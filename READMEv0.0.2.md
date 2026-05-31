@@ -42,7 +42,7 @@ Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/i
 | Timeout events in demo | 3 (slow `SlowDiv`, self-deadlock, cross-deadlock) + optional ledger timeout on cross probe |
 | Explicit `sleep` budget | ~2.45 s (settle 50 ms + five 300 ms gaps + final 900 ms timer tail) |
 | Recovery bound per stall | ~150 ms detect + ~50 ms `start_settled` + RestForOne respawn |
-| **Best-case (success only)** | **~55–75 ms** boot + 2 ops; **~0.1–2 ms** per `add` / fast `slow_div` — see [best-case table](./examples/handle_timeout_calculator_timer.md#best-case-latency-success-path-only) |
+| **Best-case (success only)** | **`add` ~58 µs avg** (debug) / **~21 µs** (release) e2e — measured at startup, demo sleeps excluded — [table](./examples/handle_timeout_calculator_timer.md#best-case-latency-success-path-only) |
 
 See [handle_timeout_calculator_timer.md — overall latency](./examples/handle_timeout_calculator_timer.md#overall-latency) for the phase-by-phase breakdown.
 
@@ -261,7 +261,7 @@ All examples built and run locally (`cargo test` — **14 passed**).
 | resilient_calculator_timer | `cargo run --example resilient_calculator_timer` | ✅ pass | Timer + supervised calculator |
 | recoverable_timer_calc | `cargo run --example recoverable_timer_calc` | ✅ pass | Journal replay after restart |
 | rest_for_one_calculator_timer | `cargo run --example rest_for_one_calculator_timer` | ✅ pass | RestForOne chain + intensity breach |
-| handle_timeout_calculator_timer | `cargo run --example handle_timeout_calculator_timer` | ✅ pass | Deadlock prevention; **~2.6–3.1 s** full demo, **~55–75 ms** success-only best case — [latency](./examples/handle_timeout_calculator_timer.md#overall-latency) |
+| handle_timeout_calculator_timer | `cargo run --example handle_timeout_calculator_timer` | ✅ pass | Deadlock prevention; **~2.6–3.1 s** full demo; success **`add` ~58 µs** avg (debug) — [latency](./examples/handle_timeout_calculator_timer.md#best-case-latency-success-path-only) |
 | gateway | `cargo run --example gateway` | ✅ server | `GET /health` → 200; long-running Actix server on `:8080` |
 
 ### Tests
