@@ -2,8 +2,6 @@
 
 OTP-style actor runtime in Rust: actors, supervision, linking, monitoring, distributed messaging, and hot code upgrade.
 
-See **[architecture.md](./architecture.md)** for Mermaid diagrams and module breakdown.
-
 ## Library (`src/`)
 
 | Module | Capability |
