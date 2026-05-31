@@ -7,12 +7,11 @@
 //! Run: `cargo run --example horizontal_scaling`
 //! See: `examples/horizontal_scaling.md`
 
-use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr};
-use lane_switchboards::distributed::{Node, RemoteActorRef};
+use lane_switchboards::actor::{Actor, ActorProcessingErr};
+use lane_switchboards::distributed::{serve_actor, Cluster};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum WorkMsg {
@@ -37,80 +36,32 @@ impl Actor<WorkMsg> for Worker {
     }
 }
 
-struct WorkerNode {
-    name: String,
-    address: String,
-    _task: tokio::task::JoinHandle<()>,
+async fn launch_worker(name: &str) -> Result<lane_switchboards::distributed::NodeHandle<WorkMsg>, Box<dyn std::error::Error>> {
+    let handle = serve_actor(
+        name,
+        "127.0.0.1:0",
+        "worker",
+        Worker {
+            node_name: name.to_string(),
+            processed: Arc::new(AtomicU64::new(0)),
+        },
+    )
+    .await?;
+    println!(
+        "[cluster] node {} online at {}",
+        handle.name(),
+        handle.address()
+    );
+    Ok(handle)
 }
 
-impl WorkerNode {
-    async fn launch(name: impl Into<String>) -> Result<Self, Box<dyn std::error::Error>> {
-        let name = name.into();
-        let node = Node::<WorkMsg>::bind(&name, "127.0.0.1:0").await?;
-        let address = node.address().to_string();
-        let processed = Arc::new(AtomicU64::new(0));
-
-        let (tx, mut rx) = mpsc::channel(32);
-        node.register("worker", tx).await;
-
-        let worker_name = name.clone();
-        let processed_for_actor = processed.clone();
-        let task = tokio::spawn(async move {
-            let (actor, _) = spawn(
-                Worker {
-                    node_name: worker_name.clone(),
-                    processed: processed_for_actor,
-                },
-                None,
-            )
-            .await
-            .expect("spawn worker");
-
-            while let Some(msg) = rx.recv().await {
-                let _ = actor.send(msg).await;
-            }
-        });
-
-        println!("[cluster] node {name} online at {address}");
-        Ok(Self {
-            name,
-            address,
-            _task: task,
-        })
-    }
-}
-
-/// In-memory cluster roster — add a remote worker whenever new hardware comes online.
-struct Cluster {
-    workers: Vec<RemoteActorRef<WorkMsg>>,
-}
-
-impl Cluster {
-    fn new() -> Self {
-        Self {
-            workers: Vec::new(),
-        }
-    }
-
-    fn add_node(&mut self, node: &WorkerNode) {
-        println!(
-            "[cluster] hooking {} into roster ({} workers total)",
-            node.name,
-            self.workers.len() + 1
-        );
-        self.workers
-            .push(RemoteActorRef::new(&node.address, "worker"));
-    }
-
-    async fn dispatch(&mut self, job_id: u64) -> Result<(), Box<dyn std::error::Error>> {
-        let worker = &self.workers[job_id as usize % self.workers.len()];
-        worker.send(WorkMsg::Process { job_id }).await?;
-        Ok(())
-    }
-
-    fn len(&self) -> usize {
-        self.workers.len()
-    }
+fn join_cluster(cluster: &mut Cluster<WorkMsg>, handle: &lane_switchboards::distributed::NodeHandle<WorkMsg>) {
+    let n = cluster.len() + 1;
+    println!(
+        "[cluster] hooking {} into roster ({n} workers total)",
+        handle.name()
+    );
+    cluster.join(handle.member.clone());
 }
 
 #[tokio::main]
@@ -119,15 +70,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("=== Phase 1: initial cluster (2 worker nodes) ===\n");
 
-    let node_a = WorkerNode::launch("worker-a").await?;
-    let node_b = WorkerNode::launch("worker-b").await?;
+    let node_a = launch_worker("worker-a").await?;
+    let node_b = launch_worker("worker-b").await?;
 
     let mut cluster = Cluster::new();
-    cluster.add_node(&node_a);
-    cluster.add_node(&node_b);
+    join_cluster(&mut cluster, &node_a);
+    join_cluster(&mut cluster, &node_b);
 
     for job_id in 1..=6 {
-        cluster.dispatch(job_id).await?;
+        cluster
+            .send_round_robin(WorkMsg::Process { job_id })
+            .await?;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -135,19 +88,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n=== Phase 2: horizontal scale-out (+2 nodes on new hardware) ===\n");
     println!("Launch new nodes, bind TCP listeners, register addresses in the roster.\n");
 
-    let node_c = WorkerNode::launch("worker-c").await?;
-    let node_d = WorkerNode::launch("worker-d").await?;
-    cluster.add_node(&node_c);
-    cluster.add_node(&node_d);
+    let before = cluster.len();
+    let node_c = launch_worker("worker-c").await?;
+    let node_d = launch_worker("worker-d").await?;
+    join_cluster(&mut cluster, &node_c);
+    join_cluster(&mut cluster, &node_d);
 
     println!(
-        "\n[cluster] capacity: {} → {} workers\n",
-        2,
+        "\n[cluster] capacity: {before} → {} workers\n",
         cluster.len()
     );
 
     for job_id in 7..=14 {
-        cluster.dispatch(job_id).await?;
+        cluster
+            .send_round_robin(WorkMsg::Process { job_id })
+            .await?;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;

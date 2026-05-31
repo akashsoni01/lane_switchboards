@@ -1,21 +1,24 @@
 //! Distributed actors over TCP with length-prefixed JSON frames.
 
+use crate::actor::{spawn, Actor};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
+use tokio::task::JoinHandle;
 
 /// Messages that can traverse the network layer.
 pub trait RemoteMessage:
-    Serialize + DeserializeOwned + Send + Clone + std::fmt::Debug + 'static
+    Serialize + DeserializeOwned + Send + Sync + Clone + std::fmt::Debug + 'static
 {
 }
 
 impl<T> RemoteMessage for T where
-    T: Serialize + DeserializeOwned + Send + Clone + std::fmt::Debug + 'static
+    T: Serialize + DeserializeOwned + Send + Sync + Clone + std::fmt::Debug + 'static
 {
 }
 
@@ -74,6 +77,10 @@ impl<M: RemoteMessage> Node<M> {
 
     pub fn address(&self) -> &str {
         &self.bind_addr
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub async fn register(&self, target: impl Into<String>, tx: mpsc::Sender<M>) {
@@ -153,4 +160,153 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
         stream.flush().await?;
         Ok(())
     }
+}
+
+/// A node in a cluster roster (name + TCP address + frame target).
+#[derive(Debug, Clone)]
+pub struct ClusterMember {
+    pub name: String,
+    pub node_addr: String,
+    pub target: String,
+}
+
+impl ClusterMember {
+    pub fn new(
+        name: impl Into<String>,
+        node_addr: impl Into<String>,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            node_addr: node_addr.into(),
+            target: target.into(),
+        }
+    }
+
+    pub fn remote_ref<M: RemoteMessage>(&self) -> RemoteActorRef<M> {
+        RemoteActorRef::new(&self.node_addr, &self.target)
+    }
+}
+
+/// Roster of remote actors — join nodes as they come online, dispatch round-robin or broadcast.
+pub struct Cluster<M: RemoteMessage> {
+    members: Vec<ClusterMember>,
+    refs: Vec<RemoteActorRef<M>>,
+    next: AtomicUsize,
+}
+
+impl<M: RemoteMessage> Default for Cluster<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<M: RemoteMessage> Cluster<M> {
+    pub fn new() -> Self {
+        Self {
+            members: Vec::new(),
+            refs: Vec::new(),
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    pub fn members(&self) -> &[ClusterMember] {
+        &self.members
+    }
+
+    /// Add a remote node to the roster (existing nodes keep running).
+    pub fn join(&mut self, member: ClusterMember) {
+        self.refs.push(member.remote_ref());
+        self.members.push(member);
+    }
+
+    /// Round-robin index for the next send (does not advance on error).
+    pub fn next(&self) -> std::io::Result<&RemoteActorRef<M>> {
+        if self.refs.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "cluster has no members",
+            ));
+        }
+        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.refs.len();
+        Ok(&self.refs[idx])
+    }
+
+    pub async fn send_round_robin(&self, msg: M) -> std::io::Result<()> {
+        self.next()?.send(msg).await
+    }
+
+    pub async fn broadcast(&self, msg: M) -> std::io::Result<()>
+    where
+        M: Clone,
+    {
+        for remote in &self.refs {
+            remote.send(msg.clone()).await?;
+        }
+        Ok(())
+    }
+}
+
+/// Local TCP node serving one actor target — use `member()` to join a [`Cluster`].
+pub struct NodeHandle<M: RemoteMessage> {
+    pub member: ClusterMember,
+    _node: Node<M>,
+    _bridge: JoinHandle<()>,
+}
+
+impl<M: RemoteMessage> NodeHandle<M> {
+    pub fn address(&self) -> &str {
+        &self.member.node_addr
+    }
+
+    pub fn name(&self) -> &str {
+        &self.member.name
+    }
+}
+
+/// Bind a TCP node and bridge incoming frames to a local actor.
+pub async fn serve_actor<M, A>(
+    node_name: impl Into<String>,
+    bind_addr: impl Into<String>,
+    target: impl Into<String>,
+    actor: A,
+) -> std::io::Result<NodeHandle<M>>
+where
+    M: RemoteMessage,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    let node_name = node_name.into();
+    let target = target.into();
+    let node = Node::<M>::bind(&node_name, bind_addr).await?;
+    let address = node.address().to_string();
+
+    let (tx, mut rx) = mpsc::channel(32);
+    node.register(&target, tx).await;
+
+    let bridge = tokio::spawn(async move {
+        let Ok((actor_ref, _)) = spawn(actor, None).await else {
+            return;
+        };
+        while let Some(msg) = rx.recv().await {
+            let _ = actor_ref.send(msg).await;
+        }
+    });
+
+    Ok(NodeHandle {
+        member: ClusterMember {
+            name: node_name,
+            node_addr: address,
+            target,
+        },
+        _node: node,
+        _bridge: bridge,
+    })
 }

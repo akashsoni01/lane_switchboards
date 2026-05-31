@@ -2,7 +2,13 @@
 
 Erlang/OTP clusters grow by **starting new BEAM nodes** and connecting them to the existing mesh. Each node runs processes; remote processes are addressed by `{Name, Node}` — new hardware means new node names and more capacity, not bigger single machines.
 
-**lane_switchboards** models the same idea at a small scale: each **`Node`** binds a TCP listener; **`RemoteActorRef`** routes frames to actors registered on any node. To scale out, bind a new node, register its address in your cluster roster, and keep dispatching work.
+**lane_switchboards** provides built-in clustering in [`distributed.rs`](../src/distributed.rs):
+
+| Type | Role |
+|------|------|
+| **`serve_actor`** | Bind a TCP node and bridge frames to a local actor |
+| **`ClusterMember`** | Name + address + frame target for one node |
+| **`Cluster`** | Roster of remote refs — `join`, `send_round_robin`, `broadcast` |
 
 ```bash
 cargo run --example horizontal_scaling
@@ -16,14 +22,14 @@ Compare with the minimal two-node ping in [`distributed_demo.rs`](./distributed_
 
 ## Idea
 
-| Telecom / Erlang | This example |
-|------------------|--------------|
-| Add a switch or exchange blade | `WorkerNode::launch("worker-c")` binds a new TCP listener |
-| Register node in the cluster | `cluster.add_node(&node_c)` stores a `RemoteActorRef` |
-| Route calls to any node in the mesh | Coordinator round-robins `WorkMsg::Process` across the roster |
-| More nodes → more concurrent workers | Jobs 7–14 spread across **four** nodes instead of two |
+| Telecom / Erlang | Library API |
+|------------------|-------------|
+| Add a switch or exchange blade | `serve_actor("worker-c", addr, "worker", actor)` |
+| Register node in the cluster | `cluster.join(node.member.clone())` |
+| Route calls to any node in the mesh | `cluster.send_round_robin(msg)` |
+| More nodes → more concurrent workers | Roster grows; round-robin uses all members |
 
-You can add computing capacity by launching new nodes on additional hardware and hooking them into the existing cluster — the roster is the hook.
+You can add computing capacity by launching new nodes on additional hardware and hooking them into the existing cluster — `Cluster::join` is the hook.
 
 ---
 
@@ -31,9 +37,9 @@ You can add computing capacity by launching new nodes on additional hardware and
 
 ```mermaid
 flowchart TB
-    Coord["Coordinator<br/>Cluster roster"]
-    A["worker-a<br/>Node TCP"]
-    B["worker-b<br/>Node TCP"]
+    Coord["Cluster roster"]
+    A["worker-a<br/>serve_actor"]
+    B["worker-b<br/>serve_actor"]
     C["worker-c<br/>new hardware"]
     D["worker-d<br/>new hardware"]
 
@@ -49,42 +55,47 @@ flowchart TB
 
 Each worker node:
 
-1. **`Node::bind(name, addr)`** — listen for length-prefixed JSON frames ([`distributed.rs`](../src/distributed.rs))
-2. **`node.register("worker", tx)`** — map frame target `"worker"` to a local mailbox
-3. Local **`Worker`** actor processes `WorkMsg::Process { job_id }`
-
-The coordinator never talks to actors directly — only to **`RemoteActorRef { node_addr, target }`**.
+1. **`serve_actor(name, bind_addr, "worker", actor)`** — bind TCP + register target + bridge to local actor
+2. Returns **`NodeHandle`** with **`member()`** metadata for the roster
+3. Coordinator uses **`Cluster::send_round_robin`** — never talks to local actors directly
 
 ---
 
-## Cluster roster
-
-There is no built-in global service discovery. Production systems use DNS, etcd, or a registry; this demo uses an in-memory **`Cluster`**:
+## Cluster roster (library)
 
 ```rust
-struct Cluster {
-    workers: Vec<RemoteActorRef<WorkMsg>>,
-}
+use lane_switchboards::distributed::{serve_actor, Cluster};
 
-impl Cluster {
-    fn add_node(&mut self, node: &WorkerNode) {
-        self.workers.push(RemoteActorRef::new(&node.address, "worker"));
-    }
+let mut cluster = Cluster::new();
 
-    async fn dispatch(&mut self, job_id: u64) -> Result<(), ...> {
-        let worker = &self.workers[job_id as usize % self.workers.len()];
-        worker.send(WorkMsg::Process { job_id }).await?;
-        Ok(())
-    }
-}
+let node_a = serve_actor("worker-a", "127.0.0.1:0", "worker", worker_a).await?;
+cluster.join(node_a.member.clone());
+
+// Scale out — existing nodes unchanged
+let node_c = serve_actor("worker-c", "127.0.0.1:0", "worker", worker_c).await?;
+cluster.join(node_c.member.clone());
+
+cluster.send_round_robin(WorkMsg::Process { job_id }).await?;
 ```
 
-**Adding capacity** is two steps:
+**Adding capacity:**
 
-1. Launch and bind the new node (get its `address()`).
-2. Push a `RemoteActorRef` into the roster your coordinator already uses.
+1. `serve_actor` on the new host (get `NodeHandle::address()`).
+2. `cluster.join(handle.member.clone())`.
 
-Existing nodes keep running; no restart required.
+No service discovery in the core — production uses DNS, etcd, or [`registry.rs`](../src/registry.rs). The roster is the minimal hook.
+
+### API reference
+
+| Method | Description |
+|--------|-------------|
+| `Cluster::new()` | Empty roster |
+| `Cluster::join(member)` | Append a `ClusterMember` |
+| `Cluster::len()` | Current worker count |
+| `Cluster::send_round_robin(msg)` | Send to next member (atomic counter) |
+| `Cluster::broadcast(msg)` | Send to every member (`M: Clone`) |
+| `Cluster::next()` | Pick ref without sending (custom dispatch) |
+| `ClusterMember::remote_ref()` | Build a `RemoteActorRef` manually |
 
 ---
 
@@ -94,21 +105,17 @@ Existing nodes keep running; no restart required.
 
 | Step | Action |
 |------|--------|
-| 1 | `WorkerNode::launch("worker-a")` and `worker-b` |
-| 2 | Build `Cluster`, `add_node` both |
-| 3 | Dispatch jobs 1–6 round-robin across 2 workers |
-
-Each worker prints which `job_id` it handled and a running total on that node.
+| 1 | `serve_actor` for `worker-a` and `worker-b` |
+| 2 | `Cluster::new()`, `join` both members |
+| 3 | Jobs 1–6 via `send_round_robin` |
 
 ### Phase 2 — scale out (+2 nodes)
 
 | Step | Action |
 |------|--------|
-| 1 | Launch `worker-c` and `worker-d` (simulates new machines / ports) |
-| 2 | `cluster.add_node` for each — roster grows 2 → 4 |
-| 3 | Dispatch jobs 7–14 — load spreads across all four |
-
-Round-robin modulo worker count automatically uses the new capacity once addresses are in the roster.
+| 1 | `serve_actor` for `worker-c` and `worker-d` |
+| 2 | `cluster.join` each — roster 2 → 4 |
+| 3 | Jobs 7–14 spread across four workers |
 
 ---
 
@@ -117,25 +124,16 @@ Round-robin modulo worker count automatically uses the new capacity once address
 ```
 === Phase 1: initial cluster (2 worker nodes) ===
 
-[cluster] node worker-a online at 127.0.0.1:54321
-[cluster] node worker-b online at 127.0.0.1:54322
+[cluster] node worker-a online at 127.0.0.1:65140
 [cluster] hooking worker-a into roster (1 workers total)
-[cluster] hooking worker-b into roster (2 workers total)
-[worker-a] processed job 1 (total on this node: 1)
-[worker-b] processed job 2 (total on this node: 1)
+[worker-a] processed job 2 (total on this node: 1)
 ...
 
 === Phase 2: horizontal scale-out (+2 nodes on new hardware) ===
 
-[cluster] node worker-c online at 127.0.0.1:54323
-[cluster] node worker-d online at 127.0.0.1:54324
-[cluster] hooking worker-c into roster (3 workers total)
-[cluster] hooking worker-d into roster (4 workers total)
-
 [cluster] capacity: 2 → 4 workers
 
-[worker-c] processed job 7 (total on this node: 1)
-[worker-d] processed job 8 (total on this node: 1)
+[worker-c] processed job 10 (total on this node: 1)
 ...
 ```
 
@@ -152,8 +150,6 @@ Each `RemoteActorRef::send` opens a TCP connection and writes:
 | 4 bytes LE | JSON frame length |
 | JSON body | `{ "target": "worker", "payload": { ... } }` |
 
-The remote `Node` deserializes the payload as `WorkMsg` and forwards to the registered mailbox.
-
 ---
 
 ## Real deployment mapping
@@ -161,11 +157,9 @@ The remote `Node` deserializes the payload as `WorkMsg` and forwards to the regi
 | Demo | Production |
 |------|------------|
 | `127.0.0.1:0` on one machine | Bind `0.0.0.0:9000` on each new host |
-| In-memory `Cluster` | Load balancer, service mesh, or `registry.rs` index |
-| Round-robin by `job_id` | Consistent hash, queue consumer groups, or OTP `pg` |
-| Single process, four nodes | Four processes / four VMs, coordinator on any node |
-
-This example keeps all nodes in one process for easy `cargo run`; the **bind + register + roster** steps are the same when processes move to separate hardware.
+| In-memory `Cluster` | Load balancer, service mesh, or external registry |
+| Round-robin | Consistent hash, queue consumer groups, or OTP `pg` |
+| Single process, four nodes | Four processes / four VMs |
 
 ---
 
@@ -173,15 +167,15 @@ This example keeps all nodes in one process for easy `cargo run`; the **bind + r
 
 | Topic | Detail |
 |-------|--------|
-| No auto-discovery | You must propagate new `node.address()` to the coordinator |
-| Fire-and-forget | `RemoteActorRef::send` has no request-reply; use local actors for RPC patterns |
-| One connection per send | Simple demo transport; production would pool connections |
-| No node failure handling | Crashed node stays in roster until you remove it |
+| No auto-discovery | Propagate new addresses to the coordinator yourself |
+| Fire-and-forget | `RemoteActorRef::send` has no request-reply |
+| One connection per send | Demo transport; pool in production |
+| No node failure handling | Remove dead members from the roster explicitly |
 
 ---
 
 ## Related docs
 
 - [distributed_demo.rs](./distributed_demo.rs) — minimal remote ping
-- [README — distributed actors](../README.md#library-src)
+- [README — horizontal scaling](../README.md#horizontal-scaling-cluster-roster)
 - [envelope_demo.md](./envelope_demo.md) — local mailbox control messages

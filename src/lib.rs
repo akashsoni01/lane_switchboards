@@ -4,7 +4,7 @@
 //! - [`supervisor`]: OneForOne / OneForAll / RestForOne restart strategies,
 //!   [`ChildRegistry`] / [`ChildSlot`] for stable child refs after restart
 //! - [`registry`]: global actor index
-//! - [`distributed`]: TCP-framed remote messaging
+//! - [`distributed`]: TCP-framed remote messaging, [`Cluster`] roster, [`serve_actor`]
 //!
 //! Ractor-based HTTP client: see the `gateway` example (`examples/gateway/`).
 
@@ -16,7 +16,9 @@ pub mod supervisor;
 pub use actor::{
     spawn, Actor, ActorId, ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason,
 };
-pub use distributed::{Frame, Node, RemoteActorRef, RemoteMessage};
+pub use distributed::{
+    serve_actor, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef, RemoteMessage,
+};
 pub use supervisor::{
     child_spec, spawn_child_spec, supervise_actor, ChildRegistry, ChildSlot, ChildSpec,
     IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,

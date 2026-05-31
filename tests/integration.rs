@@ -1,4 +1,5 @@
 use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr};
+use std::sync::Arc;
 use lane_switchboards::supervisor::{
     spawn_child_spec, supervise_actor, ChildRegistry, ChildSlot, RestartStrategy,
     Supervisor, SupervisorConfig,
@@ -100,4 +101,55 @@ async fn child_slot_holds_current_ref() {
 
     let child = slot.require().await.expect("spawned");
     child.send(EchoMsg::Ping).await.expect("send");
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RemotePing(u64);
+
+struct PingCounter(Arc<std::sync::atomic::AtomicU64>);
+
+#[async_trait::async_trait]
+impl Actor<RemotePing> for PingCounter {
+    async fn handle(&mut self, msg: RemotePing) -> Result<(), ActorProcessingErr> {
+        let _ = msg;
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn cluster_round_robin_across_nodes() {
+    use lane_switchboards::distributed::{serve_actor, Cluster};
+
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let a = serve_actor(
+        "a",
+        "127.0.0.1:0",
+        "worker",
+        PingCounter(counter.clone()),
+    )
+    .await
+    .expect("node a");
+    let b = serve_actor(
+        "b",
+        "127.0.0.1:0",
+        "worker",
+        PingCounter(Arc::new(std::sync::atomic::AtomicU64::new(0))),
+    )
+    .await
+    .expect("node b");
+
+    let mut cluster = Cluster::new();
+    cluster.join(a.member.clone());
+    cluster.join(b.member.clone());
+
+    for i in 0..4 {
+        cluster
+            .send_round_robin(RemotePing(i))
+            .await
+            .expect("send");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
 }

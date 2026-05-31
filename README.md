@@ -62,7 +62,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
 | `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec` |
 | `registry.rs` | Global `DashMap` actor index |
-| `distributed.rs` | TCP-framed remote actors |
+| `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor` |
 
 ## One supervisor, many children
 
@@ -136,6 +136,35 @@ Low-level `child_spec(order, factory)` is still available when you need a custom
 | `order` | First argument to `spawn_child_spec(order, …)` or `child_spec(order, …)`; used by `RestForOne` for startup/restart dependency order |
 
 See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run --example supervisor_strategies`) for live demos of each strategy and intensity limits.
+
+## Horizontal scaling (cluster roster)
+
+Add computing capacity by binding new TCP nodes and joining them to a shared [`Cluster`](src/distributed.rs) roster. Existing nodes keep running — no restart required.
+
+| Helper | When to use |
+|--------|-------------|
+| **`serve_actor(name, bind_addr, target, actor)`** | Bind a local node and bridge frames to a local actor |
+| **`Cluster::join(member)`** | Register a remote node's address in the roster |
+| **`Cluster::send_round_robin(msg)`** | Spread work across all members |
+
+```rust
+use lane_switchboards::distributed::{serve_actor, Cluster};
+
+let node_a = serve_actor("worker-a", "127.0.0.1:0", "worker", MyWorker::default()).await?;
+let node_b = serve_actor("worker-b", "127.0.0.1:0", "worker", MyWorker::default()).await?;
+
+let mut cluster = Cluster::new();
+cluster.join(node_a.member.clone());
+cluster.join(node_b.member.clone());
+
+// Later: scale out on new hardware
+let node_c = serve_actor("worker-c", "0.0.0.0:9002", "worker", MyWorker::default()).await?;
+cluster.join(node_c.member.clone());
+
+cluster.send_round_robin(WorkMsg::Process { job_id: 1 }).await?;
+```
+
+See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`).
 
 ## Examples
 
