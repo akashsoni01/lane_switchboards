@@ -23,6 +23,7 @@ See **[architecture.md](./architecture.md)** for Mermaid diagrams and module bre
 | Calculator (add, sub, mul, div) | `cargo run --example calculator` — see [calculator.md](examples/calculator.md) |
 | Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
+| Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | ONDC signing (testecom → dummy server) | `cargo run --example ondc_demo` — see [ondc.md](examples/gateway/ondc.md) |
 
