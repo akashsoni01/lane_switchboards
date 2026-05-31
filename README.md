@@ -1,8 +1,25 @@
 # lane_switchboards
 
-OTP-style actor runtime in Rust: actors, supervision, linking, monitoring, distributed messaging, and hot code upgrade.
+**Rust actor runtime inspired by the telecom switchboard.** Lightweight isolated actors route messages through mailboxes; supervisors restart failed workers so one bad call never takes down the whole board.
 
-See **[architecture.md](./architecture.md)** for Mermaid diagrams and module breakdown.
+OTP-style primitives in Rust: actors, supervision, linking, monitoring, distributed messaging, and hot code upgrade.
+
+## The switchboard analogy
+
+Erlang was built for telephone exchanges — physical **switchboards** where operators plugged cables to route calls. That hardware metaphor became the language’s concurrency model:
+
+| Switchboard idea | Erlang/OTP | lane_switchboards |
+|------------------|------------|-------------------|
+| **Route calls to the right jack** | Isolated processes + message passing | `Actor` + `ActorRef::send` → mailbox |
+| **Each operator’s local plug board** | Process mailbox | `mpsc` channel + `Envelope<M>` |
+| **One bad line must not kill the exchange** | “Let it crash” + supervision | Supervisors restart failed children |
+| **Replace a failed circuit automatically** | `OneForOne` / `RestForOne` restart | `supervisor.rs` strategies + intensity limits |
+| **Know who’s up across the floor** | Process registry | `registry.rs` global `DashMap` |
+| **Calls between exchanges** | Distributed Erlang | `distributed.rs` TCP-framed remote actors |
+
+Telecom switches had to stay up under massive concurrent load — faults contained, components replaced in place. That heritage is why Erlang powers high-concurrency systems (messaging backends, IoT routing, soft real-time services). **lane_switchboards** brings the same *shape* — mailboxes, supervision trees, fault isolation — to Rust on top of Tokio, in a small readable core you can extend.
+
+For the canonical reference, see the [Erlang/OTP System Documentation](https://www.erlang.org/doc/system).
 
 ## Why lane_switchboards?
 

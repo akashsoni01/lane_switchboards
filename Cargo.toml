@@ -2,9 +2,11 @@
 name = "lane_switchboards"
 version = "0.1.0"
 edition = "2021"
-description = "OTP-style actor runtime: actors, supervision, linking, monitoring, distributed messaging, hot upgrade"
+description = "Telecom-inspired OTP actor runtime for Rust: mailbox routing, supervision trees, let-it-crash fault isolation, and distributed messaging"
 license = "MIT"
 readme = "README.md"
+keywords = ["actor", "otp", "supervision", "erlang", "concurrency", "fault-tolerance", "switchboard", "mailbox", "tokio"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "net", "io-util", "time"] }
@@ -35,9 +37,15 @@ ed25519-dalek = { version = "2", features = ["std"] }
 blake2 = "0.10"
 base64 = "0.22"
 
+# --- Core runtime demos ---
+
 [[example]]
-name = "gateway"
-path = "examples/gateway/main.rs"
+name = "envelope_demo"
+path = "examples/envelope_demo.rs"
+
+[[example]]
+name = "supervisor_strategies"
+path = "examples/supervisor_strategies.rs"
 
 [[example]]
 name = "hot_upgrade"
@@ -47,13 +55,7 @@ path = "examples/hot_upgrade.rs"
 name = "distributed_demo"
 path = "examples/distributed_demo.rs"
 
-[[example]]
-name = "envelope_demo"
-path = "examples/envelope_demo.rs"
-
-[[example]]
-name = "supervisor_strategies"
-path = "examples/supervisor_strategies.rs"
+# --- Calculator & supervision (switchboard routing + fault recovery) ---
 
 [[example]]
 name = "calculator"
@@ -74,6 +76,12 @@ path = "examples/recoverable_timer_calc.rs"
 [[example]]
 name = "rest_for_one_calculator_timer"
 path = "examples/rest_for_one_calculator_timer.rs"
+
+# --- Additional examples (not listed in README) ---
+
+[[example]]
+name = "gateway"
+path = "examples/gateway/main.rs"
 
 [[example]]
 name = "ondc_demo"
