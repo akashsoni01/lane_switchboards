@@ -150,6 +150,7 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
 | Distributed messaging | `cargo run --example distributed_demo` |
+| Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 
 ## Tests
 

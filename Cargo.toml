@@ -55,6 +55,10 @@ path = "examples/hot_upgrade.rs"
 name = "distributed_demo"
 path = "examples/distributed_demo.rs"
 
+[[example]]
+name = "horizontal_scaling"
+path = "examples/horizontal_scaling.rs"
+
 # --- Calculator & supervision (switchboard routing + fault recovery) ---
 
 [[example]]
@@ -82,7 +86,3 @@ path = "examples/rest_for_one_calculator_timer.rs"
 [[example]]
 name = "gateway"
 path = "examples/gateway/main.rs"
-
-[[example]]
-name = "ondc_demo"
-path = "examples/ondc_demo.rs"
