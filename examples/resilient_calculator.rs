@@ -3,12 +3,12 @@
 //! Run: `cargo run --example resilient_calculator`
 //! See: `examples/resilient_calculator.md`
 
-use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr, ActorRef};
+use lane_switchboards::actor::{Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::supervisor::{
-    child_spec, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
+    ChildSlot, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
 use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 
 enum CalcMsg {
     Add(f64, f64, oneshot::Sender<Result<f64, String>>),
@@ -85,23 +85,14 @@ impl Actor<CalcMsg> for ResilientCalculator {
 
 /// Stable handle: always points at the current supervised calculator `ActorRef`.
 struct CalcHandle {
-    current: Arc<Mutex<Option<ActorRef<CalcMsg>>>>,
+    slot: Arc<ChildSlot<CalcMsg>>,
     _supervisor: SupervisorHandle<CalcMsg>,
 }
 
 impl CalcHandle {
     async fn start() -> Result<Self, ActorProcessingErr> {
-        let current = Arc::new(Mutex::new(None));
-        let slot_for_spec = current.clone();
-
-        let spec = child_spec(0, move |sup_tx| {
-            let slot = slot_for_spec.clone();
-            Box::pin(async move {
-                let (actor_ref, _) = spawn(ResilientCalculator::default(), Some(sup_tx)).await?;
-                *slot.lock().await = Some(actor_ref.clone());
-                Ok(actor_ref)
-            })
-        });
+        let slot = Arc::new(ChildSlot::new());
+        let spec = ChildSlot::child_spec(0, slot.clone(), || ResilientCalculator::default());
 
         let config = SupervisorConfig {
             strategy: RestartStrategy::OneForOne,
@@ -110,24 +101,19 @@ impl CalcHandle {
             ..Default::default()
         };
 
-        let supervisor = Supervisor::new(config, vec![spec]);
-        let sup_handle = supervisor.start().await?;
-
-        if current.lock().await.is_none() {
-            return Err("supervised calculator not started".into());
-        }
+        let sup_handle = Supervisor::new(config, vec![spec]).start().await?;
+        slot.require().await?;
 
         Ok(Self {
-            current,
+            slot,
             _supervisor: sup_handle,
         })
     }
 
     async fn actor(&self) -> ActorRef<CalcMsg> {
-        self.current
-            .lock()
+        self.slot
+            .get()
             .await
-            .clone()
             .expect("supervised calculator running")
     }
 }

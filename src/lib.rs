@@ -1,7 +1,8 @@
 //! Lane Switchboards — OTP-style actor runtime.
 //!
 //! - [`actor`]: actors, linking, monitoring, hot code upgrade
-//! - [`supervisor`]: OneForOne / OneForAll / RestForOne restart strategies
+//! - [`supervisor`]: OneForOne / OneForAll / RestForOne restart strategies,
+//!   [`ChildRegistry`] / [`ChildSlot`] for stable child refs after restart
 //! - [`registry`]: global actor index
 //! - [`distributed`]: TCP-framed remote messaging
 //!
@@ -17,6 +18,6 @@ pub use actor::{
 };
 pub use distributed::{Frame, Node, RemoteActorRef, RemoteMessage};
 pub use supervisor::{
-    child_spec, supervise_actor, ChildSpec, IntensityAction, RestartStrategy, Supervisor,
-    SupervisorConfig, SupervisorHandle,
+    child_spec, spawn_child_spec, supervise_actor, ChildRegistry, ChildSlot, ChildSpec,
+    IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };

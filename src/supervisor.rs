@@ -1,6 +1,7 @@
 //! OTP-style supervisor with OneForOne, OneForAll, and RestForOne strategies.
 
 use crate::actor::{spawn, Actor, ActorId, ActorProcessingErr, ActorRef};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -112,6 +113,123 @@ where
     })
 }
 
+/// Named child refs updated on every spawn/restart — share with actors and main.
+#[derive(Clone)]
+pub struct ChildRegistry<M: Send + Sync + 'static> {
+    by_name: Arc<Mutex<HashMap<String, ActorRef<M>>>>,
+    generations: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<M: Send + Sync + 'static> ChildRegistry<M> {
+    pub fn new() -> Self {
+        Self {
+            by_name: Arc::new(Mutex::new(HashMap::new())),
+            generations: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub async fn get(&self, name: &str) -> Option<ActorRef<M>> {
+        self.by_name.lock().await.get(name).cloned()
+    }
+
+    pub async fn track(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
+        self.by_name.lock().await.insert(name.into(), actor_ref);
+    }
+
+    pub async fn bump_generation(&self, name: &str) {
+        let mut gens = self.generations.lock().await;
+        *gens.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    pub async fn generation(&self, name: &str) -> u64 {
+        self.generations.lock().await.get(name).copied().unwrap_or(0)
+    }
+
+    pub async fn generations(&self) -> HashMap<String, u64> {
+        self.generations.lock().await.clone()
+    }
+}
+
+/// Single supervised child slot — use for OneForOne with one actor.
+#[derive(Clone)]
+pub struct ChildSlot<M: Send + Sync + 'static> {
+    current: Arc<Mutex<Option<ActorRef<M>>>>,
+}
+
+impl<M: Send + Sync + 'static> Default for ChildSlot<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<M: Send + Sync + 'static> ChildSlot<M> {
+    pub fn new() -> Self {
+        Self {
+            current: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub async fn get(&self) -> Option<ActorRef<M>> {
+        self.current.lock().await.clone()
+    }
+
+    pub async fn require(&self) -> Result<ActorRef<M>, ActorProcessingErr> {
+        self.get()
+            .await
+            .ok_or_else(|| "supervised child not running".into())
+    }
+
+    /// Build a child spec that spawns `build()` and keeps `slot` current.
+    pub fn child_spec<B, F>(order: usize, slot: Arc<Self>, build: F) -> Box<dyn ChildSpec<M>>
+    where
+        B: Actor<M> + Send + Sync + 'static,
+        F: Fn() -> B + Send + Sync + 'static,
+    {
+        let build = Arc::new(build);
+        child_spec(order, move |sup_tx| {
+            let slot = slot.clone();
+            let build = build.clone();
+            Box::pin(async move {
+                let (actor_ref, _) = spawn(build(), Some(sup_tx)).await?;
+                *slot.current.lock().await = Some(actor_ref.clone());
+                Ok(actor_ref)
+            })
+        })
+    }
+}
+
+/// Build a child spec: spawn `build()`, register under `name`, at supervisor `order`.
+pub fn spawn_child_spec<M, B, F>(
+    order: usize,
+    name: impl Into<String>,
+    registry: Arc<ChildRegistry<M>>,
+    build: F,
+) -> Box<dyn ChildSpec<M>>
+where
+    M: Send + Sync + 'static,
+    B: Actor<M> + Send + Sync + 'static,
+    F: Fn() -> B + Send + Sync + 'static,
+{
+    let name = name.into();
+    let build = Arc::new(build);
+    child_spec(order, move |sup_tx| {
+        let registry = registry.clone();
+        let name = name.clone();
+        let build = build.clone();
+        Box::pin(async move {
+            let (actor_ref, _) = spawn(build(), Some(sup_tx)).await?;
+            registry.track(name, actor_ref.clone()).await;
+            Ok(actor_ref)
+        })
+    })
+}
+
 /// Handle to a running supervisor.
 pub struct SupervisorHandle<M: Send + Sync + 'static> {
     pub id: ActorId,
@@ -134,6 +252,14 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
     }
 
     pub async fn start(self) -> Result<SupervisorHandle<M>, ActorProcessingErr> {
+        self.start_settled(Duration::ZERO).await
+    }
+
+    /// Start the supervisor and optionally wait for initial spawns to settle.
+    pub async fn start_settled(
+        self,
+        settle: Duration,
+    ) -> Result<SupervisorHandle<M>, ActorProcessingErr> {
         let (tx, mut rx) = mpsc::channel::<RestartSignal>(32);
         let children = self.children.clone();
         let config = self.config.clone();
@@ -146,6 +272,10 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                 let actor_ref = spec.restart(sup_tx).await?;
                 spec.set_id(actor_ref.id);
             }
+        }
+
+        if !settle.is_zero() {
+            tokio::time::sleep(settle).await;
         }
 
         let join = tokio::spawn(async move {

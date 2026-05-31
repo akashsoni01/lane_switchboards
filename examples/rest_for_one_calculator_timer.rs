@@ -12,15 +12,15 @@
 //! Run: `cargo run --example rest_for_one_calculator_timer`
 //! See: `examples/rest_for_one_calculator_timer.md`
 
-use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr, ActorRef};
+use lane_switchboards::actor::{Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::supervisor::{
-    child_spec, IntensityAction, RestartStrategy, Supervisor, SupervisorConfig,
-    SupervisorHandle,
+    spawn_child_spec, ChildRegistry, IntensityAction, RestartStrategy, Supervisor,
+    SupervisorConfig, SupervisorHandle,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::oneshot;
 
 enum AppMsg {
     Add(f64, f64, oneshot::Sender<Result<f64, String>>),
@@ -30,47 +30,24 @@ enum AppMsg {
     TimerTick,
 }
 
-struct ChildRefs {
-    by_name: Arc<Mutex<HashMap<String, ActorRef<AppMsg>>>>,
-    generations: Arc<Mutex<HashMap<String, u64>>>,
-}
-
-impl ChildRefs {
-    fn new() -> Self {
-        Self {
-            by_name: Arc::new(Mutex::new(HashMap::new())),
-            generations: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    async fn get(&self, name: &str) -> Option<ActorRef<AppMsg>> {
-        self.by_name.lock().await.get(name).cloned()
-    }
-
-    async fn bump_generation(&self, name: &str) {
-        let mut gens = self.generations.lock().await;
-        *gens.entry(name.to_string()).or_insert(0) += 1;
-        println!(
-            "[spawn] {name} generation {}",
-            gens.get(name).copied().unwrap_or(0)
-        );
-    }
-
-    async fn snapshot(&self) -> HashMap<String, u64> {
-        self.generations.lock().await.clone()
-    }
+async fn log_generation(registry: &ChildRegistry<AppMsg>, name: &str) {
+    registry.bump_generation(name).await;
+    println!(
+        "[spawn] {name} generation {}",
+        registry.generation(name).await
+    );
 }
 
 #[derive(Clone)]
 struct Calculator {
     last_result: Option<f64>,
-    refs: Arc<ChildRefs>,
+    registry: Arc<ChildRegistry<AppMsg>>,
 }
 
 #[async_trait::async_trait]
 impl Actor<AppMsg> for Calculator {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        self.refs.bump_generation("calculator").await;
+        log_generation(&self.registry, "calculator").await;
         Ok(())
     }
 
@@ -99,7 +76,7 @@ impl Actor<AppMsg> for Calculator {
 }
 
 struct ResultTimer {
-    refs: Arc<ChildRefs>,
+    registry: Arc<ChildRegistry<AppMsg>>,
     self_ref: Option<ActorRef<AppMsg>>,
     interval: Duration,
     running: bool,
@@ -108,7 +85,7 @@ struct ResultTimer {
 #[async_trait::async_trait]
 impl Actor<AppMsg> for ResultTimer {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        self.refs.bump_generation("timer").await;
+        log_generation(&self.registry, "timer").await;
         Ok(())
     }
 
@@ -120,7 +97,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.refs.get("calculator").await {
+                if let Some(calc) = self.registry.get("calculator").await {
                     let (tx, rx) = oneshot::channel();
                     let _ = calc.send(AppMsg::LastResult(tx)).await;
                     match rx.await {
@@ -152,68 +129,53 @@ impl ResultTimer {
 }
 
 struct SupervisedApp {
-    refs: Arc<ChildRefs>,
+    registry: Arc<ChildRegistry<AppMsg>>,
     _supervisor: SupervisorHandle<AppMsg>,
 }
 
 impl SupervisedApp {
     async fn start(interval: Duration, config: SupervisorConfig) -> Result<Self, ActorProcessingErr> {
-        let refs = Arc::new(ChildRefs::new());
+        let registry = Arc::new(ChildRegistry::new());
+        let calc_registry = registry.clone();
+        let timer_registry = registry.clone();
 
-        let calc_refs = refs.clone();
-        let calc_spec = child_spec(0, move |sup_tx| {
-            let refs = calc_refs.clone();
-            Box::pin(async move {
-                let worker = Calculator {
-                    last_result: None,
-                    refs: refs.clone(),
-                };
-                let (actor_ref, _) = spawn(worker, Some(sup_tx)).await?;
-                refs.by_name
-                    .lock()
-                    .await
-                    .insert("calculator".into(), actor_ref.clone());
-                Ok(actor_ref)
-            })
-        });
-
-        let timer_refs = refs.clone();
-        let timer_spec = child_spec(1, move |sup_tx| {
-            let refs = timer_refs.clone();
-            Box::pin(async move {
-                let worker = ResultTimer {
-                    refs: refs.clone(),
-                    self_ref: None,
-                    interval,
-                    running: false,
-                };
-                let (actor_ref, _) = spawn(worker, Some(sup_tx)).await?;
-                refs.by_name
-                    .lock()
-                    .await
-                    .insert("timer".into(), actor_ref.clone());
-                Ok(actor_ref)
-            })
-        });
-
-        let config = SupervisorConfig {
-            strategy: RestartStrategy::RestForOne,
-            ..config
-        };
-
-        let supervisor = Supervisor::new(config, vec![calc_spec, timer_spec]);
-        let handle = supervisor.start().await?;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // RestForOne: fail at order N → restart N and every child with higher order.
+        let handle = Supervisor::new(
+            SupervisorConfig {
+                strategy: RestartStrategy::RestForOne,
+                ..config
+            },
+            vec![
+                spawn_child_spec(0, "calculator", registry.clone(), {
+                    let registry = calc_registry.clone();
+                    move || Calculator {
+                        last_result: None,
+                        registry: registry.clone(),
+                    }
+                }),
+                spawn_child_spec(1, "timer", registry.clone(), {
+                    let registry = timer_registry.clone();
+                    move || ResultTimer {
+                        registry: registry.clone(),
+                        self_ref: None,
+                        interval,
+                        running: false,
+                    }
+                }),
+            ],
+        )
+        .start_settled(Duration::from_millis(50))
+        .await?;
 
         Ok(Self {
-            refs,
+            registry,
             _supervisor: handle,
         })
     }
 
     async fn start_timer(&self) -> anyhow::Result<()> {
         let timer = self
-            .refs
+            .registry
             .get("timer")
             .await
             .ok_or_else(|| anyhow::anyhow!("timer not running"))?;
@@ -231,7 +193,7 @@ fn actor_err(e: ActorProcessingErr) -> anyhow::Error {
 
 async fn add(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<f64> {
     let calc = app
-        .refs
+        .registry
         .get("calculator")
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
@@ -244,7 +206,7 @@ async fn add(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<f64> {
 
 async fn div(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<Result<f64, String>> {
     let calc = app
-        .refs
+        .registry
         .get("calculator")
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
@@ -313,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
-    let gens = app.refs.snapshot().await;
+    let gens = app.registry.generations().await;
     print_generations("[after intensity breach]", &gens);
 
     match add(&app, 99.0, 1.0).await {
@@ -336,14 +298,14 @@ async fn demo_rest_for_one_restart(app: &SupervisedApp, interval: Duration) -> a
     println!("[calc] add 5 + 3 = {}", add(app, 5.0, 3.0).await?);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let before = app.refs.snapshot().await;
+    let before = app.registry.generations().await;
     print_generations("\n[before] generations", &before);
 
     println!("\n--- calculator divide by zero (RestForOne restarts timer too) ---");
     let _ = div(app, 10.0, 0.0).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let after = app.refs.snapshot().await;
+    let after = app.registry.generations().await;
     print_generations("[after] generations (both should increase)", &after);
 
     app.start_timer().await?;
