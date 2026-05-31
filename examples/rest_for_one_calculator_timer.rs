@@ -2,12 +2,20 @@
 //!
 //! When the calculator fails, RestForOne restarts the calculator **and** the timer.
 //!
+//! **Intensity limits** (`max_restarts`, `within_secs`):
+//! - Every child failure adds one timestamp to a sliding window of length `within_secs`.
+//! - When restart events in that window exceed `max_restarts`, intensity is breached.
+//! - Default `IntensityAction::ShutdownSupervisor`: the supervisor task exits and
+//!   **stops restarting any child** (calculator and timer are left dead).
+//! - See phase 2 in `main` for a live breach (`max_restarts: 2`, `within_secs: 10`).
+//!
 //! Run: `cargo run --example rest_for_one_calculator_timer`
 //! See: `examples/rest_for_one_calculator_timer.md`
 
 use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::supervisor::{
-    child_spec, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
+    child_spec, IntensityAction, RestartStrategy, Supervisor, SupervisorConfig,
+    SupervisorHandle,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -149,7 +157,7 @@ struct SupervisedApp {
 }
 
 impl SupervisedApp {
-    async fn start(interval: Duration) -> Result<Self, ActorProcessingErr> {
+    async fn start(interval: Duration, config: SupervisorConfig) -> Result<Self, ActorProcessingErr> {
         let refs = Arc::new(ChildRefs::new());
 
         let calc_refs = refs.clone();
@@ -190,9 +198,7 @@ impl SupervisedApp {
 
         let config = SupervisorConfig {
             strategy: RestartStrategy::RestForOne,
-            max_restarts: 10,
-            within_secs: 60,
-            ..Default::default()
+            ..config
         };
 
         let supervisor = Supervisor::new(config, vec![calc_spec, timer_spec]);
@@ -264,23 +270,77 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let interval = Duration::from_millis(600);
-    let app = SupervisedApp::start(interval).await.map_err(actor_err)?;
 
-    println!("RestForOne supervisor: calculator order=0, timer order=1\n");
+    // Phase 1: normal RestForOne recovery (generous intensity budget)
+    let app = SupervisedApp::start(
+        interval,
+        SupervisorConfig {
+            max_restarts: 10,
+            within_secs: 60,
+            intensity_action: IntensityAction::ShutdownSupervisor,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(actor_err)?;
+
+    println!("=== Phase 1: RestForOne (calculator order=0, timer order=1) ===\n");
+    demo_rest_for_one_restart(&app, interval).await?;
+
+    // Phase 2: intensity breach — too many failures inside within_secs
+    println!("\n=== Phase 2: intensity limit (max_restarts=2, within_secs=10) ===");
+    println!("Each div-by-zero counts as one restart event in the sliding window.");
+    println!("When events in the window exceed max_restarts, ShutdownSupervisor stops the supervisor.\n");
+
+    let app = SupervisedApp::start(
+        interval,
+        SupervisorConfig {
+            max_restarts: 2,
+            within_secs: 10,
+            intensity_action: IntensityAction::ShutdownSupervisor,
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(actor_err)?;
+
+    app.start_timer().await?;
+    let _ = add(&app, 2.0, 2.0).await?;
+
+    for i in 1..=4 {
+        println!("--- intensity test failure {i} ---");
+        let _ = div(&app, 1.0, 0.0).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+
+    let gens = app.refs.snapshot().await;
+    print_generations("[after intensity breach]", &gens);
+
+    match add(&app, 99.0, 1.0).await {
+        Ok(v) => println!("[calc] unexpected success: {v}"),
+        Err(e) => println!("[calc] supervisor dead — add failed: {e}"),
+    }
+
+    println!("\nDone.");
+    Ok(())
+}
+
+async fn demo_rest_for_one_restart(app: &SupervisedApp, interval: Duration) -> anyhow::Result<()> {
+    let _ = interval;
     app.start_timer().await?;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
-    println!("[calc] add 10 + 4 = {}", add(&app, 10.0, 4.0).await?);
+    println!("[calc] add 10 + 4 = {}", add(app, 10.0, 4.0).await?);
 
     tokio::time::sleep(Duration::from_millis(900)).await;
-    println!("[calc] add 5 + 3 = {}", add(&app, 5.0, 3.0).await?);
+    println!("[calc] add 5 + 3 = {}", add(app, 5.0, 3.0).await?);
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let before = app.refs.snapshot().await;
     print_generations("\n[before] generations", &before);
 
     println!("\n--- calculator divide by zero (RestForOne restarts timer too) ---");
-    let _ = div(&app, 10.0, 0.0).await;
+    let _ = div(app, 10.0, 0.0).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let after = app.refs.snapshot().await;
@@ -288,9 +348,8 @@ async fn main() -> anyhow::Result<()> {
 
     app.start_timer().await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    println!("[calc] add 1 + 1 = {}", add(&app, 1.0, 1.0).await?);
+    println!("[calc] add 1 + 1 = {}", add(app, 1.0, 1.0).await?);
 
     tokio::time::sleep(Duration::from_millis(900)).await;
-    println!("\nDone.");
     Ok(())
 }

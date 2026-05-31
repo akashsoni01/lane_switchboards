@@ -92,7 +92,7 @@ let _handle = sup.start().await?;
 |-------|--------|
 | Message type | All children under one supervisor must use the same `M` (`Supervisor<M>`). Unify with a shared enum if needed. |
 | `supervise_actor` | Convenience helper for **one** child only — use `Supervisor::new` + `vec![…]` for multiple. |
-| Restart intensity | `max_restarts` / `within_secs` is shared across the whole supervisor, not per child. |
+| Restart intensity | `max_restarts` / `within_secs` is shared across the whole supervisor, not per child. When too many restart events land inside the sliding `within_secs` window, the supervisor stops restarting (`ShutdownSupervisor` by default). See [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md#intensity-limits-max_restarts-within_secs). |
 | Child handles | `start()` does not return `ActorRef`s — capture them in the factory (see [recoverable_timer_calc.rs](examples/recoverable_timer_calc.rs)) or read from the registry. |
 | `order` | Set on each `child_spec(order, …)`; used by `RestForOne` to define startup/restart dependency order. |
 
@@ -109,7 +109,7 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 | Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
-| RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) |
+| RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
 | Distributed messaging | `cargo run --example distributed_demo` |
 
 ## Tests

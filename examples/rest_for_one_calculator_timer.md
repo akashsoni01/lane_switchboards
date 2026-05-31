@@ -84,15 +84,71 @@ That proves the timer was restarted even though it did not fail.
 
 ---
 
+## Intensity limits (`max_restarts`, `within_secs`)
+
+This example runs **two phases**. Phase 2 shows what happens when the restart budget is exhausted.
+
+### How the sliding window works
+
+The supervisor keeps a list of restart timestamps. On each failure:
+
+1. Drop timestamps older than `within_secs`.
+2. Append the current failure.
+3. If `restart_log.len() > max_restarts`, intensity is **breached**.
+
+So `within_secs` is not a separate limit — it defines the **window** in which `max_restarts` is counted. Example: `max_restarts: 2`, `within_secs: 10` allows at most **two** restart events in any rolling 10-second period; the **third** event in that window breaches intensity.
+
+Each calculator panic sends **one** `RestartSignal`, even though RestForOne restarts **two** children (calculator + timer).
+
+### When intensity is breached (this example)
+
+Config uses default `IntensityAction::ShutdownSupervisor`:
+
+```rust
+SupervisorConfig {
+    max_restarts: 2,
+    within_secs: 10,
+    intensity_action: IntensityAction::ShutdownSupervisor,
+    ..
+}
+```
+
+| Event | What happens |
+|-------|----------------|
+| Failures 1–2 in window | RestForOne restarts calculator + timer |
+| Failure 3 in same window | Supervisor logs `restart intensity exceeded — shutting down` and **exits** |
+| After shutdown | No more restarts; `add` / `div` fail (dead `ActorRef`s) |
+
+Phase 2 output ends with:
+
+```
+[calc] supervisor dead — add failed: calculator not running
+```
+
+### If failures slow down
+
+Restart timestamps **fall out** of the window after `within_secs` seconds. A failure every 11s with `within_secs: 10` would never accumulate three events in the window, so the supervisor would keep restarting indefinitely (until you hit other limits).
+
+For `AbandonChild` behavior (supervisor keeps running), see [supervisor_strategies.md](./supervisor_strategies.md).
+
+---
+
 ## Demo flow
 
-1. Start supervisor with `RestForOne`.
+### Phase 1 — RestForOne recovery
+
+1. Start supervisor (`max_restarts: 10`, `within_secs: 60`).
 2. Start timer ticks via `TimerStart`.
 3. `add 10+4`, `add 5+3` — timer prints `last_result`.
-4. `div 10/0` — calculator panics.
-5. Supervisor restarts calculator **and** timer.
-6. Main calls `start_timer()` again (new timer instance needs bootstrap).
-7. `add 1+1` — timer prints `2`.
+4. `div 10/0` — calculator panics; calculator **and** timer restart.
+5. Main calls `start_timer()` again; `add 1+1` succeeds.
+
+### Phase 2 — intensity breach
+
+1. New supervisor (`max_restarts: 2`, `within_secs: 10`).
+2. Four rapid `div 1/0` calls.
+3. After the third failure in the window, supervisor shuts down.
+4. Further `add` calls fail.
 
 ---
 
