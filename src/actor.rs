@@ -3,9 +3,11 @@
 use crate::registry::{get_actor_sender, register_actor, register_supervisor, unregister_actor};
 use crate::supervisor::RestartSignal;
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use std::any::Any;
 use std::fmt;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
@@ -135,10 +137,18 @@ where
 }
 
 /// Handle to a running actor.
-#[derive(Clone)]
 pub struct ActorRef<M: Send + Sync + 'static> {
     pub id: ActorId,
     tx: mpsc::Sender<Envelope<M>>,
+}
+
+impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id,
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl<M: Send + Sync + 'static> ActorRef<M> {
@@ -256,11 +266,20 @@ async fn run_actor<M: Send + Sync + 'static>(
     'actor_loop: while let Some(envelope) = rx.recv().await {
         match envelope {
             Envelope::Msg(m) => {
-                if let Err(e) = actor.dyn_handle(m).await {
-                    exit_reason = ExitReason::Error(e.to_string());
-                    notify_supervisor(id, &exit_reason).await;
-                    propagate_linked_exit(id, &exit_reason, &links).await;
-                    break 'actor_loop;
+                match AssertUnwindSafe(actor.dyn_handle(m)).catch_unwind().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        exit_reason = ExitReason::Error(e.to_string());
+                        notify_supervisor(id, &exit_reason).await;
+                        propagate_linked_exit(id, &exit_reason, &links).await;
+                        break 'actor_loop;
+                    }
+                    Err(_) => {
+                        exit_reason = ExitReason::Error("panic in handle".into());
+                        notify_supervisor(id, &exit_reason).await;
+                        propagate_linked_exit(id, &exit_reason, &links).await;
+                        break 'actor_loop;
+                    }
                 }
             }
             Envelope::Link(peer) => {

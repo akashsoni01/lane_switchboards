@@ -123,6 +123,7 @@ div: 10 and 0 -> error: division by zero
 
 ## Related examples
 
-- [envelope_demo.md](./envelope_demo.md) — mailbox control messages (link, monitor, stop, …)
+- [calculator.md](./calculator.md) — unsupervised calculator (same operations)
+- [resilient_calculator.md](./resilient_calculator.md) — supervised version that survives panics
 - [hot_upgrade.rs](./hot_upgrade.rs) — same request–reply pattern with `CounterMsg::Get`
 - [architecture.md](../architecture.md) — actor runtime design

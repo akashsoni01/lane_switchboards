@@ -14,6 +14,7 @@ dashmap = "6"
 once_cell = "1"
 async-trait = "0.1"
 tracing = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -53,6 +54,10 @@ path = "examples/envelope_demo.rs"
 [[example]]
 name = "calculator"
 path = "examples/calculator.rs"
+
+[[example]]
+name = "resilient_calculator"
+path = "examples/resilient_calculator.rs"
 
 [[example]]
 name = "ondc_demo"

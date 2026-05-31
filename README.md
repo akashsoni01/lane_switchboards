@@ -21,6 +21,7 @@ See **[architecture.md](./architecture.md)** for Mermaid diagrams and module bre
 | Hot code upgrade | `cargo run --example hot_upgrade` |
 | Envelope variants (link, monitor, upgrade, …) | `cargo run --example envelope_demo` — see [envelope_demo.md](examples/envelope_demo.md) |
 | Calculator (add, sub, mul, div) | `cargo run --example calculator` — see [calculator.md](examples/calculator.md) |
+| Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | ONDC signing (testecom → dummy server) | `cargo run --example ondc_demo` — see [ondc.md](examples/gateway/ondc.md) |
 
