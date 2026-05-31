@@ -4,6 +4,8 @@
 
 OTP-style primitives in Rust: actors, supervision, linking, monitoring, distributed messaging, and hot code upgrade.
 
+In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
+
 ## The switchboard analogy
 
 Erlang was built for telephone exchanges — physical **switchboards** where operators plugged cables to route calls. That hardware metaphor became the language’s concurrency model:
