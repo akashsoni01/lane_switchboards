@@ -17,10 +17,8 @@ See **[architecture.md](./architecture.md)** for Mermaid diagrams and module bre
 
 | Example | Command |
 |---------|---------|
-| Actix gateway + Ractor RestTemplate | `cargo run --example gateway` |
 | Hot code upgrade | `cargo run --example hot_upgrade` |
 | Distributed messaging | `cargo run --example distributed_demo` |
-| ONDC signing (testecom → dummy server) | `cargo run --example ondc_demo` — see [ondc.md](examples/gateway/ondc.md) |
 
 Gateway (after `cargo run --example gateway`):
 
@@ -33,8 +31,6 @@ Gateway (after `cargo run --example gateway`):
 handle.get_parallel(["https://api.a.com/x", "https://api.b.com/y"]).await?;
 handle.execute_parallel(vec![/* RestRequest */]).await?;
 ```
-
-RestTemplate lives under `examples/gateway/` — see **[rest_template.md](examples/gateway/rest_template.md)** (architecture, connection pooling, **security / signing**).
 
 ## Tests
 
