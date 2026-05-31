@@ -98,6 +98,8 @@ let _handle = sup.start().await?;
 | Child handles | `start()` does not return `ActorRef`s — capture them in the factory (see [recoverable_timer_calc.rs](examples/recoverable_timer_calc.rs)) or read from the registry. |
 | `order` | Set on each `child_spec(order, …)`; used by `RestForOne` to define startup/restart dependency order. |
 
+See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run --example supervisor_strategies`) for live demos of each strategy and intensity limits.
+
 ## Examples
 
 | Example | Command |
@@ -105,6 +107,7 @@ let _handle = sup.start().await?;
 | Actix gateway + Ractor RestTemplate | `cargo run --example gateway` |
 | Hot code upgrade | `cargo run --example hot_upgrade` |
 | Envelope variants (link, monitor, upgrade, …) | `cargo run --example envelope_demo` — see [envelope_demo.md](examples/envelope_demo.md) |
+| Supervisor strategies + intensity limits | `cargo run --example supervisor_strategies` — see [supervisor_strategies.md](examples/supervisor_strategies.md) |
 | Calculator (add, sub, mul, div) | `cargo run --example calculator` — see [calculator.md](examples/calculator.md) |
 | Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |

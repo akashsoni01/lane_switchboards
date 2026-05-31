@@ -52,6 +52,10 @@ name = "envelope_demo"
 path = "examples/envelope_demo.rs"
 
 [[example]]
+name = "supervisor_strategies"
+path = "examples/supervisor_strategies.rs"
+
+[[example]]
 name = "calculator"
 path = "examples/calculator.rs"
 
