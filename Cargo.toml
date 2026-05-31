@@ -60,5 +60,9 @@ name = "resilient_calculator"
 path = "examples/resilient_calculator.rs"
 
 [[example]]
+name = "resilient_calculator_timer"
+path = "examples/resilient_calculator_timer.rs"
+
+[[example]]
 name = "ondc_demo"
 path = "examples/ondc_demo.rs"
