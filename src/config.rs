@@ -2,15 +2,22 @@
 
 use std::future::Future;
 use std::io;
+use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 
-/// Actor mailbox sizing and concurrency ([`crate::actor::spawn`]).
+/// Actor mailbox sizing, concurrency, and deadlock / slow-handle limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
     /// Max concurrent `handle()` calls per actor (`1` = classic sequential mailbox).
     pub max_in_flight: usize,
+    /// Max wall time for one `handle()` call. Exceeded → `on_handle_stuck` then actor exit.
+    /// `None` disables handle timeouts.
+    pub handle_timeout: Option<Duration>,
+    /// Log + count handles that finish successfully but exceed this duration.
+    /// Defaults to `handle_timeout` when set; `None` disables slow-handle warnings.
+    pub slow_handle_threshold: Option<Duration>,
 }
 
 impl Default for ActorConfig {
@@ -18,7 +25,16 @@ impl Default for ActorConfig {
         Self {
             mailbox_capacity: 64,
             max_in_flight: 1,
+            handle_timeout: None,
+            slow_handle_threshold: None,
         }
+    }
+}
+
+impl ActorConfig {
+    /// Threshold used when recording slow successful handles.
+    pub fn effective_slow_threshold(&self) -> Option<Duration> {
+        self.slow_handle_threshold.or(self.handle_timeout)
     }
 }
 

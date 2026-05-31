@@ -193,3 +193,82 @@ async fn cluster_hash_ring_routes_same_key_to_same_node() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert!(first.is_some());
 }
+
+#[derive(Clone)]
+struct SlowMsg {
+    sleep_ms: u64,
+}
+
+struct SlowWorker {
+    pending: Option<SlowMsg>,
+    stuck_journal: Arc<std::sync::Mutex<Vec<SlowMsg>>>,
+}
+
+#[async_trait::async_trait]
+impl Actor<SlowMsg> for SlowWorker {
+    async fn on_handle_begin(&mut self, msg: &SlowMsg) -> Result<(), ActorProcessingErr> {
+        self.pending = Some(msg.clone());
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: SlowMsg) -> Result<(), ActorProcessingErr> {
+        tokio::time::sleep(std::time::Duration::from_millis(msg.sleep_ms)).await;
+        self.pending = None;
+        Ok(())
+    }
+
+    async fn on_handle_stuck(
+        &mut self,
+        ctx: lane_switchboards::actor::HandleStuckContext,
+    ) -> Result<(), ActorProcessingErr> {
+        if let Some(pending) = self.pending.take() {
+            self.stuck_journal.lock().unwrap().push(pending);
+        }
+        tracing::info!(
+            actor = %ctx.actor_id,
+            elapsed_ms = ctx.elapsed.as_millis(),
+            "persisted stuck action"
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn handle_timeout_triggers_stuck_recovery_and_stats() {
+    use lane_switchboards::actor::spawn_with_config;
+    use lane_switchboards::config::ActorConfig;
+    use lane_switchboards::monitor::ActorMonitor;
+    use std::time::Duration;
+
+    let journal = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let config = ActorConfig {
+        handle_timeout: Some(Duration::from_millis(50)),
+        ..Default::default()
+    };
+
+    let (actor, join) = spawn_with_config(
+        SlowWorker {
+            pending: None,
+            stuck_journal: journal.clone(),
+        },
+        None,
+        &config,
+    )
+    .await
+    .expect("spawn");
+
+    let id = actor.id;
+    actor
+        .send(SlowMsg { sleep_ms: 500 })
+        .await
+        .expect("send slow msg");
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let stats = ActorMonitor::global().get(id).expect("stats");
+    assert_eq!(stats.handle_timeouts, 1);
+    assert_eq!(journal.lock().unwrap().len(), 1);
+    assert_eq!(journal.lock().unwrap()[0].sleep_ms, 500);
+
+    join.await.expect("join");
+}

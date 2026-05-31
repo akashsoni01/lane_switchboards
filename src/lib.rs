@@ -14,17 +14,19 @@ pub mod config;
 pub mod distributed;
 pub mod hash_ring;
 pub mod mesh;
+pub mod monitor;
 pub mod registry;
 pub mod supervisor;
 
 pub use actor::{
     spawn, spawn_on_current_runtime, spawn_on_runtime, spawn_with_config, Actor, ActorId,
-    ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason,
+    ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason, HandleStuckContext,
 };
 pub use config::{
     build_multi_thread_runtime, spawn_on, ActorConfig, DedicatedRuntime, DistributedConfig,
     RuntimeOptions,
 };
+pub use monitor::{ActorMonitor, ActorStats};
 pub use distributed::{
     serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime,
     serve_actor_with_config, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef,

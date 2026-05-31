@@ -66,6 +66,8 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `registry.rs` | Global `DashMap` actor index |
 | `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor`, hash-ring routing |
 | `hash_ring.rs` | `HashRing` / `RingNode` consistent-hash discovery |
+| `config.rs` | `ActorConfig`, load limits, handle timeouts |
+| `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | TCP service mesh — `ServiceMesh`, registry, `MeshRouter`, `serve_microservice` |
 
 ## One supervisor, many children
@@ -204,6 +206,38 @@ router.invoke_all("orders", health_msg).await;            // every replica
 ```
 
 See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`) and [`serve_microservice.md`](examples/serve_microservice.md) (bind addresses, ports, calling from other processes).
+
+## Deadlock / slow-handle prevention
+
+Stuck or slow `handle()` calls are bounded via [`ActorConfig`](src/config.rs):
+
+| Field | Role |
+|-------|------|
+| `handle_timeout` | Max wall time per `handle()` — overrun → `on_handle_stuck` → `ExitReason::HandleTimeout` → supervisor restart |
+| `slow_handle_threshold` | Warn + count handles that finish but exceed this duration (defaults to `handle_timeout`) |
+
+**Lifecycle hooks** on [`Actor`](src/actor.rs):
+
+| Method | When |
+|--------|------|
+| `on_handle_begin(&msg)` | Before each `handle` — store pending work for recovery |
+| `on_handle_stuck(ctx)` | After timeout — persist journal / stuck action |
+| `handle(msg)` | Normal processing |
+
+**Monitor:** `ActorMonitor::global().get(actor_id)` / `.all()` — messages handled, panics, timeouts, in-flight, last/max handle ms.
+
+```rust
+use lane_switchboards::{ActorConfig, ActorMonitor, spawn_with_config};
+use std::time::Duration;
+
+let config = ActorConfig {
+    handle_timeout: Some(Duration::from_secs(5)),
+    ..Default::default()
+};
+let (actor, _) = spawn_with_config(MyWorker, None, &config).await?;
+// ...
+let stats = ActorMonitor::global().get(actor.id);
+```
 
 ## Examples
 

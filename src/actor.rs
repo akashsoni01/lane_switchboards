@@ -1,6 +1,7 @@
 //! Custom actor runtime: `run_actor` loop, linking, monitoring, hot upgrade.
 
 use crate::config::{spawn_on, ActorConfig};
+use crate::monitor::ActorMonitor;
 use crate::registry::{get_actor_sender, register_actor, register_supervisor, unregister_actor};
 use crate::supervisor::RestartSignal;
 use async_trait::async_trait;
@@ -12,6 +13,7 @@ use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -40,8 +42,18 @@ pub enum ExitReason {
     Normal,
     Shutdown,
     Error(String),
+    /// `handle()` exceeded [`ActorConfig::handle_timeout`].
+    HandleTimeout { elapsed_ms: u64, limit_ms: u64 },
     Linked(ActorId, Box<ExitReason>),
     Killed,
+}
+
+/// Context passed to [`Actor::on_handle_stuck`] when a handle times out.
+#[derive(Debug, Clone)]
+pub struct HandleStuckContext {
+    pub actor_id: ActorId,
+    pub elapsed: Duration,
+    pub limit: Duration,
 }
 
 /// Messages delivered to the actor mailbox.
@@ -68,9 +80,17 @@ pub trait DynActor<M: Send + Sync + 'static>: Send + Sync {
     fn dyn_pre_start(
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>>;
+    fn dyn_on_handle_begin<'a>(
+        &'a mut self,
+        msg: &'a M,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + 'a>>;
     fn dyn_handle(
         &mut self,
         msg: M,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>>;
+    fn dyn_on_handle_stuck(
+        &mut self,
+        ctx: HandleStuckContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>>;
     fn dyn_post_stop(
         &mut self,
@@ -87,7 +107,16 @@ pub trait Actor<M: Send + Sync + 'static>: Send + Sync {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
         Ok(())
     }
+    /// Called before each `handle()` — store pending work here for recovery on timeout.
+    async fn on_handle_begin(&mut self, _msg: &M) -> Result<(), ActorProcessingErr> {
+        Ok(())
+    }
     async fn handle(&mut self, _msg: M) -> Result<(), ActorProcessingErr> {
+        Ok(())
+    }
+    /// Called when `handle()` exceeds [`ActorConfig::handle_timeout`].
+    /// Persist `on_handle_begin` state or journal the stuck action.
+    async fn on_handle_stuck(&mut self, _ctx: HandleStuckContext) -> Result<(), ActorProcessingErr> {
         Ok(())
     }
     async fn post_stop(&mut self) -> Result<(), ActorProcessingErr> {
@@ -110,11 +139,25 @@ impl<A: Actor<M> + Send + Sync, M: Send + Sync + 'static> DynActor<M> for ActorW
         Box::pin(async move { self.inner.pre_start().await })
     }
 
+    fn dyn_on_handle_begin<'a>(
+        &'a mut self,
+        msg: &'a M,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + 'a>> {
+        Box::pin(async move { self.inner.on_handle_begin(msg).await })
+    }
+
     fn dyn_handle(
         &mut self,
         msg: M,
     ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>> {
         Box::pin(async move { self.inner.handle(msg).await })
+    }
+
+    fn dyn_on_handle_stuck(
+        &mut self,
+        ctx: HandleStuckContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>> {
+        Box::pin(async move { self.inner.on_handle_stuck(ctx).await })
     }
 
     fn dyn_post_stop(
@@ -277,6 +320,7 @@ where
 
     let erased_tx = erase_sender(tx.clone());
     register_actor(id, erased_tx);
+    ActorMonitor::global().register(id);
 
     let boxed = into_dyn_actor(actor);
     let config = *config;
@@ -304,7 +348,7 @@ async fn run_actor<M: Send + Sync + 'static>(
     _runtime: Handle,
 ) {
     if config.max_in_flight <= 1 {
-        run_actor_sequential(id, rx, actor).await;
+        run_actor_sequential(id, rx, actor, config).await;
     } else {
         run_actor_concurrent(id, rx, actor, config).await;
     }
@@ -314,6 +358,7 @@ async fn run_actor_sequential<M: Send + Sync + 'static>(
     id: ActorId,
     mut rx: mpsc::Receiver<Envelope<M>>,
     mut actor: Box<dyn DynActor<M>>,
+    config: ActorConfig,
 ) {
     let mut links: Vec<ActorId> = Vec::new();
     let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
@@ -322,13 +367,14 @@ async fn run_actor_sequential<M: Send + Sync + 'static>(
     if let Err(e) = actor.dyn_pre_start().await {
         exit_reason = ExitReason::Error(e.to_string());
         unregister_actor(id);
+        ActorMonitor::global().mark_inactive(id);
         return;
     }
 
     'actor_loop: while let Some(envelope) = rx.recv().await {
         match envelope {
             Envelope::Msg(m) => {
-                if let Some(reason) = handle_message(id, &mut actor, m, &links).await {
+                if let Some(reason) = handle_message(id, &mut actor, m, &config, &links).await {
                     exit_reason = reason;
                     break 'actor_loop;
                 }
@@ -372,7 +418,7 @@ async fn run_actor_sequential<M: Send + Sync + 'static>(
         }
     }
 
-    finish_actor(id, actor, exit_reason, &links, monitors).await;
+    finish_actor(id, actor, exit_reason, &config, &links, monitors).await;
 }
 
 async fn run_actor_concurrent<M: Send + Sync + 'static>(
@@ -395,6 +441,7 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
             if let Err(e) = inner.dyn_pre_start().await {
                 exit_reason = ExitReason::Error(e.to_string());
                 unregister_actor(id);
+                ActorMonitor::global().mark_inactive(id);
                 return;
             }
         }
@@ -426,13 +473,16 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                         let links_snapshot = links.lock().await.clone();
                         let fail_tx = fail_tx.clone();
                         let task_id = id;
+                        let config = config;
                         handlers.spawn(async move {
                             let _permit = permit;
                             let mut guard = actor.lock().await;
                             let Some(inner) = guard.as_mut() else {
                                 return;
                             };
-                            if let Some(reason) = handle_message(task_id, inner, m, &links_snapshot).await {
+                            if let Some(reason) =
+                                handle_message(task_id, inner, m, &config, &links_snapshot).await
+                            {
                                 let _ = fail_tx.send(reason).await;
                             }
                         });
@@ -495,9 +545,10 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
     let links = links.lock().await.clone();
 
     if let Some(actor) = actor {
-        finish_actor(id, actor, exit_reason, &links, monitors).await;
+        finish_actor(id, actor, exit_reason, &config, &links, monitors).await;
     } else {
         unregister_actor(id);
+        ActorMonitor::global().mark_inactive(id);
     }
 }
 
@@ -505,17 +556,67 @@ async fn handle_message<M: Send + Sync + 'static>(
     id: ActorId,
     actor: &mut Box<dyn DynActor<M>>,
     msg: M,
+    config: &ActorConfig,
     links: &[ActorId],
 ) -> Option<ExitReason> {
-    match AssertUnwindSafe(actor.dyn_handle(msg)).catch_unwind().await {
-        Ok(Ok(())) => None,
+    let monitor = ActorMonitor::global();
+    let started = Instant::now();
+    monitor.begin_handle(id);
+
+    if let Err(e) = actor.dyn_on_handle_begin(&msg).await {
+        monitor.record_error(id);
+        let reason = ExitReason::Error(e.to_string());
+        notify_supervisor(id, &reason).await;
+        propagate_linked_exit(id, &reason, links).await;
+        return Some(reason);
+    }
+
+    let handle_fut = AssertUnwindSafe(async {
+        actor.dyn_handle(msg).await
+    })
+    .catch_unwind();
+
+    let handle_result = if let Some(limit) = config.handle_timeout {
+        match tokio::time::timeout(limit, handle_fut).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                let elapsed = started.elapsed();
+                monitor.record_timeout(id, elapsed);
+                let ctx = HandleStuckContext {
+                    actor_id: id,
+                    elapsed,
+                    limit,
+                };
+                if let Err(e) = actor.dyn_on_handle_stuck(ctx).await {
+                    tracing::warn!(%id, error = %e, "on_handle_stuck failed");
+                }
+                let reason = ExitReason::HandleTimeout {
+                    elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
+                    limit_ms: limit.as_millis().min(u64::MAX as u128) as u64,
+                };
+                notify_supervisor(id, &reason).await;
+                propagate_linked_exit(id, &reason, links).await;
+                return Some(reason);
+            }
+        }
+    } else {
+        handle_fut.await
+    };
+
+    match handle_result {
+        Ok(Ok(())) => {
+            monitor.finish_handle(id, started.elapsed(), config.effective_slow_threshold());
+            None
+        }
         Ok(Err(e)) => {
+            monitor.record_error(id);
             let reason = ExitReason::Error(e.to_string());
             notify_supervisor(id, &reason).await;
             propagate_linked_exit(id, &reason, links).await;
             Some(reason)
         }
         Err(_) => {
+            monitor.record_panic(id);
             let reason = ExitReason::Error("panic in handle".into());
             notify_supervisor(id, &reason).await;
             propagate_linked_exit(id, &reason, links).await;
@@ -528,6 +629,7 @@ async fn finish_actor<M: Send + Sync + 'static>(
     id: ActorId,
     mut actor: Box<dyn DynActor<M>>,
     exit_reason: ExitReason,
+    _config: &ActorConfig,
     links: &[ActorId],
     monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)>,
 ) {
@@ -537,6 +639,7 @@ async fn finish_actor<M: Send + Sync + 'static>(
     }
     propagate_linked_exit(id, &exit_reason, links).await;
     unregister_actor(id);
+    ActorMonitor::global().mark_inactive(id);
 }
 
 async fn notify_supervisor(id: ActorId, reason: &ExitReason) {

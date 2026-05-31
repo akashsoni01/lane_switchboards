@@ -14,10 +14,23 @@ Channel sizing and concurrency are no longer bundled into one struct. Each subsy
 
 | Config | Fields | Defaults | Used by |
 |--------|--------|----------|---------|
-| **`ActorConfig`** | `mailbox_capacity`, `max_in_flight` | 64, 1 | `spawn`, `spawn_with_config`, `spawn_on_runtime` |
+| **`ActorConfig`** | `mailbox_capacity`, `max_in_flight`, `handle_timeout`, `slow_handle_threshold` | 64, 1, none, none | `spawn`, `spawn_with_config`, `spawn_on_runtime` |
 | **`DistributedConfig`** | `bridge_capacity`, `max_in_flight` | 32, 32 | `Node::bind_on_runtime`, `serve_actor_on_runtime` |
 | **`SupervisorConfig`** | `mailbox_capacity` (+ strategy/intensity) | 32 | supervisor restart-signal queue |
 | **`RuntimeOptions`** | `worker_threads` | OS default | `DedicatedRuntime::new` |
+
+### Deadlock / slow-handle prevention (v0.0.2)
+
+| Component | Purpose |
+|-----------|---------|
+| `ActorConfig.handle_timeout` | Per-`handle()` wall-clock limit |
+| `ActorConfig.slow_handle_threshold` | Slow-but-successful handle warnings |
+| `on_handle_begin(&msg)` | Snapshot pending work before handle |
+| `on_handle_stuck(ctx)` | Persist stuck action on timeout |
+| `ExitReason::HandleTimeout` | Actor exit reason + supervisor notification |
+| `ActorMonitor` / `ActorStats` | Global stats: timeouts, panics, in-flight, handle ms |
+
+Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/integration.rs`.
 
 ### Semaphore load limiting (EventBus-style)
 
