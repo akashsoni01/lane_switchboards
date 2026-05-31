@@ -66,6 +66,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `registry.rs` | Global `DashMap` actor index |
 | `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor`, hash-ring routing |
 | `hash_ring.rs` | `HashRing` / `RingNode` consistent-hash discovery |
+| `mesh.rs` | TCP service mesh — `ServiceMesh`, registry, `MeshRouter`, `serve_microservice` |
 
 ## One supervisor, many children
 
@@ -176,6 +177,34 @@ cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
 
 See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`) and [`horizontal_scaling_rest_for_one.md`](examples/horizontal_scaling_rest_for_one.md) (RestForOne processor + reporter per site, multi-send APIs).
 
+## TCP service mesh
+
+Microservices over TCP with a **control plane** (register / discover) and **data plane** (route frames by service name).
+
+| Component | Role |
+|-----------|------|
+| **`MeshRegistryServer`** | TCP registry — instances call `Register` / clients call `List` |
+| **`serve_microservice`** | Bind one service instance (data plane) |
+| **`ServiceMesh` / `MeshRouter`** | Route `invoke(service, key, msg)` via hash ring per service |
+| **`join_mesh`** | Register locally + with TCP registry |
+
+```rust
+use lane_switchboards::mesh::{
+    join_mesh, serve_microservice, MeshRegistryServer, MeshRouter,
+};
+
+let registry = MeshRegistryServer::bind("127.0.0.1:9050").await?;
+let handle = serve_microservice("orders", "orders-1", "127.0.0.1:0", OrdersActor).await?;
+join_mesh(&mut mesh, Some(&registry.address), &handle).await?;
+
+let mut router = MeshRouter::with_registry(&registry.address);
+router.sync().await?;
+router.invoke("orders", &order_id, msg).await?;           // one instance (sticky)
+router.invoke_all("orders", health_msg).await;            // every replica
+```
+
+See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`).
+
 ## Examples
 
 | Example | Command |
@@ -191,6 +220,7 @@ See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --exam
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
+| TCP service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md) |
 
 ## Tests
 

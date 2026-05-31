@@ -63,6 +63,10 @@ path = "examples/horizontal_scaling.rs"
 name = "horizontal_scaling_rest_for_one"
 path = "examples/horizontal_scaling_rest_for_one.rs"
 
+[[example]]
+name = "service_mesh"
+path = "examples/service_mesh.rs"
+
 # --- Calculator & supervision (switchboard routing + fault recovery) ---
 
 [[example]]
