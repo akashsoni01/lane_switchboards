@@ -72,5 +72,9 @@ name = "recoverable_timer_calc"
 path = "examples/recoverable_timer_calc.rs"
 
 [[example]]
+name = "rest_for_one_calculator_timer"
+path = "examples/rest_for_one_calculator_timer.rs"
+
+[[example]]
 name = "ondc_demo"
 path = "examples/ondc_demo.rs"

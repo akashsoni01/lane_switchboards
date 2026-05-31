@@ -109,6 +109,7 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 | Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
+| RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) |
 | Distributed messaging | `cargo run --example distributed_demo` |
 
 ## Tests
