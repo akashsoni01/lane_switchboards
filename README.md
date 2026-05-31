@@ -203,7 +203,7 @@ router.invoke("orders", &order_id, msg).await?;           // one instance (stick
 router.invoke_all("orders", health_msg).await;            // every replica
 ```
 
-See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`).
+See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`) and [`serve_microservice.md`](examples/serve_microservice.md) (bind addresses, ports, calling from other processes).
 
 ## Examples
 
@@ -220,7 +220,7 @@ See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
-| TCP service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md) |
+| TCP service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md), [serve_microservice.md](examples/serve_microservice.md) |
 
 ## Tests
 

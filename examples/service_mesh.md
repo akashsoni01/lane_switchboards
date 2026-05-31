@@ -14,6 +14,8 @@ cargo run --example service_mesh
 
 Source: [`service_mesh.rs`](./service_mesh.rs)
 
+Deep dive on binding and ports: [**serve_microservice.md**](./serve_microservice.md).
+
 ---
 
 ## Architecture
@@ -105,11 +107,13 @@ let registry = MeshRegistryServer::bind("127.0.0.1:9050").await?;
 
 ### 2. Launch a microservice instance
 
+See [serve_microservice.md](./serve_microservice.md) for bind addresses, fixed vs ephemeral ports, and cross-process callers.
+
 ```rust
 let handle = serve_microservice(
     "orders",
     "orders-1",
-    "127.0.0.1:0",
+    "127.0.0.1:9101",   // fixed port — or "127.0.0.1:0" for ephemeral
     OrdersService { .. },
 )
 .await?;
@@ -201,6 +205,7 @@ lane_switchboards mesh is a **minimal teaching mesh** — same control/data spli
 
 ## Related
 
+- [serve_microservice.md](./serve_microservice.md) — bind addresses, ports, mermaid flow, cross-host callers
 - [horizontal_scaling.md](./horizontal_scaling.md) — cluster without service names
 - [horizontal_scaling_rest_for_one.md](./horizontal_scaling_rest_for_one.md) — RestForOne per site
 - [README — service mesh](../README.md#tcp-service-mesh)
