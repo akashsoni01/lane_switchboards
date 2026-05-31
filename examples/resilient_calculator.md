@@ -29,7 +29,7 @@ The resilient version wraps the calculator in a **supervisor** that:
 ```mermaid
 flowchart TB
     Main["main"]
-    Handle["CalcHandle<br/>Arc Mutex ActorRef"]
+    Handle["CalcHandle<br/>ChildSlot"]
     Sup["Supervisor<br/>OneForOne"]
     Calc["ResilientCalculator"]
 
@@ -37,15 +37,15 @@ flowchart TB
     Handle -->|"send CalcMsg"| Calc
     Calc -->|"panic or Err"| Sup
     Sup -->|"restart child"| Calc
-    Sup -->|"update ref"| Handle
+    Sup -->|"update slot"| Handle
 ```
 
 | Component | Role |
 |-----------|------|
 | `ResilientCalculator` | Same add/sub/mul/div as calculator; panics on divide-by-zero |
 | `Supervisor` | Restarts failed child up to intensity limit |
-| `CalcHandle` | Shared `Arc<Mutex<Option<ActorRef>>>` updated on every (re)start |
-| `child_spec` factory | Spawns calculator with supervisor channel, writes ref to shared slot |
+| `CalcHandle` | Wraps `ChildSlot<CalcMsg>` — always points at the live `ActorRef` |
+| `ChildSlot::child_spec` | Spawns calculator with supervisor channel, updates slot on every restart |
 
 ---
 
@@ -84,30 +84,27 @@ sequenceDiagram
 ```
 
 1. Panic is caught in `run_actor` and converted to `ExitReason::Error("panic in handle")`.
-2. Supervisor receives `RestartSignal` and calls `child_spec::restart`.
-3. Factory spawns a new `ResilientCalculator` and stores its `ActorRef` in the shared slot.
+2. Supervisor receives `RestartSignal` and re-runs the child factory.
+3. `ChildSlot::child_spec` spawns a new `ResilientCalculator` and stores its `ActorRef` in the slot.
 4. Next request via `CalcHandle::actor()` uses the new ref.
 
 ---
 
 ## Stable handle pattern
 
-Supervised actors get a **new `ActorId`** on each restart, so a plain `ActorRef` goes stale. The example solves this with a shared slot:
+Supervised actors get a **new `ActorId`** on each restart, so a plain `ActorRef` goes stale. The library provides `ChildSlot` for the single-child case:
 
 ```rust
-let current = Arc::new(Mutex::new(None::<ActorRef<CalcMsg>>));
+let slot = Arc::new(ChildSlot::new());
+let spec = ChildSlot::child_spec(0, slot.clone(), || ResilientCalculator::default());
 
-let spec = child_spec(0, move |sup_tx| {
-    let slot = current.clone();
-    Box::pin(async move {
-        let (actor_ref, _) = spawn(ResilientCalculator::default(), Some(sup_tx)).await?;
-        *slot.lock().await = Some(actor_ref.clone());
-        Ok(actor_ref)
-    })
-});
+let sup_handle = Supervisor::new(config, vec![spec]).start().await?;
+slot.require().await?; // live ref after initial spawn
 ```
 
-`CalcHandle::actor()` reads from this slot before every request.
+`CalcHandle::actor()` reads from `slot.get().await` before every request.
+
+For **multiple named children**, use `ChildRegistry` + `spawn_child_spec` — see [rest_for_one_calculator_timer.md](./rest_for_one_calculator_timer.md).
 
 ---
 
@@ -150,7 +147,8 @@ Panics in `handle` now trigger the same exit path as `Err` returns: supervisor n
 ## Related docs
 
 - [calculator.md](./calculator.md) — unsupervised calculator
-- [resilient_calculator_timer.rs](./resilient_calculator_timer.rs) — timer without journal
+- [supervisor_strategies.md](./supervisor_strategies.md) — all restart strategies + `ChildRegistry`
+- [resilient_calculator_timer.rs](./resilient_calculator_timer.rs) — timer without journal (uses `ChildSlot`)
 - [recoverable_timer_calc.md](./recoverable_timer_calc.md) — journal-backed recovery + timer
-- [architecture.md](../architecture.md) — supervision strategies
+- [rest_for_one_calculator_timer.md](./rest_for_one_calculator_timer.md) — multi-child RestForOne with `ChildRegistry`
 - [envelope_demo.md](./envelope_demo.md) — actor mailbox variants

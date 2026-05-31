@@ -115,7 +115,7 @@ div: 10 and 0 -> error: division by zero
 |------|-----|
 | Chain operations | Add `CalcMsg::Apply(op, b, reply)` that uses `last_result` as `a` |
 | Integer-only math | Change operands to `i64` or wrap with rounding |
-| Supervision | Pass a supervisor channel to `spawn` so crashes restart the calculator |
+| Supervision | Use `ChildSlot` or pass a supervisor channel to `spawn` — see [resilient_calculator.md](./resilient_calculator.md) |
 | Remote calculator | Register the actor on a `Node` and send from `RemoteActorRef` (see `distributed_demo`) |
 | More ops | Add `Mod`, `Pow` variants to `CalcMsg` |
 

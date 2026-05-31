@@ -17,7 +17,9 @@ Lane Switchboards mirrors Erlang/OTP supervision:
 | Concept | Rust type |
 |---------|-----------|
 | Supervisor | `Supervisor<M>` + `SupervisorConfig` |
-| Child factory | `child_spec(order, factory)` |
+| Named children | `spawn_child_spec(order, name, registry, build)` |
+| Stable refs (multi-child) | `ChildRegistry<M>` — `get(name)`, `generations()` |
+| Low-level factory | `child_spec(order, factory)` |
 | Failure signal | `RestartSignal { child_id, reason }` |
 | Restart strategy | `RestartStrategy` |
 | Restart budget | `max_restarts` within `within_secs` |
@@ -58,13 +60,16 @@ Every child implements `Actor<SupMsg>` with:
 
 ## Generation counter
 
-Each worker increments a shared generation count in `pre_start`:
+Each worker increments a shared generation count via `ChildRegistry` in `pre_start`:
 
 ```rust
 async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-    let mut gens = self.generations.lock().await;
-    *gens.entry(self.name.clone()).or_insert(0) += 1;
-    println!("[spawn] {} generation {}", self.name, gens[&self.name]);
+    self.registry.bump_generation(&self.name).await;
+    println!(
+        "[spawn] {} generation {}",
+        self.name,
+        self.registry.generation(&self.name).await
+    );
     Ok(())
 }
 ```
@@ -80,24 +85,33 @@ The demo snapshots generations before and after each failure to make restart sco
 
 ## Wiring multiple children
 
-One supervisor, three `child_spec`s, shared ref slots:
+One supervisor, three named children via `spawn_child_spec`:
 
 ```rust
-let refs = ChildRefs::new();
+let registry = Arc::new(ChildRegistry::new());
 
 let children: Vec<_> = ["alpha", "beta", "gamma"]
     .iter()
     .enumerate()
-    .map(|(order, name)| make_spec(order, name, &refs))
+    .map(|(order, name)| {
+        let name = (*name).to_string();
+        let registry = registry.clone();
+        spawn_child_spec(order, name.clone(), registry.clone(), move || NamedWorker {
+            name,
+            registry,
+        })
+    })
     .collect();
 
-let handle = Supervisor::new(config, children).start().await?;
+let handle = Supervisor::new(config, children)
+    .start_settled(Duration::from_millis(50))
+    .await?;
 ```
 
-`ChildRefs` holds:
+`ChildRegistry` holds:
 
-- `by_name` — `ActorRef<SupMsg>` updated on every spawn/restart
-- `generations` — shared counter map for observability
+- named `ActorRef`s — updated on every spawn/restart (`get`, `track`)
+- generation counters — for observability (`bump_generation`, `generations`)
 
 ---
 
@@ -191,7 +205,7 @@ sequenceDiagram
 
 **Use when:** children form a **dependency chain** — a failure in the middle invalidates everything downstream but not upstream (e.g. parser → processor → writer).
 
-The `order` argument to `child_spec(order, …)` defines this chain. Lower numbers start first and are considered upstream.
+The `order` argument to `spawn_child_spec(order, …)` defines this chain. Lower numbers start first and are considered upstream.
 
 ---
 
@@ -289,7 +303,7 @@ flowchart TD
     Exit["run_actor exits"]
     Signal["RestartSignal to supervisor"]
     Strategy["Apply RestartStrategy"]
-    Factory["child_spec restart"]
+    Factory["spawn_child_spec restart"]
     Spawn["spawn new worker pre_start"]
 
     Msg --> Handle --> Exit --> Signal --> Strategy --> Factory --> Spawn
@@ -344,14 +358,14 @@ ERROR supervisor restart intensity exceeded — shutting down
 |-------|--------|
 | Same message type | All children under one supervisor share `Supervisor<M>` — here `M = SupMsg` |
 | `supervise_actor` | Single-child helper only; use `Supervisor::new(vec![…])` for multiple |
-| Child refs | `start()` does not return refs — capture in factory via `ChildRefs` pattern |
-| Stale refs after restart | `ChildRefs.by_name` is updated on every restart in `make_spec` |
+| Child refs | `start()` does not return refs — use `ChildRegistry` (this example) or `ChildSlot` (single child) |
+| Stale refs after restart | `ChildRegistry` is updated on every restart inside `spawn_child_spec` |
 
 ---
 
 ## Related docs
 
 - [README — One supervisor, many children](../README.md#one-supervisor-many-children)
-- [architecture.md](../architecture.md) — supervision section
-- [resilient_calculator.md](./resilient_calculator.md) — single supervised child in practice
+- [rest_for_one_calculator_timer.md](./rest_for_one_calculator_timer.md) — `ChildRegistry` + RestForOne chain
+- [resilient_calculator.md](./resilient_calculator.md) — `ChildSlot` for a single supervised child
 - [envelope_demo.md](./envelope_demo.md) — actor mailbox control messages

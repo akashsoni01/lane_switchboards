@@ -63,6 +63,37 @@ Each actor handles only its variants; others are ignored.
 
 ---
 
+## Supervisor wiring
+
+The example uses library helpers from [`supervisor.rs`](../src/supervisor.rs):
+
+```rust
+let registry = Arc::new(ChildRegistry::new());
+
+Supervisor::new(
+    SupervisorConfig {
+        strategy: RestartStrategy::RestForOne,
+        ..config
+    },
+    vec![
+        spawn_child_spec(0, "calculator", registry.clone(), { /* Calculator */ }),
+        spawn_child_spec(1, "timer", registry.clone(), { /* ResultTimer */ }),
+    ],
+)
+.start_settled(Duration::from_millis(50))
+.await?;
+```
+
+| Piece | Role |
+|-------|------|
+| `spawn_child_spec(order, name, …)` | Spawns at `order`, registers ref under `name` on every (re)start |
+| `ChildRegistry` | `get("calculator")` / `get("timer")` return the live `ActorRef` |
+| `start_settled` | Brief pause after initial spawn so refs are ready |
+
+Both actors hold `Arc<ChildRegistry<AppMsg>>` for sibling lookup and generation bumps in `pre_start`.
+
+---
+
 ## Generation counter
 
 Both actors bump a shared generation map in `pre_start`:
@@ -185,7 +216,7 @@ RestForOne supervisor: calculator order=0, timer order=1
 
 ## Why restart the timer?
 
-The timer holds a `self_ref` for scheduling and assumes the calculator ref in `ChildRefs` is stable. After calculator restart:
+The timer holds a `self_ref` for scheduling and looks up the calculator via `ChildRegistry::get("calculator")`. After calculator restart:
 
 - The calculator gets a new `ActorId`.
 - The timer’s schedule was tied to the old process.
@@ -198,4 +229,5 @@ The timer holds a `self_ref` for scheduling and assumes the calculator ref in `C
 
 - [supervisor_strategies.md](./supervisor_strategies.md) — all strategies + intensity
 - [recoverable_timer_calc.md](./recoverable_timer_calc.md) — journal survives restart
+- [resilient_calculator.md](./resilient_calculator.md) — `ChildSlot` for single-child supervision
 - [README — One supervisor, many children](../README.md#one-supervisor-many-children)

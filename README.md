@@ -60,13 +60,22 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | Module | Capability |
 |--------|------------|
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
-| `supervisor.rs` | OneForOne / OneForAll / RestForOne |
+| `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec` |
 | `registry.rs` | Global `DashMap` actor index |
 | `distributed.rs` | TCP-framed remote actors |
 
 ## One supervisor, many children
 
-Yes — a single `Supervisor` manages **multiple child actors**. Pass several `child_spec`s to `Supervisor::new`; on `start()` the supervisor spawns every child and listens on one shared restart channel.
+Yes — a single `Supervisor` manages **multiple child actors**. Pass several child specs to `Supervisor::new`; on `start()` the supervisor spawns every child and listens on one shared restart channel.
+
+Use the built-in helpers so you do not reimplement spawn-and-track boilerplate in every example:
+
+| Helper | When to use |
+|--------|-------------|
+| **`spawn_child_spec(order, name, registry, build)`** | Multiple named children under one supervisor (RestForOne chains, strategy demos) |
+| **`ChildRegistry<M>`** | Stable `ActorRef` lookup by name after restart; optional generation counters |
+| **`ChildSlot<M>`** + **`ChildSlot::child_spec`** | Single supervised child with a stable handle |
+| **`Supervisor::start_settled(duration)`** | Start and wait briefly for initial spawns to settle |
 
 | Strategy | When one child fails |
 |----------|----------------------|
@@ -74,34 +83,47 @@ Yes — a single `Supervisor` manages **multiple child actors**. Pass several `c
 | `OneForAll` | Restart all children |
 | `RestForOne` | Restart the failed child and every child with higher `order` |
 
+**Multiple children (RestForOne):**
+
 ```rust
-use lane_switchboards::actor::{spawn, Actor, ActorRef};
 use lane_switchboards::supervisor::{
-    child_spec, RestartStrategy, Supervisor, SupervisorConfig,
+    spawn_child_spec, ChildRegistry, RestartStrategy, Supervisor, SupervisorConfig,
 };
+use std::sync::Arc;
+use std::time::Duration;
 
-enum WorkerMsg { Ping }
+let registry = Arc::new(ChildRegistry::new());
 
-struct WorkerA;
-struct WorkerB;
-
-// Both actors must share the same message type M (here: WorkerMsg).
-let spec_a = child_spec(0, |sup_tx| {
-    Box::pin(async move { spawn(WorkerA, Some(sup_tx)).await.map(|(r, _)| r) })
-});
-let spec_b = child_spec(1, |sup_tx| {
-    Box::pin(async move { spawn(WorkerB, Some(sup_tx)).await.map(|(r, _)| r) })
-});
-
-let sup = Supervisor::new(
+let handle = Supervisor::new(
     SupervisorConfig {
-        strategy: RestartStrategy::OneForOne,
+        strategy: RestartStrategy::RestForOne,
         ..Default::default()
     },
-    vec![spec_a, spec_b],
-);
-let _handle = sup.start().await?;
+    vec![
+        spawn_child_spec(0, "upstream", registry.clone(), || UpstreamWorker { /* … */ }),
+        spawn_child_spec(1, "downstream", registry.clone(), || DownstreamWorker { /* … */ }),
+    ],
+)
+.start_settled(Duration::from_millis(50))
+.await?;
+
+// Look up live refs after restart:
+let upstream = registry.get("upstream").await;
 ```
+
+**Single child (OneForOne):**
+
+```rust
+use lane_switchboards::supervisor::{ChildSlot, Supervisor, SupervisorConfig};
+
+let slot = Arc::new(ChildSlot::new());
+let spec = ChildSlot::child_spec(0, slot.clone(), || MyWorker::default());
+
+let _handle = Supervisor::new(SupervisorConfig::default(), vec![spec]).start().await?;
+let worker = slot.require().await?;
+```
+
+Low-level `child_spec(order, factory)` is still available when you need a custom spawn factory.
 
 **Constraints**
 
@@ -110,8 +132,8 @@ let _handle = sup.start().await?;
 | Message type | All children under one supervisor must use the same `M` (`Supervisor<M>`). Unify with a shared enum if needed. |
 | `supervise_actor` | Convenience helper for **one** child only — use `Supervisor::new` + `vec![…]` for multiple. |
 | Restart intensity | `max_restarts` / `within_secs` is shared across the whole supervisor, not per child. When too many restart events land inside the sliding `within_secs` window, the supervisor stops restarting (`ShutdownSupervisor` by default). See [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md#intensity-limits-max_restarts-within_secs). |
-| Child handles | `start()` does not return `ActorRef`s — capture them in the factory (see [recoverable_timer_calc.rs](examples/recoverable_timer_calc.rs)) or read from the registry. |
-| `order` | Set on each `child_spec(order, …)`; used by `RestForOne` to define startup/restart dependency order. |
+| Child handles | `start()` does not return `ActorRef`s — use `ChildRegistry` (named) or `ChildSlot` (single child); both are updated on every restart |
+| `order` | First argument to `spawn_child_spec(order, …)` or `child_spec(order, …)`; used by `RestForOne` for startup/restart dependency order |
 
 See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run --example supervisor_strategies`) for live demos of each strategy and intensity limits.
 

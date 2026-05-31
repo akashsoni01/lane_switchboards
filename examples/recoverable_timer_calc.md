@@ -51,7 +51,7 @@ flowchart TB
 | `SharedJournal` | `Arc<Mutex<OpJournal>>` — shared across restarts |
 | `RecoverableCalculator` | Runs ops, writes journal, replays on `pre_start` |
 | `Supervisor` | Restarts calculator after panic |
-| `CalcHandle` | Stable `ActorRef` slot + direct journal reads |
+| `CalcHandle` | `ChildSlot` for stable `ActorRef` + direct journal reads |
 | `JournalTimer` | Prints `last_result` and journal counts every 800ms |
 
 ---
@@ -67,7 +67,7 @@ type SharedJournal = Arc<Mutex<OpJournal>>;
 The journal must survive **actor death** and be the **same object** passed into every restarted calculator:
 
 - Created once in `main` before the supervisor starts
-- Cloned into `CalcHandle`, the `child_spec` factory, and each `RecoverableCalculator`
+- Cloned into `CalcHandle`, each `RecoverableCalculator`, and the `ChildSlot::child_spec` factory
 - Without `Arc`, each restart would get an empty copy and recovery would fail
 
 ### `Mutex` — safe concurrent mutation
@@ -227,16 +227,25 @@ Two shared slots, two purposes:
 
 ```rust
 struct CalcHandle {
-    current: Arc<Mutex<Option<ActorRef<CalcMsg>>>>,  // live actor (changes on restart)
-    journal: SharedJournal,                           // survives restart
+    slot: Arc<ChildSlot<CalcMsg>>,   // live actor (changes on restart)
+    journal: SharedJournal,            // survives restart
     _supervisor: SupervisorHandle<CalcMsg>,
 }
 ```
 
 | Field | Why |
 |-------|-----|
-| `current` | Supervisor assigns a new `ActorId` on restart; slot is updated by `child_spec` |
+| `slot` | `ChildSlot` is updated by `ChildSlot::child_spec` on every restart |
 | `journal` | Same `Arc` for all calculator instances; state persists |
+
+Started with:
+
+```rust
+let slot = Arc::new(ChildSlot::new());
+let spec = ChildSlot::child_spec(0, slot.clone(), move || {
+    RecoverableCalculator::new(journal.clone())
+});
+```
 
 `pending_ops()` reads the journal directly (no message to the calculator) and returns all `(id, OpKind)` pairs still `Pending`.
 
@@ -352,7 +361,7 @@ flowchart LR
 | Retry pending ops | On `pre_start`, re-run `Pending` entries (skip or fix invalid ones) |
 | Disk-backed journal | Serialize `OpJournal` to file or SQLite |
 | Mark failed ops | Catch panic metadata, set `OpStatus::Failed(reason)` |
-| Supervise timer too | Wrap `JournalTimer` in its own supervisor |
+| Supervise timer too | Wrap `JournalTimer` in its own supervisor, or use `ChildRegistry` + `spawn_child_spec` under RestForOne — see [rest_for_one_calculator_timer.md](./rest_for_one_calculator_timer.md) |
 | Remove pending on replay | GC ops that can never succeed |
 
 ---
@@ -364,7 +373,7 @@ flowchart LR
 | `OpJournal` | journal types | HashMap operation log |
 | `SharedJournal` | type alias | `Arc<Mutex<OpJournal>>` |
 | `RecoverableCalculator` | calculator actor | compute + replay |
-| `CalcHandle::start` | handle + supervisor | wires journal into factory |
+| `CalcHandle::start` | handle + supervisor | `ChildSlot::child_spec` wires journal into factory |
 | `JournalTimer` | timer actor | periodic summary |
 | `print_pending` | main helper | shows panic-interrupted ops |
 
@@ -373,7 +382,8 @@ flowchart LR
 ## Related docs
 
 - [calculator.md](./calculator.md) — basic request-reply calculator
-- [resilient_calculator.md](./resilient_calculator.md) — supervision without journal
+- [resilient_calculator.md](./resilient_calculator.md) — `ChildSlot` supervision without journal
 - [resilient_calculator_timer.rs](./resilient_calculator_timer.rs) — timer without journal replay
-- [architecture.md](../architecture.md) — actor runtime and supervision
+- [rest_for_one_calculator_timer.md](./rest_for_one_calculator_timer.md) — supervised calculator + timer under RestForOne
+- [README — One supervisor, many children](../README.md#one-supervisor-many-children)
 - [envelope_demo.md](./envelope_demo.md) — mailbox control messages
