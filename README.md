@@ -19,6 +19,7 @@ See **[architecture.md](./architecture.md)** for Mermaid diagrams and module bre
 |---------|---------|
 | Actix gateway + Ractor RestTemplate | `cargo run --example gateway` |
 | Hot code upgrade | `cargo run --example hot_upgrade` |
+| Envelope variants (link, monitor, upgrade, …) | `cargo run --example envelope_demo` — see [envelope_demo.md](examples/envelope_demo.md) |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | ONDC signing (testecom → dummy server) | `cargo run --example ondc_demo` — see [ondc.md](examples/gateway/ondc.md) |
 

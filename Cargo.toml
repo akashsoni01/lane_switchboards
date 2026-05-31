@@ -47,5 +47,9 @@ name = "distributed_demo"
 path = "examples/distributed_demo.rs"
 
 [[example]]
+name = "envelope_demo"
+path = "examples/envelope_demo.rs"
+
+[[example]]
 name = "ondc_demo"
 path = "examples/ondc_demo.rs"

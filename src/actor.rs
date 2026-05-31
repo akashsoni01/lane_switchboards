@@ -170,6 +170,13 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
             .map_err(|e| Box::new(e) as ActorProcessingErr)
     }
 
+    pub async fn unlink(&self, other: ActorId) -> Result<(), ActorProcessingErr> {
+        self.tx
+            .send(Envelope::Unlink(other))
+            .await
+            .map_err(|e| Box::new(e) as ActorProcessingErr)
+    }
+
     pub async fn upgrade(&self, new_impl: impl Actor<M> + Send + Sync + 'static) -> Result<(), ActorProcessingErr> {
         let boxed = into_dyn_actor(new_impl);
         self.tx
@@ -188,6 +195,13 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
             })
             .await;
         rx
+    }
+
+    pub async fn demonitor(&self, observer_id: ActorId) -> Result<(), ActorProcessingErr> {
+        self.tx
+            .send(Envelope::Demonitor(observer_id))
+            .await
+            .map_err(|e| Box::new(e) as ActorProcessingErr)
     }
 }
 
