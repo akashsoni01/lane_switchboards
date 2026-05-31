@@ -5,11 +5,13 @@
 //!   [`ChildRegistry`] / [`ChildSlot`] for stable child refs after restart
 //! - [`registry`]: global actor index
 //! - [`distributed`]: TCP-framed remote messaging, [`Cluster`] roster, [`serve_actor`]
+//! - [`hash_ring`]: consistent-hash node discovery ([`HashRing`], [`RingNode`])
 //!
 //! Ractor-based HTTP client: see the `gateway` example (`examples/gateway/`).
 
 pub mod actor;
 pub mod distributed;
+pub mod hash_ring;
 pub mod registry;
 pub mod supervisor;
 
@@ -19,6 +21,7 @@ pub use actor::{
 pub use distributed::{
     serve_actor, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef, RemoteMessage,
 };
+pub use hash_ring::{HashRing, RingNode};
 pub use supervisor::{
     child_spec, spawn_child_spec, supervise_actor, ChildRegistry, ChildSlot, ChildSpec,
     IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,

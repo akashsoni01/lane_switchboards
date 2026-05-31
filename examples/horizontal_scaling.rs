@@ -2,7 +2,7 @@
 //!
 //! Phase 1 — two worker nodes handle incoming jobs.
 //! Phase 2 — two more nodes bind on new addresses (simulating extra hardware) and join
-//! the same cluster roster; the coordinator round-robins across all four.
+//! the same cluster roster; jobs route via consistent hash on `job_id`.
 //!
 //! Run: `cargo run --example horizontal_scaling`
 //! See: `examples/horizontal_scaling.md`
@@ -79,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for job_id in 1..=6 {
         cluster
-            .send_round_robin(WorkMsg::Process { job_id })
+            .send_by_key(&job_id, WorkMsg::Process { job_id })
             .await?;
     }
 
@@ -101,11 +101,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for job_id in 7..=14 {
         cluster
-            .send_round_robin(WorkMsg::Process { job_id })
+            .send_by_key(&job_id, WorkMsg::Process { job_id })
             .await?;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    println!("\nDone — jobs spread across all {} nodes.", cluster.len());
+    println!("\nDone — {} nodes in hash ring.", cluster.ring().node_count());
     Ok(())
 }

@@ -153,3 +153,43 @@ async fn cluster_round_robin_across_nodes() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 2);
 }
+
+#[tokio::test]
+async fn cluster_hash_ring_routes_same_key_to_same_node() {
+    use lane_switchboards::distributed::{serve_actor, Cluster};
+
+    let a = serve_actor(
+        "a",
+        "127.0.0.1:0",
+        "worker",
+        PingCounter(Arc::new(std::sync::atomic::AtomicU64::new(0))),
+    )
+    .await
+    .expect("node a");
+    let b = serve_actor(
+        "b",
+        "127.0.0.1:0",
+        "worker",
+        PingCounter(Arc::new(std::sync::atomic::AtomicU64::new(0))),
+    )
+    .await
+    .expect("node b");
+
+    let mut cluster = Cluster::new();
+    cluster.join(a.member.clone());
+    cluster.join(b.member.clone());
+
+    let key = 42u64;
+    let first = cluster.member_for_key(&key).map(|m| m.name.clone());
+    assert_eq!(cluster.member_for_key(&key).map(|m| m.name.clone()), first);
+
+    for _ in 0..3 {
+        cluster
+            .send_by_key(&key, RemotePing(key))
+            .await
+            .expect("send");
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(first.is_some());
+}

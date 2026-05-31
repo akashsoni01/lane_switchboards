@@ -62,7 +62,8 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
 | `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec` |
 | `registry.rs` | Global `DashMap` actor index |
-| `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor` |
+| `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor`, hash-ring routing |
+| `hash_ring.rs` | `HashRing` / `RingNode` consistent-hash discovery |
 
 ## One supervisor, many children
 
@@ -145,7 +146,9 @@ Add computing capacity by binding new TCP nodes and joining them to a shared [`C
 |--------|-------------|
 | **`serve_actor(name, bind_addr, target, actor)`** | Bind a local node and bridge frames to a local actor |
 | **`Cluster::join(member)`** | Register a remote node's address in the roster |
-| **`Cluster::send_round_robin(msg)`** | Spread work across all members |
+| **`Cluster::send_by_key(key, msg)`** | Route to the node chosen by consistent hash |
+| **`Cluster::send_round_robin(msg)`** | Spread work across all members (no stickiness) |
+| **`HashRing`** | Standalone consistent-hash discovery ([`hash_ring.rs`](src/hash_ring.rs)) |
 
 ```rust
 use lane_switchboards::distributed::{serve_actor, Cluster};
@@ -161,7 +164,8 @@ cluster.join(node_b.member.clone());
 let node_c = serve_actor("worker-c", "0.0.0.0:9002", "worker", MyWorker::default()).await?;
 cluster.join(node_c.member.clone());
 
-cluster.send_round_robin(WorkMsg::Process { job_id: 1 }).await?;
+cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
+// Same job_id always maps to the same node until the ring changes.
 ```
 
 See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`).

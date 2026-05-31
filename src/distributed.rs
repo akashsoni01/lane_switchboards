@@ -1,9 +1,11 @@
 //! Distributed actors over TCP with length-prefixed JSON frames.
 
 use crate::actor::{spawn, Actor};
+use crate::hash_ring::{HashRing, RingNode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -186,12 +188,18 @@ impl ClusterMember {
     pub fn remote_ref<M: RemoteMessage>(&self) -> RemoteActorRef<M> {
         RemoteActorRef::new(&self.node_addr, &self.target)
     }
+
+    pub fn ring_node(&self) -> RingNode {
+        RingNode::from_socket_addr(&self.name, &self.node_addr)
+    }
 }
 
-/// Roster of remote actors — join nodes as they come online, dispatch round-robin or broadcast.
+/// Roster of remote actors — join nodes as they come online, dispatch by hash ring or round-robin.
 pub struct Cluster<M: RemoteMessage> {
     members: Vec<ClusterMember>,
     refs: Vec<RemoteActorRef<M>>,
+    refs_by_id: HashMap<String, usize>,
+    ring: HashRing,
     next: AtomicUsize,
 }
 
@@ -203,9 +211,15 @@ impl<M: RemoteMessage> Default for Cluster<M> {
 
 impl<M: RemoteMessage> Cluster<M> {
     pub fn new() -> Self {
+        Self::with_virtual_nodes(150)
+    }
+
+    pub fn with_virtual_nodes(virtual_nodes: u32) -> Self {
         Self {
             members: Vec::new(),
             refs: Vec::new(),
+            refs_by_id: HashMap::new(),
+            ring: HashRing::new(virtual_nodes),
             next: AtomicUsize::new(0),
         }
     }
@@ -222,10 +236,53 @@ impl<M: RemoteMessage> Cluster<M> {
         &self.members
     }
 
-    /// Add a remote node to the roster (existing nodes keep running).
+    pub fn ring(&self) -> &HashRing {
+        &self.ring
+    }
+
+    /// Add a remote node to the roster and hash ring (existing nodes keep running).
     pub fn join(&mut self, member: ClusterMember) {
+        let idx = self.refs.len();
+        self.ring.add_node(member.ring_node());
+        self.refs_by_id.insert(member.name.clone(), idx);
         self.refs.push(member.remote_ref());
         self.members.push(member);
+    }
+
+    /// Remove a node from the roster and hash ring.
+    pub fn leave(&mut self, node_id: &str) -> Option<ClusterMember> {
+        self.ring.remove_node(node_id)?;
+        let idx = self.refs_by_id.remove(node_id)?;
+        self.refs.remove(idx);
+        let member = self.members.remove(idx);
+        self.refs_by_id.clear();
+        for (i, m) in self.members.iter().enumerate() {
+            self.refs_by_id.insert(m.name.clone(), i);
+        }
+        Some(member)
+    }
+
+    /// Lookup cluster member for a key via the hash ring.
+    pub fn member_for_key<T: Hash>(&self, key: &T) -> Option<&ClusterMember> {
+        let node = self.ring.get_node(key)?;
+        self.members.iter().find(|m| m.name == node.id)
+    }
+
+    /// Lookup remote ref for a key via the hash ring.
+    pub fn ref_for_key<T: Hash>(&self, key: &T) -> Option<&RemoteActorRef<M>> {
+        let node = self.ring.get_node(key)?;
+        self.refs_by_id.get(&node.id).map(|&i| &self.refs[i])
+    }
+
+    /// Send to the node selected by consistent hash of `key`.
+    pub async fn send_by_key<T: Hash>(&self, key: &T, msg: M) -> std::io::Result<()> {
+        match self.ref_for_key(key) {
+            Some(remote) => remote.send(msg).await,
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "cluster has no members",
+            )),
+        }
     }
 
     /// Round-robin index for the next send (does not advance on error).

@@ -26,7 +26,7 @@ Compare with the minimal two-node ping in [`distributed_demo.rs`](./distributed_
 |------------------|-------------|
 | Add a switch or exchange blade | `serve_actor("worker-c", addr, "worker", actor)` |
 | Register node in the cluster | `cluster.join(node.member.clone())` |
-| Route calls to any node in the mesh | `cluster.send_round_robin(msg)` |
+| Route calls to any node in the mesh | `cluster.send_by_key(&job_id, msg)` — same key → same node |
 | More nodes → more concurrent workers | Roster grows; round-robin uses all members |
 
 You can add computing capacity by launching new nodes on additional hardware and hooking them into the existing cluster — `Cluster::join` is the hook.
@@ -57,7 +57,7 @@ Each worker node:
 
 1. **`serve_actor(name, bind_addr, "worker", actor)`** — bind TCP + register target + bridge to local actor
 2. Returns **`NodeHandle`** with **`member()`** metadata for the roster
-3. Coordinator uses **`Cluster::send_round_robin`** — never talks to local actors directly
+3. Coordinator uses **`Cluster::send_by_key`** — hash ring picks the node per job id
 
 ---
 
@@ -75,8 +75,32 @@ cluster.join(node_a.member.clone());
 let node_c = serve_actor("worker-c", "127.0.0.1:0", "worker", worker_c).await?;
 cluster.join(node_c.member.clone());
 
-cluster.send_round_robin(WorkMsg::Process { job_id }).await?;
+cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
 ```
+
+Each `join` also registers the node on the internal **`HashRing`** (150 virtual nodes by default). The same `job_id` always routes to the same worker until the ring membership changes.
+
+### Hash ring API (standalone)
+
+```rust
+use lane_switchboards::{HashRing, RingNode};
+
+let mut ring = HashRing::default();
+ring.add_node(RingNode::new("worker-a", "10.0.0.1", 9001));
+ring.add_node(RingNode::new("worker-b", "10.0.0.2", 9001));
+
+let node = ring.get_node(&"user-42");           // primary owner
+let replicas = ring.get_nodes(&"user-42", 2);   // primary + next on ring
+```
+
+| Method | Description |
+|--------|-------------|
+| `HashRing::new(virtual_nodes)` | Ring with vnode count (default 150) |
+| `add_node` / `remove_node` | Membership changes |
+| `get_node(key)` | Primary node for a key |
+| `get_nodes(key, n)` | Walk clockwise for n distinct nodes |
+| `Cluster::ring()` | Access the cluster's ring |
+| `Cluster::leave(id)` | Remove from roster and ring |
 
 **Adding capacity:**
 
@@ -92,7 +116,8 @@ No service discovery in the core — production uses DNS, etcd, or [`registry.rs
 | `Cluster::new()` | Empty roster |
 | `Cluster::join(member)` | Append a `ClusterMember` |
 | `Cluster::len()` | Current worker count |
-| `Cluster::send_round_robin(msg)` | Send to next member (atomic counter) |
+| `Cluster::send_by_key(key, msg)` | Hash-ring routing |
+| `Cluster::send_round_robin(msg)` | Round-robin (no stickiness) |
 | `Cluster::broadcast(msg)` | Send to every member (`M: Clone`) |
 | `Cluster::next()` | Pick ref without sending (custom dispatch) |
 | `ClusterMember::remote_ref()` | Build a `RemoteActorRef` manually |
@@ -107,7 +132,7 @@ No service discovery in the core — production uses DNS, etcd, or [`registry.rs
 |------|--------|
 | 1 | `serve_actor` for `worker-a` and `worker-b` |
 | 2 | `Cluster::new()`, `join` both members |
-| 3 | Jobs 1–6 via `send_round_robin` |
+| 3 | Jobs 1–6 via `send_by_key(&job_id, …)` |
 
 ### Phase 2 — scale out (+2 nodes)
 
@@ -115,7 +140,7 @@ No service discovery in the core — production uses DNS, etcd, or [`registry.rs
 |------|--------|
 | 1 | `serve_actor` for `worker-c` and `worker-d` |
 | 2 | `cluster.join` each — roster 2 → 4 |
-| 3 | Jobs 7–14 spread across four workers |
+| 3 | Jobs 7–14 — hash ring includes all four nodes |
 
 ---
 
@@ -157,8 +182,8 @@ Each `RemoteActorRef::send` opens a TCP connection and writes:
 | Demo | Production |
 |------|------------|
 | `127.0.0.1:0` on one machine | Bind `0.0.0.0:9000` on each new host |
-| In-memory `Cluster` | Load balancer, service mesh, or external registry |
-| Round-robin | Consistent hash, queue consumer groups, or OTP `pg` |
+| In-memory `Cluster` + `HashRing` | Load balancer, service mesh, or external registry |
+| Consistent hash on `job_id` | User/session sharding; minimal remapping when nodes join |
 | Single process, four nodes | Four processes / four VMs |
 
 ---
