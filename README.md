@@ -38,8 +38,6 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | Full distributed OTP (cluster, remote spawn) | **Erlang/Elixir** |
 | High-throughput minimal actors | Dedicated actor crates or custom Tokio |
 
-The **gateway** example combines Actix Web (HTTP edge) with Ractor (client pool) — lane_switchboards handles the **supervised actor core**; web and HTTP layers stay in their own crates.
-
 ## Library (`src/`)
 
 | Module | Capability |
@@ -104,7 +102,6 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 
 | Example | Command |
 |---------|---------|
-| Actix gateway + Ractor RestTemplate | `cargo run --example gateway` |
 | Hot code upgrade | `cargo run --example hot_upgrade` |
 | Envelope variants (link, monitor, upgrade, …) | `cargo run --example envelope_demo` — see [envelope_demo.md](examples/envelope_demo.md) |
 | Supervisor strategies + intensity limits | `cargo run --example supervisor_strategies` — see [supervisor_strategies.md](examples/supervisor_strategies.md) |
@@ -113,21 +110,6 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
 | Distributed messaging | `cargo run --example distributed_demo` |
-| ONDC signing (testecom → dummy server) | `cargo run --example ondc_demo` — see [ondc.md](examples/gateway/ondc.md) |
-
-Gateway (after `cargo run --example gateway`):
-
-- `GET http://127.0.0.1:8080/health`
-- `GET http://127.0.0.1:8080/fetch` — single request (pooled connection reuse)
-- `GET http://127.0.0.1:8080/fetch-parallel` — parallel GETs to multiple httpbin endpoints
-
-```rust
-// Parallel calls from code
-handle.get_parallel(["https://api.a.com/x", "https://api.b.com/y"]).await?;
-handle.execute_parallel(vec![/* RestRequest */]).await?;
-```
-
-RestTemplate lives under `examples/gateway/` — see **[rest_template.md](examples/gateway/rest_template.md)** (architecture, connection pooling, **security / signing**).
 
 ## Tests
 
