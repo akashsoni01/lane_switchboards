@@ -32,6 +32,114 @@ Channel sizing and concurrency are no longer bundled into one struct. Each subsy
 
 Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/integration.rs`.
 
+#### Handle lifecycle — `on_handle_begin` and `on_handle_stuck`
+
+Every `Envelope::Msg` passes through `handle_message` in `src/actor.rs`. The two hooks bracket `handle()` so you can **snapshot work before processing** and **persist it if the handler stalls**.
+
+| Hook | When | Typical use |
+|------|------|-------------|
+| **`on_handle_begin(&msg)`** | Always, before `handle()` | Copy `msg` into `self.pending`, write to journal, increment generation |
+| **`handle(msg)`** | After begin, inside timeout + `catch_unwind` | Normal business logic |
+| **`on_handle_stuck(ctx)`** | Only when `handle_timeout` elapses | Flush `self.pending` to durable storage; log `ctx.elapsed` / `ctx.limit` |
+
+`HandleStuckContext` fields: `actor_id`, `elapsed`, `limit`.
+
+**Sequence — happy path vs timeout**
+
+```mermaid
+sequenceDiagram
+    participant Mailbox as run_actor mailbox
+    participant Mon as ActorMonitor
+    participant Worker as your Worker impl
+    participant Sup as Supervisor
+
+    Mailbox->>Mon: begin_handle actor_id
+    Mailbox->>Worker: on_handle_begin msg ref
+    Note over Worker: pending equals msg snapshot
+
+    alt completes within handle_timeout
+        Mailbox->>Worker: handle msg
+        Worker-->>Mailbox: Ok
+        Mailbox->>Mon: finish_handle duration
+        Note over Worker: clear pending optional
+    else exceeds handle_timeout
+        Note over Mailbox: tokio timeout cancels handle future
+        Mailbox->>Mon: record_timeout
+        Mailbox->>Worker: on_handle_stuck ctx
+        Note over Worker: journal pending action
+        Worker-->>Mailbox: Ok
+        Mailbox->>Sup: RestartSignal HandleTimeout
+        Mailbox->>Mon: mark_inactive
+        Note over Sup: OneForOne restarts child if supervised
+    end
+```
+
+**Decision flow inside `handle_message`**
+
+```mermaid
+flowchart TD
+    A["Envelope Msg received"] --> B["ActorMonitor begin_handle"]
+    B --> C["on_handle_begin and msg"]
+    C -->|error| X["ExitReason Error notify supervisor"]
+    C -->|Ok| D{"handle_timeout set?"}
+    D -->|no| E["handle msg with catch_unwind"]
+    D -->|yes| F["timeout limit around handle msg"]
+    F -->|Ok| G{"panic or Err?"}
+    F -->|timeout| H["record_timeout"]
+    H --> I["on_handle_stuck ctx"]
+    I --> J["ExitReason HandleTimeout"]
+    J --> K["notify supervisor plus linked exits"]
+    E --> G
+    G -->|Ok| L["finish_handle check slow threshold"]
+    G -->|Err or panic| X
+    L --> M["continue mailbox loop"]
+    K --> N["actor exits post_stop"]
+    X --> N
+```
+
+**Example — journal before handle, flush on stuck**
+
+```rust
+#[async_trait]
+impl Actor<OrderMsg> for OrderWorker {
+    async fn on_handle_begin(&mut self, msg: &OrderMsg) -> Result<(), ActorProcessingErr> {
+        self.pending = Some(msg.clone()); // snapshot BEFORE handle
+        Ok(())
+    }
+
+    async fn handle(&mut self, msg: OrderMsg) -> Result<(), ActorProcessingErr> {
+        process_order(msg).await?;          // may stall here
+        self.pending = None;
+        Ok(())
+    }
+
+    async fn on_handle_stuck(&mut self, ctx: HandleStuckContext) -> Result<(), ActorProcessingErr> {
+        if let Some(order) = self.pending.take() {
+            self.journal.insert(order.id, order); // persist stuck action
+        }
+        tracing::warn!(%ctx.actor_id, ?ctx.elapsed, "order processing stuck");
+        Ok(())
+    }
+}
+
+let config = ActorConfig {
+    handle_timeout: Some(Duration::from_secs(5)),
+    slow_handle_threshold: Some(Duration::from_secs(2)),
+    ..Default::default()
+};
+```
+
+**Important:** `on_handle_begin` runs while `msg` is still available by reference — store what you need there. When timeout fires, the in-flight `handle()` future is **dropped**; recovery reads from state you saved in `on_handle_begin`, not from the dropped future. Pair with a **supervisor** so `HandleTimeout` triggers a child restart (see `ChildSlot` / `spawn_child_spec`).
+
+**Monitor after timeout**
+
+```rust
+let stats = ActorMonitor::global().get(actor_id)?;
+// stats.handle_timeouts, stats.last_handle_ms, stats.max_handle_ms, ...
+```
+
+Stats remain queryable after the actor exits (`mark_inactive`).
+
 ### Semaphore load limiting (EventBus-style)
 
 Per-node and per-actor backpressure via `tokio::sync::Semaphore`:
@@ -112,7 +220,8 @@ rt.block_on(async {
 | Module | v0.0.2 capability |
 |--------|-------------------|
 | `config.rs` | `ActorConfig`, `DistributedConfig`, `DedicatedRuntime`, `RuntimeOptions`, `spawn_on` |
-| `actor.rs` | `spawn_on_runtime`, concurrent `handle()` when `max_in_flight > 1` |
+| `actor.rs` | `spawn_on_runtime`, handle timeout hooks, concurrent `handle()` when `max_in_flight > 1` |
+| `monitor.rs` | `ActorMonitor`, `ActorStats` — handle duration, timeouts, panics |
 | `supervisor.rs` | `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `mailbox_capacity` on `SupervisorConfig` |
 | `distributed.rs` | Per-node semaphore, `bind_on_runtime`, `serve_actor_on_runtime` |
 | `hash_ring.rs` | Consistent hash ring |
@@ -122,7 +231,7 @@ rt.block_on(async {
 
 ## Example run results (2026-05-31)
 
-All examples built and run locally (`cargo test` — **13 passed**).
+All examples built and run locally (`cargo test` — **14 passed**).
 
 | Example | Command | Result | Notes |
 |---------|---------|--------|-------|
@@ -144,7 +253,7 @@ All examples built and run locally (`cargo test` — **13 passed**).
 
 ```bash
 cargo test
-# 6 lib unit tests + 7 integration tests — all pass
+# 6 lib unit tests + 8 integration tests — all pass
 ```
 
 ---
@@ -167,6 +276,8 @@ cargo test
 ActorConfig {
     mailbox_capacity: 64,
     max_in_flight: 1,        // sequential mailbox
+    handle_timeout: None,    // Some(Duration::from_secs(5)) to enable
+    slow_handle_threshold: None,
 }
 
 DistributedConfig {

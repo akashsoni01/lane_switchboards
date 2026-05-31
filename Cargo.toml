@@ -89,6 +89,10 @@ path = "examples/recoverable_timer_calc.rs"
 name = "rest_for_one_calculator_timer"
 path = "examples/rest_for_one_calculator_timer.rs"
 
+[[example]]
+name = "handle_timeout_calculator_timer"
+path = "examples/handle_timeout_calculator_timer.rs"
+
 # --- Additional examples (not listed in README) ---
 
 [[example]]
