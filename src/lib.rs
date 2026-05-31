@@ -18,13 +18,17 @@ pub mod registry;
 pub mod supervisor;
 
 pub use actor::{
-    spawn, spawn_with_config, Actor, ActorId, ActorProcessingErr, ActorRef, DynActor, Envelope,
-    ExitReason,
+    spawn, spawn_on_current_runtime, spawn_on_runtime, spawn_with_config, Actor, ActorId,
+    ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason,
 };
-pub use config::{ActorConfig, DistributedConfig};
+pub use config::{
+    build_multi_thread_runtime, spawn_on, ActorConfig, DedicatedRuntime, DistributedConfig,
+    RuntimeOptions,
+};
 pub use distributed::{
-    serve_actor, serve_actor_with_config, Cluster, ClusterMember, Frame, Node, NodeHandle,
-    RemoteActorRef, RemoteMessage,
+    serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime,
+    serve_actor_with_config, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef,
+    RemoteMessage,
 };
 pub use hash_ring::{HashRing, RingNode};
 pub use mesh::{

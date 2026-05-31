@@ -1,7 +1,7 @@
 //! Distributed actors over TCP with length-prefixed JSON frames.
 
-use crate::actor::{spawn_with_config, Actor};
-use crate::config::{ActorConfig, DistributedConfig};
+use crate::actor::{spawn_on_runtime, Actor};
+use crate::config::{spawn_on, ActorConfig, DistributedConfig};
 use crate::hash_ring::{HashRing, RingNode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 
 /// Messages that can traverse the network layer.
@@ -37,11 +38,28 @@ pub struct Node<M: RemoteMessage> {
     name: String,
     bind_addr: String,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
-    _listener: tokio::task::JoinHandle<()>,
+    _listener: JoinHandle<()>,
 }
 
 impl<M: RemoteMessage> Node<M> {
     pub async fn bind(name: impl Into<String>, addr: impl Into<String>) -> std::io::Result<Self> {
+        Self::bind_on_current_runtime(name, addr, &DistributedConfig::default()).await
+    }
+
+    pub async fn bind_on_current_runtime(
+        name: impl Into<String>,
+        addr: impl Into<String>,
+        config: &DistributedConfig,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_runtime(&Handle::current(), name, addr, config).await
+    }
+
+    pub async fn bind_on_runtime(
+        runtime: &Handle,
+        name: impl Into<String>,
+        addr: impl Into<String>,
+        config: &DistributedConfig,
+    ) -> std::io::Result<Self> {
         let name = name.into();
         let bind_addr = addr.into();
         let listener = TcpListener::bind(&bind_addr).await?;
@@ -50,14 +68,20 @@ impl<M: RemoteMessage> Node<M> {
 
         let dispatch = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<M>>::new()));
         let dispatch_c = dispatch.clone();
+        let in_flight = Arc::new(Semaphore::new(config.max_in_flight.max(1)));
+        let runtime = runtime.clone();
 
-        let listener_task = tokio::spawn(async move {
+        let listener_task = spawn_on(Some(&runtime), {
+            let runtime = runtime.clone();
+            async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         let table = dispatch_c.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_conn(stream, table).await {
+                        let in_flight = in_flight.clone();
+                        let conn_runtime = runtime.clone();
+                        spawn_on(Some(&runtime), async move {
+                            if let Err(e) = handle_conn(stream, table, in_flight, conn_runtime).await {
                                 tracing::warn!(%peer, error = %e, "connection handler error");
                             }
                         });
@@ -68,6 +92,7 @@ impl<M: RemoteMessage> Node<M> {
                     }
                 }
             }
+        }
         });
 
         Ok(Self {
@@ -98,6 +123,8 @@ impl<M: RemoteMessage> Node<M> {
 async fn handle_conn<M: RemoteMessage>(
     mut stream: TcpStream,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
+    in_flight: Arc<Semaphore>,
+    runtime: Handle,
 ) -> std::io::Result<()> {
     loop {
         let len = match stream.read_u32_le().await {
@@ -118,12 +145,22 @@ async fn handle_conn<M: RemoteMessage>(
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
 
-        let table = dispatch.lock().await;
-        if let Some(tx) = table.get(&frame.target) {
-            let _ = tx.send(msg).await;
-        } else {
-            tracing::warn!(target = %frame.target, "no local actor for frame target");
-        }
+        let permit = match in_flight.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+
+        let table = dispatch.clone();
+        let target = frame.target.clone();
+        spawn_on(Some(&runtime), async move {
+            let _permit = permit;
+            let table = table.lock().await;
+            if let Some(tx) = table.get(&target) {
+                let _ = tx.send(msg).await;
+            } else {
+                tracing::warn!(target = %target, "no local actor for frame target");
+            }
+        });
     }
     Ok(())
 }
@@ -377,7 +414,7 @@ impl<M: RemoteMessage> NodeHandle<M> {
     }
 }
 
-/// Bind a TCP node and bridge incoming frames to a local actor.
+/// Bind a TCP node and bridge incoming frames to a local actor on the current runtime.
 pub async fn serve_actor<M, A>(
     node_name: impl Into<String>,
     bind_addr: impl Into<String>,
@@ -388,7 +425,7 @@ where
     M: RemoteMessage,
     A: Actor<M> + Send + Sync + 'static,
 {
-    serve_actor_with_config(
+    serve_actor_on_current_runtime(
         node_name,
         bind_addr,
         target,
@@ -399,8 +436,50 @@ where
     .await
 }
 
-/// Bind a TCP node and bridge incoming frames to a local actor with explicit channel sizing.
+/// Bind a TCP node and bridge incoming frames to a local actor on the current runtime.
 pub async fn serve_actor_with_config<M, A>(
+    node_name: impl Into<String>,
+    bind_addr: impl Into<String>,
+    target: impl Into<String>,
+    actor: A,
+    distributed: &DistributedConfig,
+    actor_config: &ActorConfig,
+) -> std::io::Result<NodeHandle<M>>
+where
+    M: RemoteMessage,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    serve_actor_on_current_runtime(node_name, bind_addr, target, actor, distributed, actor_config).await
+}
+
+/// Bind a TCP node and bridge on the current runtime with explicit channel sizing.
+pub async fn serve_actor_on_current_runtime<M, A>(
+    node_name: impl Into<String>,
+    bind_addr: impl Into<String>,
+    target: impl Into<String>,
+    actor: A,
+    distributed: &DistributedConfig,
+    actor_config: &ActorConfig,
+) -> std::io::Result<NodeHandle<M>>
+where
+    M: RemoteMessage,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    serve_actor_on_runtime(
+        &Handle::current(),
+        node_name,
+        bind_addr,
+        target,
+        actor,
+        distributed,
+        actor_config,
+    )
+    .await
+}
+
+/// Bind a TCP node and bridge on a dedicated runtime with load limits.
+pub async fn serve_actor_on_runtime<M, A>(
+    runtime: &Handle,
     node_name: impl Into<String>,
     bind_addr: impl Into<String>,
     target: impl Into<String>,
@@ -414,15 +493,17 @@ where
 {
     let node_name = node_name.into();
     let target = target.into();
-    let node = Node::<M>::bind(&node_name, bind_addr).await?;
+    let node = Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed).await?;
     let address = node.address().to_string();
 
     let (tx, mut rx) = mpsc::channel(distributed.bridge_capacity);
     node.register(&target, tx).await;
 
     let actor_config = *actor_config;
-    let bridge = tokio::spawn(async move {
-        let Ok((actor_ref, _)) = spawn_with_config(actor, None, &actor_config).await else {
+    let runtime = runtime.clone();
+    let actor_runtime = runtime.clone();
+    let bridge = spawn_on(Some(&runtime), async move {
+        let Ok((actor_ref, _)) = spawn_on_runtime(&actor_runtime, actor, None, &actor_config).await else {
             return;
         };
         while let Some(msg) = rx.recv().await {

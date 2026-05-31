@@ -1,29 +1,96 @@
-//! Runtime tuning — mailbox capacities for tokio mpsc channels.
+//! Runtime tuning — mailbox capacities, load limits, and dedicated runtimes.
 
-/// Actor mailbox sizing ([`crate::actor::spawn`]).
+use std::future::Future;
+use std::io;
+use tokio::runtime::{Builder, Runtime};
+use tokio::task::JoinHandle;
+
+/// Actor mailbox sizing and concurrency ([`crate::actor::spawn`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
+    /// Max concurrent `handle()` calls per actor (`1` = classic sequential mailbox).
+    pub max_in_flight: usize,
 }
 
 impl Default for ActorConfig {
     fn default() -> Self {
         Self {
             mailbox_capacity: 64,
+            max_in_flight: 1,
         }
     }
 }
 
-/// Distributed TCP bridge sizing ([`crate::distributed::serve_actor`]).
+/// Distributed TCP bridge sizing and per-node load limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DistributedConfig {
     pub bridge_capacity: usize,
+    /// Max in-flight frame dispatches per TCP node (semaphore backpressure).
+    pub max_in_flight: usize,
 }
 
 impl Default for DistributedConfig {
     fn default() -> Self {
         Self {
             bridge_capacity: 32,
+            max_in_flight: 32,
         }
+    }
+}
+
+/// Options for building a dedicated Tokio runtime for actors / nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeOptions {
+    pub worker_threads: Option<usize>,
+}
+
+impl Default for RuntimeOptions {
+    fn default() -> Self {
+        Self {
+            worker_threads: None,
+        }
+    }
+}
+
+/// Dedicated multi-thread Tokio runtime (keeps the OS runtime alive).
+pub struct DedicatedRuntime {
+    inner: Runtime,
+}
+
+impl DedicatedRuntime {
+    pub fn new(options: RuntimeOptions) -> io::Result<Self> {
+        build_multi_thread_runtime(options.worker_threads).map(|inner| Self { inner })
+    }
+
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.inner.handle().clone()
+    }
+
+    /// Run a future to completion on this runtime (blocking the calling thread).
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        self.inner.block_on(future)
+    }
+}
+
+/// Build a multi-thread Tokio runtime for isolating actors or distributed nodes.
+pub fn build_multi_thread_runtime(worker_threads: Option<usize>) -> io::Result<Runtime> {
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(n) = worker_threads {
+        builder.worker_threads(n);
+    }
+    builder.build()
+}
+
+/// Spawn a task on `runtime`, or the current runtime when `runtime` is `None`.
+pub fn spawn_on<F>(runtime: Option<&tokio::runtime::Handle>, future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match runtime {
+        Some(handle) => handle.spawn(future),
+        None => tokio::spawn(future),
     }
 }

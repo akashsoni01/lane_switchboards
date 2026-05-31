@@ -1,12 +1,13 @@
 //! OTP-style supervisor with OneForOne, OneForAll, and RestForOne strategies.
 
-use crate::actor::{spawn_with_config, Actor, ActorId, ActorProcessingErr, ActorRef};
+use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef};
 use crate::config::ActorConfig;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 
@@ -203,7 +204,7 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
             let build = build.clone();
             let actor_config = *actor_config;
             Box::pin(async move {
-                let (actor_ref, _) = spawn_with_config(build(), Some(sup_tx), &actor_config).await?;
+                let (actor_ref, _) = spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config).await?;
                 *slot.current.lock().await = Some(actor_ref.clone());
                 Ok(actor_ref)
             })
@@ -231,7 +232,8 @@ where
         let build = build.clone();
         let actor_config = *actor_config;
         Box::pin(async move {
-            let (actor_ref, _) = spawn_with_config(build(), Some(sup_tx), &actor_config).await?;
+            let (actor_ref, _) =
+                spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config).await?;
             registry.track(name, actor_ref.clone()).await;
             Ok(actor_ref)
         })
@@ -388,11 +390,15 @@ where
     let spec = child_spec(0, move |sup_tx, actor_config| {
         let a = actor_prototype.clone();
         let actor_config = *actor_config;
-        Box::pin(async move { spawn_with_config(a, Some(sup_tx), &actor_config).await.map(|(r, _)| r) })
+        Box::pin(async move {
+            spawn_on_runtime(&Handle::current(), a, Some(sup_tx), &actor_config)
+                .await
+                .map(|(r, _)| r)
+        })
     });
 
     let sup = Supervisor::with_actor_config(child_config, config, vec![spec]);
     let handle = sup.start().await?;
-    let (child_ref, _) = spawn_with_config(actor, None, actor_config).await?;
+    let (child_ref, _) = spawn_on_runtime(&Handle::current(), actor, None, actor_config).await?;
     Ok((child_ref, handle))
 }

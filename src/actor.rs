@@ -1,8 +1,8 @@
 //! Custom actor runtime: `run_actor` loop, linking, monitoring, hot upgrade.
 
+use crate::config::{spawn_on, ActorConfig};
 use crate::registry::{get_actor_sender, register_actor, register_supervisor, unregister_actor};
 use crate::supervisor::RestartSignal;
-use crate::config::ActorConfig;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use std::any::Any;
@@ -11,8 +11,10 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use std::sync::Arc;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 
 static ACTOR_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -216,7 +218,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     }
 }
 
-/// Spawn an actor and return `(ActorRef, JoinHandle)`.
+/// Spawn an actor on the current Tokio runtime.
 pub async fn spawn<M, A>(
     actor: A,
     supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
@@ -225,11 +227,38 @@ where
     M: Send + Sync + 'static,
     A: Actor<M> + Send + Sync + 'static,
 {
-    spawn_with_config(actor, supervisor_tx, &ActorConfig::default()).await
+    spawn_on_current_runtime(actor, supervisor_tx, &ActorConfig::default()).await
 }
 
-/// Spawn an actor with explicit [`ActorConfig`] mailbox sizing.
+/// Spawn an actor on the current Tokio runtime with explicit config.
 pub async fn spawn_with_config<M, A>(
+    actor: A,
+    supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
+    config: &ActorConfig,
+) -> Result<(ActorRef<M>, JoinHandle<()>), ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    spawn_on_current_runtime(actor, supervisor_tx, config).await
+}
+
+/// Spawn an actor on the current Tokio runtime.
+pub async fn spawn_on_current_runtime<M, A>(
+    actor: A,
+    supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
+    config: &ActorConfig,
+) -> Result<(ActorRef<M>, JoinHandle<()>), ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    spawn_on_runtime(&Handle::current(), actor, supervisor_tx, config).await
+}
+
+/// Spawn an actor on a specific Tokio runtime handle.
+pub async fn spawn_on_runtime<M, A>(
+    runtime: &Handle,
     actor: A,
     supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
     config: &ActorConfig,
@@ -250,7 +279,12 @@ where
     register_actor(id, erased_tx);
 
     let boxed = into_dyn_actor(actor);
-    let join = tokio::spawn(run_actor(id, rx, boxed));
+    let config = *config;
+    let runtime = runtime.clone();
+    let actor_runtime = runtime.clone();
+    let join = spawn_on(Some(&runtime), async move {
+        run_actor(id, rx, boxed, config, actor_runtime).await;
+    });
 
     Ok((actor_ref, join))
 }
@@ -263,6 +297,20 @@ fn erase_sender<M: Send + Sync + 'static>(
 }
 
 async fn run_actor<M: Send + Sync + 'static>(
+    id: ActorId,
+    rx: mpsc::Receiver<Envelope<M>>,
+    actor: Box<dyn DynActor<M>>,
+    config: ActorConfig,
+    _runtime: Handle,
+) {
+    if config.max_in_flight <= 1 {
+        run_actor_sequential(id, rx, actor).await;
+    } else {
+        run_actor_concurrent(id, rx, actor, config).await;
+    }
+}
+
+async fn run_actor_sequential<M: Send + Sync + 'static>(
     id: ActorId,
     mut rx: mpsc::Receiver<Envelope<M>>,
     mut actor: Box<dyn DynActor<M>>,
@@ -280,20 +328,9 @@ async fn run_actor<M: Send + Sync + 'static>(
     'actor_loop: while let Some(envelope) = rx.recv().await {
         match envelope {
             Envelope::Msg(m) => {
-                match AssertUnwindSafe(actor.dyn_handle(m)).catch_unwind().await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        exit_reason = ExitReason::Error(e.to_string());
-                        notify_supervisor(id, &exit_reason).await;
-                        propagate_linked_exit(id, &exit_reason, &links).await;
-                        break 'actor_loop;
-                    }
-                    Err(_) => {
-                        exit_reason = ExitReason::Error("panic in handle".into());
-                        notify_supervisor(id, &exit_reason).await;
-                        propagate_linked_exit(id, &exit_reason, &links).await;
-                        break 'actor_loop;
-                    }
+                if let Some(reason) = handle_message(id, &mut actor, m, &links).await {
+                    exit_reason = reason;
+                    break 'actor_loop;
                 }
             }
             Envelope::Link(peer) => {
@@ -335,11 +372,170 @@ async fn run_actor<M: Send + Sync + 'static>(
         }
     }
 
+    finish_actor(id, actor, exit_reason, &links, monitors).await;
+}
+
+async fn run_actor_concurrent<M: Send + Sync + 'static>(
+    id: ActorId,
+    mut rx: mpsc::Receiver<Envelope<M>>,
+    actor: Box<dyn DynActor<M>>,
+    config: ActorConfig,
+) {
+    let actor: Arc<Mutex<Option<Box<dyn DynActor<M>>>>> = Arc::new(Mutex::new(Some(actor)));
+    let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
+    let links: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
+    let mut exit_reason = ExitReason::Normal;
+    let mut handlers = JoinSet::new();
+    let (fail_tx, mut fail_rx) = mpsc::channel::<ExitReason>(1);
+
+    {
+        let mut guard = actor.lock().await;
+        if let Some(inner) = guard.as_mut() {
+            if let Err(e) = inner.dyn_pre_start().await {
+                exit_reason = ExitReason::Error(e.to_string());
+                unregister_actor(id);
+                return;
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            reason = fail_rx.recv() => {
+                if let Some(reason) = reason {
+                    exit_reason = reason;
+                    break;
+                }
+            }
+            join = handlers.join_next(), if !handlers.is_empty() => {
+                if let Some(Err(e)) = join {
+                    tracing::warn!(%id, error = %e, "actor handler task failed");
+                }
+            }
+            envelope = rx.recv() => {
+                let Some(envelope) = envelope else { break };
+                match envelope {
+                    Envelope::Msg(m) => {
+                        let permit = match in_flight.clone().acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => break,
+                        };
+                        let actor = Arc::clone(&actor);
+                        let links_snapshot = links.lock().await.clone();
+                        let fail_tx = fail_tx.clone();
+                        let task_id = id;
+                        handlers.spawn(async move {
+                            let _permit = permit;
+                            let mut guard = actor.lock().await;
+                            let Some(inner) = guard.as_mut() else {
+                                return;
+                            };
+                            if let Some(reason) = handle_message(task_id, inner, m, &links_snapshot).await {
+                                let _ = fail_tx.send(reason).await;
+                            }
+                        });
+                    }
+                    Envelope::Link(peer) => {
+                        let mut guard = links.lock().await;
+                        if !guard.contains(&peer) {
+                            guard.push(peer);
+                        }
+                    }
+                    Envelope::Unlink(peer) => {
+                        links.lock().await.retain(|&x| x != peer);
+                    }
+                    Envelope::Monitor { observer: _, notify } => {
+                        monitors.push((ActorId::new(), notify));
+                    }
+                    Envelope::Demonitor(_) => {}
+                    Envelope::LinkedExit(peer, reason) => {
+                        let trap = actor
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|a| a.trap_exit())
+                            .unwrap_or(false);
+                        if trap {
+                            tracing::debug!(%id, %peer, ?reason, "trapped linked exit");
+                            continue;
+                        }
+                        exit_reason = ExitReason::Linked(peer, Box::new(reason));
+                        break;
+                    }
+                    Envelope::Upgrade(new_impl) => {
+                        let mut guard = actor.lock().await;
+                        if let Some(inner) = guard.as_mut() {
+                            *inner = new_impl;
+                            if let Err(e) = inner.dyn_pre_start().await {
+                                exit_reason = ExitReason::Error(e.to_string());
+                                break;
+                            }
+                            tracing::info!(%id, "hot code upgrade applied");
+                        }
+                    }
+                    Envelope::Stop => {
+                        exit_reason = ExitReason::Shutdown;
+                        break;
+                    }
+                    Envelope::Kill => {
+                        exit_reason = ExitReason::Killed;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    handlers.abort_all();
+    while handlers.join_next().await.is_some() {}
+
+    let actor = actor.lock().await.take();
+    let links = links.lock().await.clone();
+
+    if let Some(actor) = actor {
+        finish_actor(id, actor, exit_reason, &links, monitors).await;
+    } else {
+        unregister_actor(id);
+    }
+}
+
+async fn handle_message<M: Send + Sync + 'static>(
+    id: ActorId,
+    actor: &mut Box<dyn DynActor<M>>,
+    msg: M,
+    links: &[ActorId],
+) -> Option<ExitReason> {
+    match AssertUnwindSafe(actor.dyn_handle(msg)).catch_unwind().await {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => {
+            let reason = ExitReason::Error(e.to_string());
+            notify_supervisor(id, &reason).await;
+            propagate_linked_exit(id, &reason, links).await;
+            Some(reason)
+        }
+        Err(_) => {
+            let reason = ExitReason::Error("panic in handle".into());
+            notify_supervisor(id, &reason).await;
+            propagate_linked_exit(id, &reason, links).await;
+            Some(reason)
+        }
+    }
+}
+
+async fn finish_actor<M: Send + Sync + 'static>(
+    id: ActorId,
+    mut actor: Box<dyn DynActor<M>>,
+    exit_reason: ExitReason,
+    links: &[ActorId],
+    monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)>,
+) {
     let _ = actor.dyn_post_stop().await;
     for (_, notify) in monitors {
         let _ = notify.send(exit_reason.clone());
     }
-    propagate_linked_exit(id, &exit_reason, &links).await;
+    propagate_linked_exit(id, &exit_reason, links).await;
     unregister_actor(id);
 }
 
