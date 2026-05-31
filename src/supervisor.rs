@@ -1,6 +1,7 @@
 //! OTP-style supervisor with OneForOne, OneForAll, and RestForOne strategies.
 
-use crate::actor::{spawn, Actor, ActorId, ActorProcessingErr, ActorRef};
+use crate::actor::{spawn_with_config, Actor, ActorId, ActorProcessingErr, ActorRef};
+use crate::config::ActorConfig;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -38,6 +39,8 @@ pub struct SupervisorConfig {
     pub max_restarts: usize,
     pub within_secs: u64,
     pub intensity_action: IntensityAction,
+    /// Restart-signal queue capacity.
+    pub mailbox_capacity: usize,
 }
 
 impl Default for SupervisorConfig {
@@ -47,6 +50,7 @@ impl Default for SupervisorConfig {
             max_restarts: 5,
             within_secs: 10,
             intensity_action: IntensityAction::ShutdownSupervisor,
+            mailbox_capacity: 32,
         }
     }
 }
@@ -58,6 +62,7 @@ pub trait ChildSpec<M: Send + Sync + 'static>: Send + Sync {
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
+        actor_config: &ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>;
     fn set_id(&mut self, id: ActorId);
 }
@@ -72,7 +77,7 @@ struct FnChildSpec<M, F> {
 impl<M, F> ChildSpec<M> for FnChildSpec<M, F>
 where
     M: Send + Sync + 'static,
-    F: Fn(mpsc::Sender<RestartSignal>) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
+    F: Fn(mpsc::Sender<RestartSignal>, &ActorConfig) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync,
 {
@@ -87,8 +92,9 @@ where
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
+        actor_config: &ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>> {
-        (self.factory)(supervisor_tx)
+        (self.factory)(supervisor_tx, actor_config)
     }
 
     fn set_id(&mut self, id: ActorId) {
@@ -100,7 +106,7 @@ where
 pub fn child_spec<M, F>(order: usize, factory: F) -> Box<dyn ChildSpec<M>>
 where
     M: Send + Sync + 'static,
-    F: Fn(mpsc::Sender<RestartSignal>) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
+    F: Fn(mpsc::Sender<RestartSignal>, &ActorConfig) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -192,11 +198,12 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
         F: Fn() -> B + Send + Sync + 'static,
     {
         let build = Arc::new(build);
-        child_spec(order, move |sup_tx| {
+        child_spec(order, move |sup_tx, actor_config| {
             let slot = slot.clone();
             let build = build.clone();
+            let actor_config = *actor_config;
             Box::pin(async move {
-                let (actor_ref, _) = spawn(build(), Some(sup_tx)).await?;
+                let (actor_ref, _) = spawn_with_config(build(), Some(sup_tx), &actor_config).await?;
                 *slot.current.lock().await = Some(actor_ref.clone());
                 Ok(actor_ref)
             })
@@ -218,12 +225,13 @@ where
 {
     let name = name.into();
     let build = Arc::new(build);
-    child_spec(order, move |sup_tx| {
+    child_spec(order, move |sup_tx, actor_config| {
         let registry = registry.clone();
         let name = name.clone();
         let build = build.clone();
+        let actor_config = *actor_config;
         Box::pin(async move {
-            let (actor_ref, _) = spawn(build(), Some(sup_tx)).await?;
+            let (actor_ref, _) = spawn_with_config(build(), Some(sup_tx), &actor_config).await?;
             registry.track(name, actor_ref.clone()).await;
             Ok(actor_ref)
         })
@@ -240,13 +248,23 @@ pub struct SupervisorHandle<M: Send + Sync + 'static> {
 /// OTP supervisor task.
 pub struct Supervisor<M: Send + Sync + 'static> {
     config: SupervisorConfig,
+    actor_config: ActorConfig,
     children: Arc<Mutex<Vec<Box<dyn ChildSpec<M>>>>>,
 }
 
 impl<M: Send + Sync + 'static> Supervisor<M> {
     pub fn new(config: SupervisorConfig, children: Vec<Box<dyn ChildSpec<M>>>) -> Self {
+        Self::with_actor_config(ActorConfig::default(), config, children)
+    }
+
+    pub fn with_actor_config(
+        actor_config: ActorConfig,
+        config: SupervisorConfig,
+        children: Vec<Box<dyn ChildSpec<M>>>,
+    ) -> Self {
         Self {
             config,
+            actor_config,
             children: Arc::new(Mutex::new(children)),
         }
     }
@@ -260,16 +278,17 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
         self,
         settle: Duration,
     ) -> Result<SupervisorHandle<M>, ActorProcessingErr> {
-        let (tx, mut rx) = mpsc::channel::<RestartSignal>(32);
         let children = self.children.clone();
         let config = self.config.clone();
+        let actor_config = self.actor_config;
+        let (tx, mut rx) = mpsc::channel::<RestartSignal>(config.mailbox_capacity);
 
         // Initial spawn of all children
         {
             let mut slots = children.lock().await;
             for spec in slots.iter_mut() {
                 let sup_tx = tx.clone();
-                let actor_ref = spec.restart(sup_tx).await?;
+                let actor_ref = spec.restart(sup_tx, &actor_config).await?;
                 spec.set_id(actor_ref.id);
             }
         }
@@ -326,7 +345,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
 
                 for idx in indices {
                     let sup_tx = tx.clone();
-                    if let Ok(actor_ref) = slots[idx].restart(sup_tx).await {
+                    if let Ok(actor_ref) = slots[idx].restart(sup_tx, &actor_config).await {
                         slots[idx].set_id(actor_ref.id);
                         tracing::info!(child = %actor_ref.id, "supervisor restarted child");
                     }
@@ -351,15 +370,29 @@ where
     M: Send + Sync + 'static,
     A: Actor<M> + Send + Sync + Clone + 'static,
 {
+    supervise_actor_with_config(actor, config, &ActorConfig::default()).await
+}
+
+/// Supervise a single typed actor with explicit child mailbox sizing.
+pub async fn supervise_actor_with_config<M, A>(
+    actor: A,
+    config: SupervisorConfig,
+    actor_config: &ActorConfig,
+) -> Result<(ActorRef<M>, SupervisorHandle<M>), ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    A: Actor<M> + Send + Sync + Clone + 'static,
+{
     let actor_prototype = actor.clone();
-    let spec = child_spec(0, move |sup_tx| {
+    let child_config = *actor_config;
+    let spec = child_spec(0, move |sup_tx, actor_config| {
         let a = actor_prototype.clone();
-        Box::pin(async move { spawn(a, Some(sup_tx)).await.map(|(r, _)| r) })
+        let actor_config = *actor_config;
+        Box::pin(async move { spawn_with_config(a, Some(sup_tx), &actor_config).await.map(|(r, _)| r) })
     });
 
-    let sup = Supervisor::new(config, vec![spec]);
+    let sup = Supervisor::with_actor_config(child_config, config, vec![spec]);
     let handle = sup.start().await?;
-    // Child ref is re-fetched from registry on first restart; caller should keep initial spawn ref.
-    let (child_ref, _) = spawn(actor, None).await?;
+    let (child_ref, _) = spawn_with_config(actor, None, actor_config).await?;
     Ok((child_ref, handle))
 }

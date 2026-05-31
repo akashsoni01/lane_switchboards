@@ -195,6 +195,7 @@ async fn demo_intensity_shutdown() -> anyhow::Result<()> {
         max_restarts: 3,
         within_secs: 10,
         intensity_action: IntensityAction::ShutdownSupervisor,
+        ..Default::default()
     };
     let _sup = start_supervisor(config, &["alpha", "beta", "gamma"], registry.clone())
         .await
@@ -224,6 +225,7 @@ async fn demo_intensity_abandon() -> anyhow::Result<()> {
         max_restarts: 2,
         within_secs: 10,
         intensity_action: IntensityAction::AbandonChild,
+        ..Default::default()
     };
     let _sup = start_supervisor(config, &["alpha", "beta", "gamma"], registry.clone())
         .await

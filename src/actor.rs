@@ -2,6 +2,7 @@
 
 use crate::registry::{get_actor_sender, register_actor, register_supervisor, unregister_actor};
 use crate::supervisor::RestartSignal;
+use crate::config::ActorConfig;
 use async_trait::async_trait;
 use futures_util::FutureExt;
 use std::any::Any;
@@ -224,8 +225,21 @@ where
     M: Send + Sync + 'static,
     A: Actor<M> + Send + Sync + 'static,
 {
+    spawn_with_config(actor, supervisor_tx, &ActorConfig::default()).await
+}
+
+/// Spawn an actor with explicit [`ActorConfig`] mailbox sizing.
+pub async fn spawn_with_config<M, A>(
+    actor: A,
+    supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
+    config: &ActorConfig,
+) -> Result<(ActorRef<M>, JoinHandle<()>), ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    A: Actor<M> + Send + Sync + 'static,
+{
     let id = ActorId::new();
-    let (tx, rx) = mpsc::channel::<Envelope<M>>(64);
+    let (tx, rx) = mpsc::channel::<Envelope<M>>(config.mailbox_capacity);
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
     if let Some(sup_tx) = supervisor_tx {

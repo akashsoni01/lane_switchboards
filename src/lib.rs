@@ -10,6 +10,7 @@
 //! Ractor-based HTTP client: see the `gateway` example (`examples/gateway/`).
 
 pub mod actor;
+pub mod config;
 pub mod distributed;
 pub mod hash_ring;
 pub mod mesh;
@@ -17,10 +18,13 @@ pub mod registry;
 pub mod supervisor;
 
 pub use actor::{
-    spawn, Actor, ActorId, ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason,
+    spawn, spawn_with_config, Actor, ActorId, ActorProcessingErr, ActorRef, DynActor, Envelope,
+    ExitReason,
 };
+pub use config::{ActorConfig, DistributedConfig};
 pub use distributed::{
-    serve_actor, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef, RemoteMessage,
+    serve_actor, serve_actor_with_config, Cluster, ClusterMember, Frame, Node, NodeHandle,
+    RemoteActorRef, RemoteMessage,
 };
 pub use hash_ring::{HashRing, RingNode};
 pub use mesh::{
@@ -28,6 +32,6 @@ pub use mesh::{
     MeshRegistryServer, MeshRouter, MicroserviceHandle, ServiceMesh, ServiceRecord,
 };
 pub use supervisor::{
-    child_spec, spawn_child_spec, supervise_actor, ChildRegistry, ChildSlot, ChildSpec,
+    child_spec, spawn_child_spec, supervise_actor, supervise_actor_with_config, ChildRegistry, ChildSlot, ChildSpec,
     IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };

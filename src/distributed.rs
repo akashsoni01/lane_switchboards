@@ -1,6 +1,7 @@
 //! Distributed actors over TCP with length-prefixed JSON frames.
 
-use crate::actor::{spawn, Actor};
+use crate::actor::{spawn_with_config, Actor};
+use crate::config::{ActorConfig, DistributedConfig};
 use crate::hash_ring::{HashRing, RingNode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -387,16 +388,41 @@ where
     M: RemoteMessage,
     A: Actor<M> + Send + Sync + 'static,
 {
+    serve_actor_with_config(
+        node_name,
+        bind_addr,
+        target,
+        actor,
+        &DistributedConfig::default(),
+        &ActorConfig::default(),
+    )
+    .await
+}
+
+/// Bind a TCP node and bridge incoming frames to a local actor with explicit channel sizing.
+pub async fn serve_actor_with_config<M, A>(
+    node_name: impl Into<String>,
+    bind_addr: impl Into<String>,
+    target: impl Into<String>,
+    actor: A,
+    distributed: &DistributedConfig,
+    actor_config: &ActorConfig,
+) -> std::io::Result<NodeHandle<M>>
+where
+    M: RemoteMessage,
+    A: Actor<M> + Send + Sync + 'static,
+{
     let node_name = node_name.into();
     let target = target.into();
     let node = Node::<M>::bind(&node_name, bind_addr).await?;
     let address = node.address().to_string();
 
-    let (tx, mut rx) = mpsc::channel(32);
+    let (tx, mut rx) = mpsc::channel(distributed.bridge_capacity);
     node.register(&target, tx).await;
 
+    let actor_config = *actor_config;
     let bridge = tokio::spawn(async move {
-        let Ok((actor_ref, _)) = spawn(actor, None).await else {
+        let Ok((actor_ref, _)) = spawn_with_config(actor, None, &actor_config).await else {
             return;
         };
         while let Some(msg) = rx.recv().await {
