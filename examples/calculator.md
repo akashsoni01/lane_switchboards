@@ -125,5 +125,7 @@ div: 10 and 0 -> error: division by zero
 
 - [calculator.md](./calculator.md) — unsupervised calculator (same operations)
 - [resilient_calculator.md](./resilient_calculator.md) — supervised version that survives panics
+- [resilient_calculator_timer.rs](./resilient_calculator_timer.rs) — timer without journal replay
+- [recoverable_timer_calc.md](./recoverable_timer_calc.md) — journal-backed state recovery + timer
 - [hot_upgrade.rs](./hot_upgrade.rs) — same request–reply pattern with `CounterMsg::Get`
 - [architecture.md](../architecture.md) — actor runtime design

@@ -4,6 +4,7 @@
 //! actor that replays the journal in `pre_start`, restoring `last_result`.
 //!
 //! Run: `cargo run --example recoverable_timer_calc`
+//! See: `examples/recoverable_timer_calc.md`
 
 use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::supervisor::{
@@ -175,6 +176,7 @@ impl RecoverableCalculator {
 #[async_trait::async_trait]
 impl Actor<CalcMsg> for RecoverableCalculator {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
+        println!("replaying journal into last_result on pre_start===========");
         self.replay_journal().await;
         Ok(())
     }

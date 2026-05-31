@@ -150,5 +150,7 @@ Panics in `handle` now trigger the same exit path as `Err` returns: supervisor n
 ## Related docs
 
 - [calculator.md](./calculator.md) — unsupervised calculator
+- [resilient_calculator_timer.rs](./resilient_calculator_timer.rs) — timer without journal
+- [recoverable_timer_calc.md](./recoverable_timer_calc.md) — journal-backed recovery + timer
 - [architecture.md](../architecture.md) — supervision strategies
 - [envelope_demo.md](./envelope_demo.md) — actor mailbox variants
