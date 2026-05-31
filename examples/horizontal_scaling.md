@@ -201,6 +201,7 @@ Each `RemoteActorRef::send` opens a TCP connection and writes:
 
 ## Related docs
 
+- [horizontal_scaling_rest_for_one.md](./horizontal_scaling_rest_for_one.md) — RestForOne processor + reporter per site, multi-send APIs
 - [distributed_demo.rs](./distributed_demo.rs) — minimal remote ping
 - [README — horizontal scaling](../README.md#horizontal-scaling-cluster-roster)
 - [envelope_demo.md](./envelope_demo.md) — local mailbox control messages

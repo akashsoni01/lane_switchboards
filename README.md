@@ -147,6 +147,10 @@ Add computing capacity by binding new TCP nodes and joining them to a shared [`C
 | **`serve_actor(name, bind_addr, target, actor)`** | Bind a local node and bridge frames to a local actor |
 | **`Cluster::join(member)`** | Register a remote node's address in the roster |
 | **`Cluster::send_by_key(key, msg)`** | Route to the node chosen by consistent hash |
+| **`Cluster::broadcast(msg)`** | Send to every member (`M: Clone`; fails on first error) |
+| **`Cluster::send_all(msg)`** | Send to every member; returns per-node results |
+| **`Cluster::send_to(names, msg)`** | Send to a named subset |
+| **`Cluster::send_replicas(key, n, msg)`** | Primary + next nodes on hash ring |
 | **`Cluster::send_round_robin(msg)`** | Spread work across all members (no stickiness) |
 | **`HashRing`** | Standalone consistent-hash discovery ([`hash_ring.rs`](src/hash_ring.rs)) |
 
@@ -168,7 +172,7 @@ cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
 // Same job_id always maps to the same node until the ring changes.
 ```
 
-See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`).
+See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`) and [`horizontal_scaling_rest_for_one.md`](examples/horizontal_scaling_rest_for_one.md) (RestForOne processor + reporter per site, multi-send APIs).
 
 ## Examples
 
@@ -184,6 +188,7 @@ See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --exam
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
+| Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
 
 ## Tests
 

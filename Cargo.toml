@@ -59,6 +59,10 @@ path = "examples/distributed_demo.rs"
 name = "horizontal_scaling"
 path = "examples/horizontal_scaling.rs"
 
+[[example]]
+name = "horizontal_scaling_rest_for_one"
+path = "examples/horizontal_scaling_rest_for_one.rs"
+
 # --- Calculator & supervision (switchboard routing + fault recovery) ---
 
 [[example]]

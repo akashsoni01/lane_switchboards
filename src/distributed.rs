@@ -310,6 +310,53 @@ impl<M: RemoteMessage> Cluster<M> {
         }
         Ok(())
     }
+
+    /// Send to every member; returns per-node results (continues after individual failures).
+    pub async fn send_all(&self, msg: M) -> Vec<(String, std::io::Result<()>)>
+    where
+        M: Clone,
+    {
+        let mut results = Vec::with_capacity(self.members.len());
+        for (member, remote) in self.members.iter().zip(self.refs.iter()) {
+            let result = remote.send(msg.clone()).await;
+            results.push((member.name.clone(), result));
+        }
+        results
+    }
+
+    /// Send to a subset of members by node name.
+    pub async fn send_to(&self, names: &[&str], msg: M) -> Vec<(String, std::io::Result<()>)>
+    where
+        M: Clone,
+    {
+        let mut results = Vec::new();
+        for name in names {
+            if let Some(&idx) = self.refs_by_id.get(*name) {
+                let result = self.refs[idx].send(msg.clone()).await;
+                results.push(((*name).to_string(), result));
+            }
+        }
+        results
+    }
+
+    /// Send to the primary node for `key` plus the next `count - 1` nodes on the hash ring.
+    pub async fn send_replicas<T: Hash>(&self, key: &T, count: usize, msg: M) -> Vec<(String, std::io::Result<()>)>
+    where
+        M: Clone,
+    {
+        let mut results = Vec::new();
+        for node in self.ring.get_nodes(key, count) {
+            if let Some(&idx) = self.refs_by_id.get(&node.id) {
+                let result = self.refs[idx].send(msg.clone()).await;
+                results.push((node.id.clone(), result));
+            }
+        }
+        results
+    }
+
+    pub fn ref_by_name(&self, name: &str) -> Option<&RemoteActorRef<M>> {
+        self.refs_by_id.get(name).map(|&idx| &self.refs[idx])
+    }
 }
 
 /// Local TCP node serving one actor target — use `member()` to join a [`Cluster`].
