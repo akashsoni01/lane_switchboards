@@ -45,7 +45,43 @@ flowchart TB
 | Layer | Message type | Actors |
 |-------|--------------|--------|
 | Cluster (TCP) | `WorkMsg` | One gateway per site |
-| Local supervisor | `LocalMsg` | `processor` + `reporter` (RestForOne) |
+| Local supervisor | `LocalMsg` | `LocalMsg::Processor(…)` / `LocalMsg::Reporter(…)` under RestForOne |
+
+### Role enum
+
+Child identity and RestForOne order come from one enum — no scattered string literals:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRole {
+    Processor,  // order 0
+    Reporter,   // order 1
+}
+
+impl LocalRole {
+    const ALL: [Self; 2] = [Self::Processor, Self::Reporter];
+
+    const fn order(self) -> usize { /* 0 or 1 */ }
+    const fn name(self) -> &'static str { /* registry key */ }
+}
+```
+
+Specs are built by iterating `LocalRole::ALL`:
+
+```rust
+for role in LocalRole::ALL {
+    spawn_child_spec(role.order(), role.name(), registry.clone(), move || LocalWorker { role, .. });
+}
+```
+
+Local messages are tagged by role:
+
+```rust
+enum LocalMsg {
+    Processor(ProcessorMsg),
+    Reporter(ReporterMsg),
+}
+```
 
 **Why two message types?** A supervisor requires one `M` for all its children. Remote cluster routing also requires one `M` per `Cluster<M>`. Gateways translate `WorkMsg` → `LocalMsg`.
 
@@ -59,10 +95,9 @@ Supervisor::new(
         strategy: RestartStrategy::RestForOne,
         ..
     },
-    vec![
-        spawn_child_spec(0, "processor", registry.clone(), { /* Processor */ }),
-        spawn_child_spec(1, "reporter", registry.clone(), { /* Reporter */ }),
-    ],
+    LocalRole::ALL.into_iter().map(|role| {
+        spawn_child_spec(role.order(), role.name(), registry.clone(), move || LocalWorker { role, .. })
+    }).collect(),
 )
 ```
 
@@ -78,8 +113,10 @@ The gateway handles fan-out inside one node:
 
 ```rust
 WorkMsg::Process { job_id, value } => {
-    processor.send(LocalMsg::Compute { job_id, value }).await?;
-    // processor sends LocalMsg::Report to reporter after compute
+    role_ref(&registry, LocalRole::Processor).await?
+        .send(LocalMsg::Processor(ProcessorMsg::Compute { job_id, value }))
+        .await?;
+    // processor sends LocalMsg::Reporter(Report { .. }) to reporter
 }
 ```
 

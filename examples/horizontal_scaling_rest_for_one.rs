@@ -6,7 +6,7 @@
 //! Run: `cargo run --example horizontal_scaling_rest_for_one`
 //! See: `examples/horizontal_scaling_rest_for_one.md`
 
-use lane_switchboards::actor::{Actor, ActorProcessingErr};
+use lane_switchboards::actor::{Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::distributed::{serve_actor, Cluster};
 use lane_switchboards::supervisor::{
     spawn_child_spec, ChildRegistry, RestartStrategy, Supervisor, SupervisorConfig,
@@ -25,73 +25,101 @@ enum WorkMsg {
     FailProcessor,
 }
 
-// --- Local supervised actors (share LocalMsg under RestForOne) ---
+// --- Local roles (RestForOne order + registry key) ---
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRole {
+    Processor,
+    Reporter,
+}
+
+impl LocalRole {
+    const ALL: [Self; 2] = [Self::Processor, Self::Reporter];
+
+    const fn order(self) -> usize {
+        match self {
+            Self::Processor => 0,
+            Self::Reporter => 1,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Processor => "processor",
+            Self::Reporter => "reporter",
+        }
+    }
+}
+
+// --- Local supervised messages (tagged by role) ---
 
 #[derive(Debug, Clone)]
 enum LocalMsg {
+    Processor(ProcessorMsg),
+    Reporter(ReporterMsg),
+}
+
+#[derive(Debug, Clone)]
+enum ProcessorMsg {
     Compute { job_id: u64, value: f64 },
-    Report { job_id: u64, line: String },
     Fail,
 }
 
-struct Processor {
+#[derive(Debug, Clone)]
+enum ReporterMsg {
+    Report { job_id: u64, line: String },
+}
+
+async fn role_ref(
+    registry: &ChildRegistry<LocalMsg>,
+    role: LocalRole,
+) -> Option<ActorRef<LocalMsg>> {
+    registry.get(role.name()).await
+}
+
+struct LocalWorker {
+    role: LocalRole,
     site: String,
     registry: Arc<ChildRegistry<LocalMsg>>,
 }
 
 #[async_trait::async_trait]
-impl Actor<LocalMsg> for Processor {
+impl Actor<LocalMsg> for LocalWorker {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        self.registry.bump_generation("processor").await;
+        self.registry.bump_generation(self.role.name()).await;
         println!(
-            "[{}] processor generation {}",
+            "[{}] {} generation {}",
             self.site,
-            self.registry.generation("processor").await
+            self.role.name(),
+            self.registry.generation(self.role.name()).await
         );
         Ok(())
     }
 
     async fn handle(&mut self, msg: LocalMsg) -> Result<(), ActorProcessingErr> {
-        match msg {
-            LocalMsg::Compute { job_id, value } => {
+        match (self.role, msg) {
+            (LocalRole::Processor, LocalMsg::Processor(ProcessorMsg::Compute { job_id, value })) => {
                 let result = value * 2.0;
-                println!("[{}] processor job {job_id}: {value} -> {result}", self.site);
-                if let Some(reporter) = self.registry.get("reporter").await {
+                println!(
+                    "[{}] processor job {job_id}: {value} -> {result}",
+                    self.site
+                );
+                if let Some(reporter) = role_ref(&self.registry, LocalRole::Reporter).await {
                     let _ = reporter
-                        .send(LocalMsg::Report {
+                        .send(LocalMsg::Reporter(ReporterMsg::Report {
                             job_id,
                             line: format!("computed {result}"),
-                        })
+                        }))
                         .await;
                 }
             }
-            LocalMsg::Fail => panic!("processor fault (RestForOne will restart reporter too)"),
-            LocalMsg::Report { .. } => {}
-        }
-        Ok(())
-    }
-}
-
-struct Reporter {
-    site: String,
-    registry: Arc<ChildRegistry<LocalMsg>>,
-}
-
-#[async_trait::async_trait]
-impl Actor<LocalMsg> for Reporter {
-    async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        self.registry.bump_generation("reporter").await;
-        println!(
-            "[{}] reporter generation {}",
-            self.site,
-            self.registry.generation("reporter").await
-        );
-        Ok(())
-    }
-
-    async fn handle(&mut self, msg: LocalMsg) -> Result<(), ActorProcessingErr> {
-        if let LocalMsg::Report { job_id, line } = msg {
-            println!("[{}] reporter job {job_id}: {line}", self.site);
+            (LocalRole::Processor, LocalMsg::Processor(ProcessorMsg::Fail)) => {
+                panic!("processor fault (RestForOne will restart reporter too)")
+            }
+            (LocalRole::Reporter, LocalMsg::Reporter(ReporterMsg::Report { job_id, line })) => {
+                println!("[{}] reporter job {job_id}: {line}", self.site);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -106,9 +134,20 @@ struct SupervisedPair {
 impl SupervisedPair {
     async fn start(site: &str) -> Result<Self, ActorProcessingErr> {
         let registry = Arc::new(ChildRegistry::new());
-        let proc_reg = registry.clone();
-        let rep_reg = registry.clone();
         let site = site.to_string();
+
+        let children: Vec<_> = LocalRole::ALL
+            .into_iter()
+            .map(|role| {
+                let site = site.clone();
+                let registry = registry.clone();
+                spawn_child_spec(role.order(), role.name(), registry.clone(), move || LocalWorker {
+                    role,
+                    site: site.clone(),
+                    registry: registry.clone(),
+                })
+            })
+            .collect();
 
         let handle = Supervisor::new(
             SupervisorConfig {
@@ -117,24 +156,7 @@ impl SupervisedPair {
                 within_secs: 60,
                 ..Default::default()
             },
-            vec![
-                spawn_child_spec(0, "processor", registry.clone(), {
-                    let site = site.clone();
-                    let registry = proc_reg.clone();
-                    move || Processor {
-                        site: site.clone(),
-                        registry: registry.clone(),
-                    }
-                }),
-                spawn_child_spec(1, "reporter", registry.clone(), {
-                    let site = site.clone();
-                    let registry = rep_reg.clone();
-                    move || Reporter {
-                        site: site.clone(),
-                        registry: registry.clone(),
-                    }
-                }),
-            ],
+            children,
         )
         .start_settled(Duration::from_millis(30))
         .await?;
@@ -143,6 +165,10 @@ impl SupervisedPair {
             registry,
             _supervisor: handle,
         })
+    }
+
+    async fn generation(&self, role: LocalRole) -> u64 {
+        self.registry.generation(role.name()).await
     }
 }
 
@@ -157,10 +183,9 @@ impl Actor<WorkMsg> for Gateway {
     async fn handle(&mut self, msg: WorkMsg) -> Result<(), ActorProcessingErr> {
         match msg {
             WorkMsg::Process { job_id, value } => {
-                // One remote message → two local actors (processor then reporter via processor)
-                if let Some(processor) = self.registry.get("processor").await {
+                if let Some(processor) = role_ref(&self.registry, LocalRole::Processor).await {
                     processor
-                        .send(LocalMsg::Compute { job_id, value })
+                        .send(LocalMsg::Processor(ProcessorMsg::Compute { job_id, value }))
                         .await?;
                 }
             }
@@ -168,8 +193,10 @@ impl Actor<WorkMsg> for Gateway {
                 println!("[{}] gateway ping", self.site);
             }
             WorkMsg::FailProcessor => {
-                if let Some(processor) = self.registry.get("processor").await {
-                    let _ = processor.send(LocalMsg::Fail).await;
+                if let Some(processor) = role_ref(&self.registry, LocalRole::Processor).await {
+                    let _ = processor
+                        .send(LocalMsg::Processor(ProcessorMsg::Fail))
+                        .await;
                 }
             }
         }
@@ -193,8 +220,10 @@ impl WorkerSite {
         };
         let handle = serve_actor(name, "127.0.0.1:0", "gateway", gateway).await?;
         println!(
-            "[cluster] site {name} online at {} (RestForOne: processor=0, reporter=1)",
-            handle.address()
+            "[cluster] site {name} online at {} (RestForOne: {}=0, {}=1)",
+            handle.address(),
+            LocalRole::Processor.name(),
+            LocalRole::Reporter.name(),
         );
         Ok(Self {
             pair,
@@ -229,7 +258,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     join(&mut cluster, &site_a);
     join(&mut cluster, &site_b);
 
-    // One node: hash ring picks owner for job_id
     cluster
         .send_by_key(&42u64, WorkMsg::Process { job_id: 42, value: 10.0 })
         .await?;
@@ -238,11 +266,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\n=== Send to multiple nodes at once ===\n");
 
-    // All nodes in one go (stops on first error)
     cluster.broadcast(WorkMsg::Ping).await?;
     println!("[coordinator] broadcast Ping → all nodes\n");
 
-    // All nodes; collect per-node results (continues on failure)
     let results = cluster
         .send_all(WorkMsg::Process {
             job_id: 100,
@@ -253,7 +279,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[coordinator] send_all → {name}: {result:?}");
     }
 
-    // Named subset only
     let subset = cluster
         .send_to(
             &["site-a"],
@@ -265,7 +290,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await;
     println!("[coordinator] send_to [site-a]: {:?}\n", subset);
 
-    // Hash-ring replicas (primary + next node on ring)
     let replicas = cluster
         .send_replicas(&7u64, 2, WorkMsg::Process { job_id: 7, value: 1.0 })
         .await;
@@ -287,18 +311,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .for_each(|(name, _)| println!("[coordinator] ping after scale-out → {name}"));
 
     println!("\n=== RestForOne on one site (processor fail → reporter restarts) ===\n");
-    let before_p = site_a.pair.registry.generation("processor").await;
-    let before_r = site_a.pair.registry.generation("reporter").await;
+    let before_p = site_a.pair.generation(LocalRole::Processor).await;
+    let before_r = site_a.pair.generation(LocalRole::Reporter).await;
 
-    cluster
-        .send_to(&["site-a"], WorkMsg::FailProcessor)
-        .await;
+    cluster.send_to(&["site-a"], WorkMsg::FailProcessor).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let after_p = site_a.pair.registry.generation("processor").await;
-    let after_r = site_a.pair.registry.generation("reporter").await;
+    let after_p = site_a.pair.generation(LocalRole::Processor).await;
+    let after_r = site_a.pair.generation(LocalRole::Reporter).await;
     println!(
-        "[site-a] processor gen {before_p} -> {after_p}, reporter gen {before_r} -> {after_r}"
+        "[site-a] {} gen {before_p} -> {after_p}, {} gen {before_r} -> {after_r}",
+        LocalRole::Processor.name(),
+        LocalRole::Reporter.name(),
     );
 
     cluster
