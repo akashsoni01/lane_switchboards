@@ -14,6 +14,9 @@
 //!
 //! Run: `cargo run --example handle_timeout_calculator_timer`
 //! See: `examples/handle_timeout_calculator_timer.md`
+//!
+//! **Overall latency:** ~2.6–3.1 s wall clock (full demo). **Best case (success only):**
+//! ~55–75 ms boot + ops; ~0.1–2 ms per successful `add` / fast `slow_div`.
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr, ActorRef, HandleStuckContext};
 use lane_switchboards::config::ActorConfig;

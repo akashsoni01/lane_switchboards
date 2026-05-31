@@ -32,6 +32,20 @@ Channel sizing and concurrency are no longer bundled into one struct. Each subsy
 
 Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/integration.rs`.
 
+**End-to-end example:** [`handle_timeout_calculator_timer`](./examples/handle_timeout_calculator_timer.md) — slow handler, self-deadlock, and calc↔ledger cross-deadlock with journaling + RestForOne recovery.
+
+| Metric | Value |
+|--------|-------|
+| Command | `cargo run --example handle_timeout_calculator_timer` |
+| **Overall latency (wall clock)** | **~2.6–3.1 s** (3 local runs: 2.62 s, 2.62 s, 3.10 s) |
+| `handle_timeout` | 150 ms per stuck `handle()` |
+| Timeout events in demo | 3 (slow `SlowDiv`, self-deadlock, cross-deadlock) + optional ledger timeout on cross probe |
+| Explicit `sleep` budget | ~2.45 s (settle 50 ms + five 300 ms gaps + final 900 ms timer tail) |
+| Recovery bound per stall | ~150 ms detect + ~50 ms `start_settled` + RestForOne respawn |
+| **Best-case (success only)** | **~55–75 ms** boot + 2 ops; **~0.1–2 ms** per `add` / fast `slow_div` — see [best-case table](./examples/handle_timeout_calculator_timer.md#best-case-latency-success-path-only) |
+
+See [handle_timeout_calculator_timer.md — overall latency](./examples/handle_timeout_calculator_timer.md#overall-latency) for the phase-by-phase breakdown.
+
 #### Handle lifecycle — `on_handle_begin` and `on_handle_stuck`
 
 Every `Envelope::Msg` passes through `handle_message` in `src/actor.rs`. The two hooks bracket `handle()` so you can **snapshot work before processing** and **persist it if the handler stalls**.
@@ -247,6 +261,7 @@ All examples built and run locally (`cargo test` — **14 passed**).
 | resilient_calculator_timer | `cargo run --example resilient_calculator_timer` | ✅ pass | Timer + supervised calculator |
 | recoverable_timer_calc | `cargo run --example recoverable_timer_calc` | ✅ pass | Journal replay after restart |
 | rest_for_one_calculator_timer | `cargo run --example rest_for_one_calculator_timer` | ✅ pass | RestForOne chain + intensity breach |
+| handle_timeout_calculator_timer | `cargo run --example handle_timeout_calculator_timer` | ✅ pass | Deadlock prevention; **~2.6–3.1 s** full demo, **~55–75 ms** success-only best case — [latency](./examples/handle_timeout_calculator_timer.md#overall-latency) |
 | gateway | `cargo run --example gateway` | ✅ server | `GET /health` → 200; long-running Actix server on `:8080` |
 
 ### Tests
@@ -304,3 +319,4 @@ SupervisorConfig {
 - [service_mesh.md](./examples/service_mesh.md)
 - [serve_microservice.md](./examples/serve_microservice.md)
 - [supervisor_strategies.md](./examples/supervisor_strategies.md)
+- [handle_timeout_calculator_timer.md](./examples/handle_timeout_calculator_timer.md) — deadlock prevention demo + latency budget

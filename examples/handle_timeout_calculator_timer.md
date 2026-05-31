@@ -144,3 +144,80 @@ Supervisor uses `Supervisor::with_actor_config(actor_config, ...)` so every chil
 - Pair timeouts with a **supervisor** so `HandleTimeout` triggers child restart rather than a permanently wedged process.
 
 See also [README.md](../README.md#deadlock--slow-handle-prevention) and [READMEv0.0.2.md](../READMEv0.0.2.md).
+
+---
+
+## Overall latency
+
+Measured locally on 2026-05-31 (`cargo build --example handle_timeout_calculator_timer` then 3 runs of the binary):
+
+| Run | Wall clock |
+|-----|------------|
+| 1 | 3.10 s |
+| 2 | 2.62 s |
+| 3 | 2.62 s |
+| **Typical** | **~2.6–3.1 s** |
+
+The demo is **not** waiting for real deadlocks to hang forever — each stall is capped by `handle_timeout` (150 ms). Most of the runtime is intentional pacing so restarts and timer ticks are visible in the log.
+
+### Phase budget
+
+| Step | Duration | Cumulative (approx.) |
+|------|----------|----------------------|
+| `start_settled` | 50 ms | 0.05 s |
+| Phase 1 — fast `add`, sleep | ~300 ms | 0.35 s |
+| Phase 1 — `SlowDiv` timeout + restart | ~150 ms + respawn | 0.55 s |
+| Phase 1 — post-restart sleep | 300 ms | 0.85 s |
+| Phase 2a — self-deadlock timeout + restart | ~150 ms + respawn | 1.05 s |
+| Phase 2a — sleep | 300 ms | 1.35 s |
+| Phase 2b — cross-deadlock timeout(s) + restart | ~150–300 ms | 1.55–1.65 s |
+| Phase 2b — sleep | 300 ms | 1.85–1.95 s |
+| Recovery — `add`, fast `slow_div`, timer ticks | ~50 ms | 2.0 s |
+| Final timer tail (`sleep(900ms)`) | 900 ms | **~2.9 s** |
+
+**Explicit sleep total:** 50 + 5×300 + 900 = **2450 ms**.  
+**Timeout detection total:** 3×150 ms = **450 ms** (minimum; cross probe may also timeout ledger).  
+**Actor / supervisor work:** remainder (~100–200 ms) — spawns, mailbox I/O, journal queries.
+
+### Latency knobs
+
+| Constant | Value | Effect |
+|----------|-------|--------|
+| `HANDLE_TIMEOUT` | 150 ms | Upper bound per stuck `handle()` before recovery |
+| `start_settled` | 50 ms | Initial child spawn settle |
+| Phase sleeps | 300 ms × 5 | Log readability between probes |
+| Timer interval | 600 ms | Background `last_result` prints |
+| Final sleep | 900 ms | Lets timer fire after recovery |
+
+To run faster in CI, reduce the 300 ms / 900 ms sleeps; recovery timing is still bounded by `handle_timeout`.
+
+### Best-case latency (success path only)
+
+Rough **order-of-magnitude** estimates for this example on a local dev machine when **no timeout, panic, or restart** occurs. Actual numbers vary with CPU load and Tokio scheduling; treat these as planning guides, not SLAs.
+
+| Step | What runs | Rough latency |
+|------|-----------|---------------|
+| **Supervisor boot** | RestForOne start + spawn calculator, timer, ledger + `start_settled(50ms)` | **~50–70 ms** (50 ms is intentional settle) |
+| **Registry lookup** | `ChildRegistry::get("calculator")` (async mutex) | ~0.05–0.5 ms |
+| **Mailbox send** | `ActorRef::send` → `mpsc` enqueue + scheduler wake | ~0.02–0.3 ms |
+| **`on_handle_begin`** | Snapshot `StuckAction` from `&msg` | ~0.01–0.1 ms |
+| **`handle` — `Add`** | Mutex update + `oneshot` reply | ~0.05–0.3 ms |
+| **`handle` — `SlowDiv` (0 ms sleep)** | Same as `Add` + divide | ~0.05–0.3 ms |
+| **`handle` — `LastResult`** | Mutex read + reply | ~0.05–0.2 ms |
+| **`handle` — `StuckJournal`** | Mutex clone of vec + reply | ~0.1–0.5 ms |
+| **`ActorMonitor`** | `begin_handle` / `finish_handle` counters | ~0.01–0.05 ms (success path) |
+| **`handle_timeout` wrapper** | `tokio::time::timeout` when handle finishes in time | ~0 ms extra (negligible vs handle) |
+| **End-to-end `add(a, b)`** | lookup + send + full handle lifecycle + `rx.await` | **~0.1–2 ms** |
+| **End-to-end `slow_div` (0 ms)** | same path | **~0.1–2 ms** |
+| **Timer → `LastResult`** | timer `handle` + calc round-trip (2 actors) | **~0.2–4 ms** |
+| **Timer tick interval** | background; not on caller critical path | 600 ms between prints |
+
+**Minimal success-only run** (boot + one `add` + one fast `slow_div`, no demo sleeps or probes):
+
+| Phase | Rough total |
+|-------|-------------|
+| Boot | ~50–70 ms |
+| 2 successful calculator ops | ~0.2–4 ms |
+| **Best-case wall clock** | **~55–75 ms** |
+
+Contrast with the full demo (~2.6–3.1 s): timeouts (3×150 ms), intentional `sleep` pacing (2.45 s), and RestForOne restarts dominate. In production, a healthy supervised actor tree on the success path should look like the **~0.1–2 ms per op** row, plus one-time boot cost.
