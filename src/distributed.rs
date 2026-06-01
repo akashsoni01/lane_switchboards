@@ -3,6 +3,7 @@
 use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr};
 use crate::config::{spawn_on, ActorConfig, DistributedConfig};
 use crate::hash_ring::{HashRing, RingNode};
+use crate::tls::{self, MaybeTlsStream};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -10,11 +11,13 @@ use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
+pub use tokio_rustls::TlsAcceptor;
 
 /// Messages that can traverse the network layer.
 pub trait RemoteMessage:
@@ -43,12 +46,15 @@ where
     payload: &'a M,
 }
 
-async fn write_frame<M: RemoteMessage>(
-    stream: &mut TcpStream,
+async fn write_frame<M, S: AsyncWrite + Unpin>(
+    stream: &mut S,
     target: &str,
     msg: &M,
     max_frame_bytes: u32,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    M: RemoteMessage,
+{
     let body = serde_json::to_vec(&FrameOut { target, payload: msg }).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
@@ -69,12 +75,13 @@ async fn remote_write_loop<M: RemoteMessage>(
     target: String,
     mut rx: mpsc::Receiver<M>,
     config: DistributedConfig,
+    tls: Option<Arc<TlsConnector>>,
 ) {
     const RECONNECT_DELAY: Duration = Duration::from_millis(500);
 
     loop {
         let mut stream = loop {
-            match TcpStream::connect(&node_addr).await {
+            match tls::connect(&node_addr, tls.as_deref()).await {
                 Ok(s) => break s,
                 Err(e) => {
                     tracing::warn!(%node_addr, error = %e, "remote write reconnect failed");
@@ -117,13 +124,23 @@ pub struct RemoteActorRef<M: RemoteMessage> {
 
 impl<M: RemoteMessage> RemoteActorRef<M> {
     pub fn new(node_addr: impl Into<String>, target: impl Into<String>) -> Self {
-        Self::with_config(node_addr, target, &DistributedConfig::default())
+        Self::with_config(node_addr, target, &DistributedConfig::default(), None)
+    }
+
+    pub fn with_tls(
+        node_addr: impl Into<String>,
+        target: impl Into<String>,
+        config: &DistributedConfig,
+        tls: Arc<TlsConnector>,
+    ) -> Self {
+        Self::with_config(node_addr, target, config, Some(tls))
     }
 
     pub fn with_config(
         node_addr: impl Into<String>,
         target: impl Into<String>,
         config: &DistributedConfig,
+        tls: Option<Arc<TlsConnector>>,
     ) -> Self {
         let node_addr = node_addr.into();
         let target = target.into();
@@ -131,7 +148,14 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
         let loop_addr = node_addr.clone();
         let loop_target = target.clone();
         let loop_config = *config;
-        let task = tokio::spawn(remote_write_loop(loop_addr, loop_target, rx, loop_config));
+        let loop_tls = tls.clone();
+        let task = tokio::spawn(remote_write_loop(
+            loop_addr,
+            loop_target,
+            rx,
+            loop_config,
+            loop_tls,
+        ));
         Self {
             node_addr,
             target,
@@ -171,7 +195,18 @@ impl<M: RemoteMessage> Node<M> {
         addr: impl Into<String>,
         config: &DistributedConfig,
     ) -> std::io::Result<Self> {
-        Self::bind_on_runtime(&Handle::current(), name, addr, config).await
+        Self::bind_on_runtime(&Handle::current(), name, addr, config, None).await
+    }
+
+    /// Bind with TLS (server certificate required).
+    pub async fn bind_tls_on_runtime(
+        runtime: &Handle,
+        name: impl Into<String>,
+        addr: impl Into<String>,
+        config: &DistributedConfig,
+        tls: Arc<TlsAcceptor>,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_runtime(runtime, name, addr, config, Some(tls)).await
     }
 
     pub async fn bind_on_runtime(
@@ -179,18 +214,25 @@ impl<M: RemoteMessage> Node<M> {
         name: impl Into<String>,
         addr: impl Into<String>,
         config: &DistributedConfig,
+        tls: Option<Arc<TlsAcceptor>>,
     ) -> std::io::Result<Self> {
         let name = name.into();
         let bind_addr = addr.into();
         let listener = TcpListener::bind(&bind_addr).await?;
         let actual_addr = listener.local_addr()?;
-        tracing::info!(node = %name, %actual_addr, "distributed node listening");
+        tracing::info!(
+            node = %name,
+            %actual_addr,
+            tls = tls.is_some(),
+            "distributed node listening"
+        );
 
         let dispatch = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<M>>::new()));
         let dispatch_c = dispatch.clone();
         let in_flight = Arc::new(Semaphore::new(config.max_in_flight.max(1)));
         let conn_config = *config;
         let runtime = runtime.clone();
+        let tls_acceptor = tls;
 
         let listener_task = spawn_on(Some(&runtime), {
             let runtime = runtime.clone();
@@ -201,17 +243,25 @@ impl<M: RemoteMessage> Node<M> {
                             let table = dispatch_c.clone();
                             let in_flight = in_flight.clone();
                             let conn_runtime = runtime.clone();
+                            let acceptor = tls_acceptor.clone();
                             spawn_on(Some(&runtime), async move {
-                                if let Err(e) = handle_conn(
-                                    stream,
-                                    table,
-                                    in_flight,
-                                    conn_runtime,
-                                    conn_config,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(%peer, error = %e, "connection handler error");
+                                match tls::accept(stream, acceptor.as_deref()).await {
+                                    Ok(stream) => {
+                                        if let Err(e) = handle_conn(
+                                            stream,
+                                            table,
+                                            in_flight,
+                                            conn_runtime,
+                                            conn_config,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(%peer, error = %e, "connection handler error");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%peer, error = %e, "TLS accept failed");
+                                    }
                                 }
                             });
                         }
@@ -249,8 +299,8 @@ impl<M: RemoteMessage> Node<M> {
     }
 }
 
-async fn read_u32_le_timeout(
-    stream: &mut TcpStream,
+async fn read_u32_le_timeout<S: AsyncRead + Unpin>(
+    stream: &mut S,
     config: &DistributedConfig,
 ) -> std::io::Result<Option<u32>> {
     match tokio::time::timeout(config.read_timeout, stream.read_u32_le()).await {
@@ -274,7 +324,7 @@ async fn read_u32_le_timeout(
 }
 
 async fn handle_conn<M: RemoteMessage>(
-    mut stream: TcpStream,
+    mut stream: MaybeTlsStream,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
     in_flight: Arc<Semaphore>,
     runtime: Handle,
@@ -348,6 +398,14 @@ impl ClusterMember {
         RemoteActorRef::new(&self.node_addr, &self.target)
     }
 
+    pub fn remote_ref_with<M: RemoteMessage>(
+        &self,
+        config: &DistributedConfig,
+        tls: Option<Arc<TlsConnector>>,
+    ) -> RemoteActorRef<M> {
+        RemoteActorRef::with_config(&self.node_addr, &self.target, config, tls)
+    }
+
     pub fn ring_node(&self) -> RingNode {
         RingNode::from_socket_addr(&self.name, &self.node_addr)
     }
@@ -360,6 +418,8 @@ pub struct Cluster<M: RemoteMessage> {
     refs_by_id: HashMap<String, usize>,
     ring: HashRing,
     next: AtomicUsize,
+    distributed_config: DistributedConfig,
+    tls: Option<Arc<TlsConnector>>,
 }
 
 impl<M: RemoteMessage> Default for Cluster<M> {
@@ -380,7 +440,22 @@ impl<M: RemoteMessage> Cluster<M> {
             refs_by_id: HashMap::new(),
             ring: HashRing::new(virtual_nodes),
             next: AtomicUsize::new(0),
+            distributed_config: DistributedConfig::default(),
+            tls: None,
         }
+    }
+
+    /// TLS connector used when joining members (`RemoteActorRef` outbound).
+    pub fn set_tls_connector(&mut self, connector: Option<Arc<TlsConnector>>) {
+        self.tls = connector;
+    }
+
+    pub fn tls_connector(&self) -> Option<&Arc<TlsConnector>> {
+        self.tls.as_ref()
+    }
+
+    pub fn set_distributed_config(&mut self, config: DistributedConfig) {
+        self.distributed_config = config;
     }
 
     pub fn len(&self) -> usize {
@@ -404,7 +479,10 @@ impl<M: RemoteMessage> Cluster<M> {
         let idx = self.refs.len();
         self.ring.add_node(member.ring_node());
         self.refs_by_id.insert(member.name.clone(), idx);
-        self.refs.push(member.remote_ref());
+        self.refs.push(member.remote_ref_with(
+            &self.distributed_config,
+            self.tls.clone(),
+        ));
         self.members.push(member);
     }
 
@@ -563,6 +641,7 @@ where
         actor,
         &DistributedConfig::default(),
         &ActorConfig::default(),
+        None,
     )
     .await
 }
@@ -588,6 +667,35 @@ where
         actor,
         distributed,
         actor_config,
+        None,
+    )
+    .await
+}
+
+/// Bind a TCP node with TLS and bridge on a dedicated runtime.
+pub async fn serve_actor_tls_on_runtime<M, A>(
+    runtime: &Handle,
+    node_name: impl Into<String>,
+    bind_addr: impl Into<String>,
+    target: impl Into<String>,
+    actor: A,
+    distributed: &DistributedConfig,
+    actor_config: &ActorConfig,
+    tls: Arc<TlsAcceptor>,
+) -> std::io::Result<NodeHandle<M>>
+where
+    M: RemoteMessage,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    serve_actor_on_runtime(
+        runtime,
+        node_name,
+        bind_addr,
+        target,
+        actor,
+        distributed,
+        actor_config,
+        Some(tls),
     )
     .await
 }
@@ -601,6 +709,7 @@ pub async fn serve_actor_on_runtime<M, A>(
     actor: A,
     distributed: &DistributedConfig,
     actor_config: &ActorConfig,
+    tls: Option<Arc<TlsAcceptor>>,
 ) -> std::io::Result<NodeHandle<M>>
 where
     M: RemoteMessage,
@@ -619,7 +728,8 @@ where
             )
         })?;
 
-    let node = Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed).await?;
+    let node =
+        Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed, tls).await?;
     let address = node.address().to_string();
 
     let (tx, mut rx) = mpsc::channel(distributed.bridge_capacity);

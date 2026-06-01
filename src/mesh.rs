@@ -1,18 +1,21 @@
 //! TCP service mesh: register microservice instances, discover by name, route via hash ring.
 
 use crate::distributed::{
-    serve_actor, Cluster, ClusterMember, NodeHandle, RemoteActorRef, RemoteMessage,
+    serve_actor, serve_actor_tls_on_runtime, Cluster, ClusterMember, NodeHandle, RemoteActorRef,
+    RemoteMessage, TlsAcceptor,
 };
 use crate::hash_ring::HashRing;
+use crate::tls::{self, MaybeTlsStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
 
 /// Max inbound control-plane frame size (registration/list replies are small JSON).
 const MAX_CONTROL_FRAME: u32 = 64 * 1024;
@@ -290,6 +293,47 @@ where
     })
 }
 
+/// Bind a microservice with TLS on the data plane.
+pub async fn serve_microservice_tls<M, A>(
+    service: impl Into<String>,
+    instance_id: impl Into<String>,
+    bind_addr: impl Into<String>,
+    actor: A,
+    tls: Arc<TlsAcceptor>,
+) -> std::io::Result<MicroserviceHandle<M>>
+where
+    M: RemoteMessage,
+    A: crate::actor::Actor<M> + Send + Sync + 'static,
+{
+    use crate::config::{ActorConfig, DistributedConfig};
+    use tokio::runtime::Handle;
+
+    let service = service.into();
+    let instance_id = instance_id.into();
+    let target = instance_id.clone();
+    let node = serve_actor_tls_on_runtime(
+        &Handle::current(),
+        &instance_id,
+        bind_addr,
+        &target,
+        actor,
+        &DistributedConfig::default(),
+        &ActorConfig::default(),
+        tls,
+    )
+    .await?;
+    Ok(MicroserviceHandle {
+        record: ServiceRecord {
+            service,
+            instance_id,
+            address: node.address().to_string(),
+            target,
+            registered_at: 0,
+        },
+        _node: node,
+    })
+}
+
 // --- TCP control plane (discovery) ---
 
 /// Control-plane message (length-prefixed JSON over TCP).
@@ -303,7 +347,10 @@ pub enum MeshControlMsg {
     Pong,
 }
 
-async fn write_control(stream: &mut TcpStream, msg: &MeshControlMsg) -> std::io::Result<()> {
+async fn write_control<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &MeshControlMsg,
+) -> std::io::Result<()> {
     let body = serde_json::to_vec(msg).map_err(|e| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
     })?;
@@ -319,7 +366,7 @@ async fn write_control(stream: &mut TcpStream, msg: &MeshControlMsg) -> std::io:
     Ok(())
 }
 
-async fn read_control_len(stream: &mut TcpStream) -> std::io::Result<Option<u32>> {
+async fn read_control_len<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<u32>> {
     match tokio::time::timeout(CONTROL_READ_TIMEOUT, stream.read_u32_le()).await {
         Ok(Ok(0)) => Ok(None),
         Ok(Ok(n)) => {
@@ -340,7 +387,7 @@ async fn read_control_len(stream: &mut TcpStream) -> std::io::Result<Option<u32>
     }
 }
 
-async fn read_control(stream: &mut TcpStream) -> std::io::Result<Option<MeshControlMsg>> {
+async fn read_control<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<MeshControlMsg>> {
     let Some(len) = read_control_len(stream).await? else {
         return Ok(None);
     };
@@ -428,19 +475,44 @@ pub struct MeshRegistryServer {
 
 impl MeshRegistryServer {
     pub async fn bind(addr: impl Into<String>) -> std::io::Result<Self> {
+        Self::bind_on_runtime(addr, None).await
+    }
+
+    /// Bind the control plane with TLS.
+    pub async fn bind_tls(
+        addr: impl Into<String>,
+        tls: Arc<TlsAcceptor>,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_runtime(addr, Some(tls)).await
+    }
+
+    async fn bind_on_runtime(
+        addr: impl Into<String>,
+        tls: Option<Arc<TlsAcceptor>>,
+    ) -> std::io::Result<Self> {
         let registry = MeshRegistry::new();
         let listener = TcpListener::bind(addr.into()).await?;
         let address = listener.local_addr()?.to_string();
         let reg = registry.clone();
+        let acceptor = tls;
+        let tls_enabled = acceptor.is_some();
 
         let task = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
                         let reg = reg.clone();
+                        let acceptor = acceptor.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_registry_conn(stream, reg).await {
-                                tracing::warn!(%peer, error = %e, "mesh registry connection error");
+                            match tls::accept(stream, acceptor.as_deref()).await {
+                                Ok(stream) => {
+                                    if let Err(e) = handle_registry_conn(stream, reg).await {
+                                        tracing::warn!(%peer, error = %e, "mesh registry connection error");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%peer, error = %e, "mesh registry TLS accept failed");
+                                }
                             }
                         });
                     }
@@ -461,7 +533,7 @@ impl MeshRegistryServer {
             }
         });
 
-        tracing::info!(%address, "mesh registry listening");
+        tracing::info!(%address, tls = tls_enabled, "mesh registry listening");
         Ok(Self {
             address,
             registry,
@@ -476,7 +548,7 @@ impl MeshRegistryServer {
 }
 
 async fn handle_registry_conn(
-    mut stream: TcpStream,
+    mut stream: MaybeTlsStream,
     registry: MeshRegistry,
 ) -> std::io::Result<()> {
     loop {
@@ -524,7 +596,8 @@ async fn handle_registry_conn(
 /// Client for the TCP mesh registry (discovery) with a persistent connection.
 pub struct MeshRegistryClient {
     registry_addr: String,
-    stream: Option<TcpStream>,
+    stream: Option<MaybeTlsStream>,
+    tls: Option<Arc<TlsConnector>>,
 }
 
 impl MeshRegistryClient {
@@ -532,6 +605,15 @@ impl MeshRegistryClient {
         Self {
             registry_addr: registry_addr.into(),
             stream: None,
+            tls: None,
+        }
+    }
+
+    pub fn with_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
+        Self {
+            registry_addr: registry_addr.into(),
+            stream: None,
+            tls: Some(tls),
         }
     }
 
@@ -539,9 +621,9 @@ impl MeshRegistryClient {
         self.stream = None;
     }
 
-    async fn conn(&mut self) -> std::io::Result<&mut TcpStream> {
+    async fn conn(&mut self) -> std::io::Result<&mut MaybeTlsStream> {
         if self.stream.is_none() {
-            self.stream = Some(TcpStream::connect(&self.registry_addr).await?);
+            self.stream = Some(tls::connect(&self.registry_addr, self.tls.as_deref()).await?);
         }
         Ok(self.stream.as_mut().unwrap())
     }
@@ -619,6 +701,13 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::new(),
             client: Some(MeshRegistryClient::new(registry_addr)),
+        }
+    }
+
+    pub fn with_registry_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
+        Self {
+            mesh: ServiceMesh::new(),
+            client: Some(MeshRegistryClient::with_tls(registry_addr, tls)),
         }
     }
 
