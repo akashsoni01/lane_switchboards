@@ -4,6 +4,8 @@
 
 OTP-style primitives in Rust: actors, supervision, linking, monitoring, distributed messaging, and hot code upgrade.
 
+Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
+
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 
 ## The switchboard analogy
@@ -66,7 +68,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `registry.rs` | Global `DashMap` actor index |
 | `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor`, hash-ring routing |
 | `hash_ring.rs` | `HashRing` / `RingNode` consistent-hash discovery |
-| `config.rs` | `ActorConfig`, load limits, handle timeouts |
+| `config.rs` | `ActorConfig` mailbox + timeout tuning, `DistributedConfig` load limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | TCP service mesh — `ServiceMesh`, registry, `MeshRouter`, `serve_microservice` |
 
@@ -239,6 +241,20 @@ let (actor, _) = spawn_with_config(MyWorker, None, &config).await?;
 let stats = ActorMonitor::global().get(actor.id);
 ```
 
+### Latest latency snapshot (sequential runtime)
+
+Measured on the current design (`cargo run --example handle_timeout_calculator_timer_latency`, 2026-06-01, debug build):
+
+| Metric | Value |
+|--------|-------|
+| warmup / samples | 5 / 50 |
+| `add` end-to-end | min **40 µs**, avg **91 µs**, max **1321 µs** |
+| `slow_div` (0ms delay) end-to-end | min **1165 µs**, avg **1237 µs**, max **1499 µs** |
+| `last_result` end-to-end | min **38 µs**, avg **63 µs**, max **386 µs** |
+| Full demo wall-clock | **~3.4 s** |
+
+The wall-clock run includes demonstration sleeps, restart choreography, and timeout phases; the microsecond figures above are success-path request latency.
+
 ## Examples
 
 | Example | Command |
@@ -251,6 +267,7 @@ let stats = ActorMonitor::global().get(actor.id);
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
+| Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |

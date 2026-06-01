@@ -65,6 +65,15 @@ Result: simpler runtime behavior, lower lock contention risk, and closer OTP pro
 - Linked exits are propagated only for abnormal exits (not `Normal` / `Shutdown`).
 - Added upgrade lifecycle hook (`on_upgrade`) used by hot upgrade flow.
 
+### 5) Latest latency (sequential design)
+
+From `cargo run --example handle_timeout_calculator_timer_latency` (2026-06-01, debug build, warmup=5, samples=50):
+
+- `add` e2e: min 40 µs, avg 91 µs, max 1321 µs
+- `slow_div 0ms` e2e: min 1165 µs, avg 1237 µs, max 1499 µs
+- `last_result` e2e: min 38 µs, avg 63 µs, max 386 µs
+- Full demo wall clock: ~3.4 s
+
 ---
 
 ## Tests and checks

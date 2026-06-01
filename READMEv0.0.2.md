@@ -2,6 +2,8 @@
 
 Release notes for **v0.0.2** — runtime tuning, load limits, dedicated Tokio runtimes, hash-ring clustering, and TCP service mesh.
 
+> Note: this file is kept for release continuity. Runtime behavior has since been updated to a sequential OTP mailbox model (no actor `max_in_flight` setting). See also `README.md` and `READMEv0.0.3.ms`.
+
 For the full project overview see [README.md](./README.md).
 
 ---
@@ -14,7 +16,7 @@ Channel sizing and concurrency are no longer bundled into one struct. Each subsy
 
 | Config | Fields | Defaults | Used by |
 |--------|--------|----------|---------|
-| **`ActorConfig`** | `mailbox_capacity`, `max_in_flight`, `handle_timeout`, `slow_handle_threshold` | 64, 1, none, none | `spawn`, `spawn_with_config`, `spawn_on_runtime` |
+| **`ActorConfig`** | `mailbox_capacity`, `handle_timeout`, `slow_handle_threshold` | 64, none, none | `spawn`, `spawn_with_config`, `spawn_on_runtime` |
 | **`DistributedConfig`** | `bridge_capacity`, `max_in_flight` | 32, 32 | `Node::bind_on_runtime`, `serve_actor_on_runtime` |
 | **`SupervisorConfig`** | `mailbox_capacity` (+ strategy/intensity) | 32 | supervisor restart-signal queue |
 | **`RuntimeOptions`** | `worker_threads` | OS default | `DedicatedRuntime::new` |
@@ -37,12 +39,18 @@ Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/i
 | Metric | Value |
 |--------|-------|
 | Command | `cargo run --example handle_timeout_calculator_timer` |
-| **Overall latency (wall clock)** | **~2.6–3.1 s** (3 local runs: 2.62 s, 2.62 s, 3.10 s) |
+| **Overall latency (wall clock)** | **~3.4 s** (latest sequential runtime sample, 2026-06-01) |
 | `handle_timeout` | 150 ms per stuck `handle()` |
 | Timeout events in demo | 3 (slow `SlowDiv`, self-deadlock, cross-deadlock) + optional ledger timeout on cross probe |
 | Explicit `sleep` budget | ~2.45 s (settle 50 ms + five 300 ms gaps + final 900 ms timer tail) |
 | Recovery bound per stall | ~150 ms detect + ~50 ms `start_settled` + RestForOne respawn |
-| **Best-case (success only)** | **`add` ~58 µs avg** (debug) / **~21 µs** (release) e2e — measured at startup, demo sleeps excluded — [table](./examples/handle_timeout_calculator_timer.md#best-case-latency-success-path-only) |
+| **Best-case (success only)** | `add` **min 40 µs / avg 91 µs / max 1321 µs** (latest debug run, n=50) |
+
+Latest success-path metrics (`cargo run --example handle_timeout_calculator_timer_latency`, warmup 5, samples 50):
+
+- `add`: min 40 µs, avg 91 µs, max 1321 µs
+- `slow_div 0ms`: min 1165 µs, avg 1237 µs, max 1499 µs
+- `last_result`: min 38 µs, avg 63 µs, max 386 µs
 
 See [handle_timeout_calculator_timer.md — overall latency](./examples/handle_timeout_calculator_timer.md#overall-latency) for the phase-by-phase breakdown.
 
@@ -156,12 +164,10 @@ Stats remain queryable after the actor exits (`mark_inactive`).
 
 ### Semaphore load limiting (EventBus-style)
 
-Per-node and per-actor backpressure via `tokio::sync::Semaphore`:
+Per-node backpressure via `tokio::sync::Semaphore`:
 
 - **TCP nodes** — `DistributedConfig.max_in_flight` caps concurrent frame dispatches per node. A permit is held until the bridge channel accepts the message, so a full bridge blocks new frames.
-- **Actors** — `ActorConfig.max_in_flight`:
-  - `1` (default) — classic sequential mailbox (OTP semantics).
-  - `> 1` — up to N concurrent `handle()` calls; control messages (link, stop, upgrade, …) stay on the main loop.
+- **Actors** — mailbox handling is now sequential-only (OTP semantics).
 
 ### Dedicated Tokio runtime
 
@@ -191,7 +197,7 @@ rt.block_on(async {
         },
         &ActorConfig {
             mailbox_capacity: 256,
-            max_in_flight: 8,
+            handle_timeout: Some(Duration::from_millis(150)),
         },
     )
     .await
@@ -234,7 +240,7 @@ rt.block_on(async {
 | Module | v0.0.2 capability |
 |--------|-------------------|
 | `config.rs` | `ActorConfig`, `DistributedConfig`, `DedicatedRuntime`, `RuntimeOptions`, `spawn_on` |
-| `actor.rs` | `spawn_on_runtime`, handle timeout hooks, concurrent `handle()` when `max_in_flight > 1` |
+| `actor.rs` | `spawn_on_runtime`, handle timeout hooks, sequential mailbox execution |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — handle duration, timeouts, panics |
 | `supervisor.rs` | `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `mailbox_capacity` on `SupervisorConfig` |
 | `distributed.rs` | Per-node semaphore, `bind_on_runtime`, `serve_actor_on_runtime` |
@@ -290,7 +296,6 @@ cargo test
 ```rust
 ActorConfig {
     mailbox_capacity: 64,
-    max_in_flight: 1,        // sequential mailbox
     handle_timeout: None,    // Some(Duration::from_secs(5)) to enable
     slow_handle_threshold: None,
 }
