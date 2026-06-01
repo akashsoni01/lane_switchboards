@@ -267,6 +267,7 @@ The wall-clock run includes demonstration sleeps, restart choreography, and time
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
+| RestForOne calculator + timer (optimized macros) | `cargo run --example rest_for_one_calculator_timer_optimized` — see [rest_for_one_calculator_timer_optimized.md](examples/rest_for_one_calculator_timer_optimized.md) |
 | Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |

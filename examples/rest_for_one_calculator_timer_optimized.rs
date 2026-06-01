@@ -109,28 +109,38 @@ fn actor_err(e: ActorProcessingErr) -> anyhow::Error {
 }
 
 impl App {
+    fn rest_for_one_config(cfg: SupervisorConfig) -> SupervisorConfig {
+        SupervisorConfig {
+            strategy: RestartStrategy::RestForOne,
+            ..cfg
+        }
+    }
+
+    fn child_specs(
+        interval: Duration,
+        registry: Arc<ChildRegistry<AppMsg>>,
+    ) -> Vec<Box<dyn lane_switchboards::supervisor::ChildSpec<AppMsg>>> {
+        vec![
+            registry_child_spec!(0, "calculator", registry, Calculator { last_result: None }),
+            registry_child_spec!(
+                1,
+                "timer",
+                registry,
+                ResultTimer {
+                    registry: registry.clone(),
+                    self_ref: None,
+                    interval,
+                    running: false,
+                }
+            ),
+        ]
+    }
+
     async fn start(interval: Duration, cfg: SupervisorConfig) -> Result<Self, ActorProcessingErr> {
         let registry = Arc::new(ChildRegistry::new());
-        let timer_registry = registry.clone();
         let handle = Supervisor::new(
-            SupervisorConfig {
-                strategy: RestartStrategy::RestForOne,
-                ..cfg
-            },
-            vec![
-                registry_child_spec!(0, "calculator", registry, Calculator { last_result: None }),
-                registry_child_spec!(
-                    1,
-                    "timer",
-                    registry,
-                    ResultTimer {
-                        registry: timer_registry.clone(),
-                        self_ref: None,
-                        interval,
-                        running: false,
-                    }
-                ),
-            ],
+            Self::rest_for_one_config(cfg),
+            Self::child_specs(interval, registry.clone()),
         )
         .start_settled(Duration::from_millis(50))
         .await?;
