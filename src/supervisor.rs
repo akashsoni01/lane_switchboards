@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 
 /// Notification sent to supervisor when a child fails.
@@ -139,7 +139,7 @@ pub struct ChildRegistry<
     M: Send + Sync + 'static,
     K: Eq + Hash + Clone + Send + Sync + 'static = String,
 > {
-    inner: Arc<RwLock<RegistryInner<M, K>>>,
+    inner: Arc<Mutex<RegistryInner<M, K>>>,
 }
 
 impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Default
@@ -153,7 +153,7 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Def
 impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> ChildRegistry<M, K> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(RegistryInner {
+            inner: Arc::new(Mutex::new(RegistryInner {
                 refs: HashMap::new(),
                 generations: HashMap::new(),
             })),
@@ -165,22 +165,22 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.read().await.refs.get(name).cloned()
+        self.inner.lock().await.refs.get(name).cloned()
     }
 
     pub async fn track(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
-        self.inner.write().await.refs.insert(name.into(), actor_ref);
+        self.inner.lock().await.refs.insert(name.into(), actor_ref);
     }
 
     pub async fn bump_generation(&self, name: impl Into<K>) {
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.lock().await;
         *inner.generations.entry(name.into()).or_insert(0) += 1;
     }
 
     /// Atomically register a ref and bump its generation counter.
     pub async fn track_and_bump(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
         let name = name.into();
-        let mut inner = self.inner.write().await;
+        let mut inner = self.inner.lock().await;
         inner.refs.insert(name.clone(), actor_ref);
         *inner.generations.entry(name).or_insert(0) += 1;
     }
@@ -191,7 +191,7 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
         Q: Hash + Eq + ?Sized,
     {
         self.inner
-            .read()
+            .lock()
             .await
             .generations
             .get(name)
@@ -204,7 +204,7 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let inner = self.inner.read().await;
+        let inner = self.inner.lock().await;
         inner.refs.get(name).cloned().map(|actor_ref| {
             let generation = inner.generations.get(name).copied().unwrap_or(0);
             (actor_ref, generation)
@@ -212,7 +212,7 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
     }
 
     pub async fn generations(&self) -> HashMap<K, u64> {
-        self.inner.read().await.generations.clone()
+        self.inner.lock().await.generations.clone()
     }
 }
 
@@ -252,13 +252,14 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
         F: Fn() -> B + Send + Sync + 'static,
     {
         let build = Arc::new(build);
+        let handle = Handle::current();
         child_spec(order, move |sup_tx, actor_config| {
             let slot = slot.clone();
             let build = build.clone();
+            let handle = handle.clone();
             Box::pin(async move {
                 let (actor_ref, _) =
-                    spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config)
-                        .await?;
+                    spawn_on_runtime(&handle, build(), Some(sup_tx), &actor_config).await?;
                 *slot.current.lock().await = Some(actor_ref.clone());
                 Ok(actor_ref)
             })
@@ -281,14 +282,16 @@ where
 {
     let name = name.into();
     let build = Arc::new(build);
+    let handle = Handle::current();
     child_spec(order, move |sup_tx, actor_config| {
         let registry = registry.clone();
         let name = name.clone();
         let build = build.clone();
+        let handle = handle.clone();
         Box::pin(async move {
             let (actor_ref, _) =
-                spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config).await?;
-            registry.track(name, actor_ref.clone()).await;
+                spawn_on_runtime(&handle, build(), Some(sup_tx), &actor_config).await?;
+            registry.track_and_bump(name, actor_ref.clone()).await;
             Ok(actor_ref)
         })
     })
@@ -297,6 +300,7 @@ where
 /// Handle to a running supervisor.
 pub struct SupervisorHandle<M: Send + Sync + 'static> {
     initial_refs: Vec<ActorRef<M>>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
     _join: JoinHandle<()>,
     _marker: std::marker::PhantomData<M>,
 }
@@ -311,13 +315,21 @@ impl<M: Send + Sync + 'static> SupervisorHandle<M> {
     pub fn initial_refs(&self) -> &[ActorRef<M>] {
         &self.initial_refs
     }
+
+    /// Stop children in reverse start order, then shut down the supervisor task.
+    pub async fn stop(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = self._join.await;
+    }
 }
 
 /// OTP supervisor task.
 pub struct Supervisor<M: Send + Sync + 'static> {
     config: SupervisorConfig,
     actor_config: ActorConfig,
-    children: Arc<Mutex<Vec<Box<dyn ChildSpec<M>>>>>,
+    children: Vec<Box<dyn ChildSpec<M>>>,
 }
 
 impl<M: Send + Sync + 'static> Supervisor<M> {
@@ -333,7 +345,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
         Self {
             config,
             actor_config,
-            children: Arc::new(Mutex::new(children)),
+            children,
         }
     }
 
@@ -354,20 +366,16 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
         let Self {
             config,
             actor_config,
-            children: children_arc,
+            children: mut slots,
         } = self;
 
-        let mut specs = match Arc::try_unwrap(children_arc) {
-            Ok(mutex) => mutex.into_inner(),
-            Err(_) => {
-                return Err("supervisor children Arc shared before start".into());
-            }
-        };
+        slots.sort_by_key(|s| s.order());
 
         let (tx, mut rx) = mpsc::channel::<RestartSignal>(config.mailbox_capacity);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
 
-        let mut initial_refs = Vec::with_capacity(specs.len());
-        for spec in specs.iter_mut() {
+        let mut initial_refs = Vec::with_capacity(slots.len());
+        for spec in slots.iter_mut() {
             let sup_tx = tx.clone();
             let actor_ref = spec.restart(sup_tx, actor_config).await?;
             spec.set_id(actor_ref.id);
@@ -378,57 +386,93 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
             tokio::time::sleep(settle).await;
         }
 
-        let children = Arc::new(Mutex::new(specs));
         let config_clone = config.clone();
+        let mut current_refs = initial_refs.clone();
 
         let join = tokio::spawn(async move {
             let mut restart_log: VecDeque<Instant> = VecDeque::new();
 
-            while let Some(signal) = rx.recv().await {
-                let now = Instant::now();
-                let cutoff = now - Duration::from_secs(config_clone.within_secs);
-                while restart_log.front().is_some_and(|t| *t < cutoff) {
-                    restart_log.pop_front();
-                }
-                restart_log.push_back(now);
-
-                if restart_log.len() > config_clone.max_restarts {
-                    match config_clone.intensity_action {
-                        IntensityAction::ShutdownSupervisor => {
-                            tracing::error!("supervisor restart intensity exceeded — shutting down");
-                            break;
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => {
+                        for actor_ref in current_refs.iter().rev() {
+                            let _ = actor_ref.stop().await;
                         }
-                        IntensityAction::AbandonChild => {
-                            tracing::warn!(child = %signal.child_id, "abandoning child after intensity breach");
-                            continue;
-                        }
+                        break;
                     }
-                }
+                    signal = rx.recv() => {
+                        let Some(signal) = signal else { break; };
 
-                let mut slots = children.lock().await;
-                let failed_order = slots
-                    .iter()
-                    .find(|s| s.id() == signal.child_id)
-                    .map(|s| s.order());
-
-                let indices = restart_indices(&config_clone.strategy, &slots, &signal, failed_order);
-
-                for idx in indices {
-                    let child_id = slots[idx].id();
-                    let sup_tx = tx.clone();
-                    match slots[idx].restart(sup_tx, actor_config).await {
-                        Ok(actor_ref) => {
-                            slots[idx].set_id(actor_ref.id);
-                            tracing::info!(child = %actor_ref.id, "supervisor restarted child");
+                        let now = Instant::now();
+                        let cutoff = now - Duration::from_secs(config_clone.within_secs);
+                        while restart_log.front().is_some_and(|t| *t < cutoff) {
+                            restart_log.pop_front();
                         }
-                        Err(e) => {
-                            tracing::error!(
-                                child = %child_id,
-                                error = %e,
-                                "supervisor failed to restart child"
-                            );
-                            slots[idx].set_id(ActorId::DEAD);
-                            restart_log.push_back(Instant::now());
+                        restart_log.push_back(now);
+
+                        if restart_log.len() > config_clone.max_restarts {
+                            match config_clone.intensity_action {
+                                IntensityAction::ShutdownSupervisor => {
+                                    tracing::error!("supervisor restart intensity exceeded — shutting down");
+                                    for actor_ref in current_refs.iter().rev() {
+                                        let _ = actor_ref.stop().await;
+                                    }
+                                    break;
+                                }
+                                IntensityAction::AbandonChild => {
+                                    tracing::warn!(child = %signal.child_id, "abandoning child after intensity breach");
+                                    if let Some(slot) = slots.iter_mut().find(|s| s.id() == signal.child_id) {
+                                        slot.set_id(ActorId::DEAD);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        match config_clone.strategy {
+                            RestartStrategy::OneForOne => {
+                                if let Some(idx) = slots.iter().position(|s| s.id() == signal.child_id) {
+                                    restart_child(
+                                        &mut slots,
+                                        &mut current_refs,
+                                        idx,
+                                        &tx,
+                                        actor_config,
+                                    )
+                                    .await;
+                                }
+                            }
+                            RestartStrategy::OneForAll => {
+                                for idx in 0..slots.len() {
+                                    restart_child(
+                                        &mut slots,
+                                        &mut current_refs,
+                                        idx,
+                                        &tx,
+                                        actor_config,
+                                    )
+                                    .await;
+                                }
+                            }
+                            RestartStrategy::RestForOne => {
+                                let failed_order = slots
+                                    .iter()
+                                    .find(|s| s.id() == signal.child_id)
+                                    .map(|s| s.order())
+                                    .unwrap_or(0);
+                                for idx in 0..slots.len() {
+                                    if slots[idx].order() >= failed_order {
+                                        restart_child(
+                                            &mut slots,
+                                            &mut current_refs,
+                                            idx,
+                                            &tx,
+                                            actor_config,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -437,40 +481,35 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
 
         Ok(SupervisorHandle {
             initial_refs,
+            shutdown_tx: Some(shutdown_tx),
             _join: join,
             _marker: std::marker::PhantomData,
         })
     }
 }
 
-fn restart_indices<M: Send + Sync + 'static>(
-    strategy: &RestartStrategy,
-    slots: &[Box<dyn ChildSpec<M>>],
-    signal: &RestartSignal,
-    failed_order: Option<usize>,
-) -> Vec<usize> {
-    match strategy {
-        RestartStrategy::OneForOne => slots
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.id() == signal.child_id)
-            .map(|(i, _)| i)
-            .collect(),
-        RestartStrategy::OneForAll => {
-            let mut idxs: Vec<usize> = (0..slots.len()).collect();
-            idxs.sort_by_key(|&i| slots[i].order());
-            idxs
+async fn restart_child<M: Send + Sync + 'static>(
+    slots: &mut [Box<dyn ChildSpec<M>>],
+    current_refs: &mut [ActorRef<M>],
+    idx: usize,
+    tx: &mpsc::Sender<RestartSignal>,
+    actor_config: ActorConfig,
+) {
+    let child_id = slots[idx].id();
+    let sup_tx = tx.clone();
+    match slots[idx].restart(sup_tx, actor_config).await {
+        Ok(actor_ref) => {
+            slots[idx].set_id(actor_ref.id);
+            current_refs[idx] = actor_ref.clone();
+            tracing::info!(child = %actor_ref.id, "supervisor restarted child");
         }
-        RestartStrategy::RestForOne => {
-            let order = failed_order.unwrap_or(0);
-            let mut idxs: Vec<usize> = slots
-                .iter()
-                .enumerate()
-                .filter(|(_, s)| s.order() >= order)
-                .map(|(i, _)| i)
-                .collect();
-            idxs.sort_by_key(|&i| slots[i].order());
-            idxs
+        Err(e) => {
+            tracing::error!(
+                child = %child_id,
+                error = %e,
+                "supervisor failed to restart child"
+            );
+            slots[idx].set_id(ActorId::DEAD);
         }
     }
 }
@@ -499,10 +538,12 @@ where
 {
     let actor_prototype = actor.clone();
     let child_config = *actor_config;
+    let handle = Handle::current();
     let spec = child_spec(0, move |sup_tx, actor_config| {
         let a = actor_prototype.clone();
+        let handle = handle.clone();
         Box::pin(async move {
-            spawn_on_runtime(&Handle::current(), a, Some(sup_tx), &actor_config)
+            spawn_on_runtime(&handle, a, Some(sup_tx), &actor_config)
                 .await
                 .map(|(r, _)| r)
         })

@@ -85,7 +85,8 @@ async fn child_registry_updates_on_restart() {
     let _sup = Supervisor::new(config, vec![spec]).start().await.expect("start");
 
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    assert_eq!(registry.generation("echo").await, 1);
+    // spawn_child_spec: track_and_bump (1) + pre_start bump (2)
+    assert_eq!(registry.generation("echo").await, 2);
 }
 
 #[tokio::test]
