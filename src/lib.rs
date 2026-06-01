@@ -36,6 +36,7 @@ pub use hash_ring::{HashRing, RingNode};
 pub use mesh::{
     join_mesh, serve_microservice, MeshControlMsg, MeshRegistry, MeshRegistryClient,
     MeshRegistryServer, MeshRouter, MicroserviceHandle, ServiceMesh, ServiceRecord,
+    DEFAULT_RECORD_TTL,
 };
 pub use supervisor::{
     child_spec, spawn_child_spec, supervise_actor, supervise_actor_with_config, ChildRegistry, ChildSlot, ChildSpec,

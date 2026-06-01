@@ -279,7 +279,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router.mesh.instance_count(Service::Orders.name())
     );
 
-    let list = MeshRegistryClient::list(&registry.address).await?;
+    let list = {
+        let mut client = MeshRegistryClient::new(&registry.address);
+        client.list().await?
+    };
     println!("\n[control] registry records: {}", list.len());
 
     Ok(())
