@@ -2,8 +2,10 @@
 
 use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef};
 use crate::config::ActorConfig;
+use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -126,24 +128,29 @@ where
     })
 }
 
-struct RegistryInner<M: Send + Sync + 'static> {
-    refs: HashMap<String, ActorRef<M>>,
-    generations: HashMap<String, u64>,
+struct RegistryInner<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> {
+    refs: HashMap<K, ActorRef<M>>,
+    generations: HashMap<K, u64>,
 }
 
 /// Named child refs updated on every spawn/restart — share with actors and main.
 #[derive(Clone)]
-pub struct ChildRegistry<M: Send + Sync + 'static> {
-    inner: Arc<RwLock<RegistryInner<M>>>,
+pub struct ChildRegistry<
+    M: Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + 'static = String,
+> {
+    inner: Arc<RwLock<RegistryInner<M, K>>>,
 }
 
-impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
+impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Default
+    for ChildRegistry<M, K>
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<M: Send + Sync + 'static> ChildRegistry<M> {
+impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> ChildRegistry<M, K> {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(RegistryInner {
@@ -153,28 +160,36 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
         }
     }
 
-    pub async fn get(&self, name: &str) -> Option<ActorRef<M>> {
+    pub async fn get<Q>(&self, name: &Q) -> Option<ActorRef<M>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner.read().await.refs.get(name).cloned()
     }
 
-    pub async fn track(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
+    pub async fn track(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
         self.inner.write().await.refs.insert(name.into(), actor_ref);
     }
 
-    pub async fn bump_generation(&self, name: &str) {
+    pub async fn bump_generation(&self, name: impl Into<K>) {
         let mut inner = self.inner.write().await;
-        *inner.generations.entry(name.to_string()).or_insert(0) += 1;
+        *inner.generations.entry(name.into()).or_insert(0) += 1;
     }
 
     /// Atomically register a ref and bump its generation counter.
-    pub async fn track_and_bump(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
+    pub async fn track_and_bump(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
         let name = name.into();
         let mut inner = self.inner.write().await;
         inner.refs.insert(name.clone(), actor_ref);
         *inner.generations.entry(name).or_insert(0) += 1;
     }
 
-    pub async fn generation(&self, name: &str) -> u64 {
+    pub async fn generation<Q>(&self, name: &Q) -> u64
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         self.inner
             .read()
             .await
@@ -184,7 +199,11 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
             .unwrap_or(0)
     }
 
-    pub async fn get_with_generation(&self, name: &str) -> Option<(ActorRef<M>, u64)> {
+    pub async fn get_with_generation<Q>(&self, name: &Q) -> Option<(ActorRef<M>, u64)>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
         let inner = self.inner.read().await;
         inner.refs.get(name).cloned().map(|actor_ref| {
             let generation = inner.generations.get(name).copied().unwrap_or(0);
@@ -192,7 +211,7 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
         })
     }
 
-    pub async fn generations(&self) -> HashMap<String, u64> {
+    pub async fn generations(&self) -> HashMap<K, u64> {
         self.inner.read().await.generations.clone()
     }
 }
@@ -248,14 +267,15 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
 }
 
 /// Build a child spec: spawn `build()`, register under `name`, at supervisor `order`.
-pub fn spawn_child_spec<M, B, F>(
+pub fn spawn_child_spec<M, K, B, F>(
     order: usize,
-    name: impl Into<String>,
-    registry: Arc<ChildRegistry<M>>,
+    name: impl Into<K>,
+    registry: Arc<ChildRegistry<M, K>>,
     build: F,
 ) -> Box<dyn ChildSpec<M>>
 where
     M: Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
     B: Actor<M> + Send + Sync + 'static,
     F: Fn() -> B + Send + Sync + 'static,
 {

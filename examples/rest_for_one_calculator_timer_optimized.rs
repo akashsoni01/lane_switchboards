@@ -15,6 +15,27 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ChildName {
+    Calculator,
+    Timer,
+}
+
+// impl AsRef<str> for ChildName {
+//     fn as_ref(&self) -> &str {
+//         match self {
+//             ChildName::Calculator => "calculator",
+//             ChildName::Timer => "timer",
+//         }
+//     }
+// }
+
+// impl From<ChildName> for String {
+//     fn from(value: ChildName) -> Self {
+//         value.as_ref().to_string()
+//     }
+// }
+
 enum AppMsg {
     Add(f64, f64, oneshot::Sender<Result<f64, String>>),
     Div(f64, f64, oneshot::Sender<Result<f64, String>>),
@@ -55,7 +76,7 @@ impl Actor<AppMsg> for Calculator {
 }
 
 struct ResultTimer {
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
     self_ref: Option<ActorRef<AppMsg>>,
     interval: Duration,
     running: bool,
@@ -71,7 +92,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get(&ChildName::Calculator).await {
                     match actor_ask!(calc, |reply| AppMsg::LastResult(reply)) {
                         Ok(Some(v)) => println!("[timer] last_result = {v}"),
                         Ok(None) => println!("[timer] last_result = (none)"),
@@ -100,7 +121,7 @@ impl ResultTimer {
 }
 
 struct App {
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
     _supervisor: SupervisorHandle<AppMsg>,
 }
 
@@ -118,13 +139,13 @@ impl App {
 
     fn child_specs(
         interval: Duration,
-        registry: Arc<ChildRegistry<AppMsg>>,
+        registry: Arc<ChildRegistry<AppMsg, ChildName>>,
     ) -> Vec<Box<dyn lane_switchboards::supervisor::ChildSpec<AppMsg>>> {
         vec![
-            registry_child_spec!(0, "calculator", registry, Calculator { last_result: None }),
+            registry_child_spec!(0, ChildName::Calculator, registry, Calculator { last_result: None }),
             registry_child_spec!(
                 1,
-                "timer",
+                ChildName::Timer,
                 registry,
                 ResultTimer {
                     registry: registry.clone(),
@@ -137,7 +158,7 @@ impl App {
     }
 
     async fn start(interval: Duration, cfg: SupervisorConfig) -> Result<Self, ActorProcessingErr> {
-        let registry = Arc::new(ChildRegistry::new());
+        let registry = Arc::new(ChildRegistry::<AppMsg, ChildName>::new());
         let handle = Supervisor::new(
             Self::rest_for_one_config(cfg),
             Self::child_specs(interval, registry.clone()),
@@ -153,7 +174,7 @@ impl App {
     async fn start_timer(&self) -> anyhow::Result<()> {
         let timer = self
             .registry
-            .get("timer")
+            .get(&ChildName::Timer)
             .await
             .ok_or_else(|| anyhow::anyhow!("timer not running"))?;
         timer
@@ -166,7 +187,7 @@ impl App {
     async fn add(&self, a: f64, b: f64) -> anyhow::Result<f64> {
         let calc = self
             .registry
-            .get("calculator")
+            .get(&ChildName::Calculator)
             .await
             .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
         actor_ask!(calc, |reply| AppMsg::Add(a, b, reply))
@@ -177,7 +198,7 @@ impl App {
     async fn div(&self, a: f64, b: f64) -> anyhow::Result<Result<f64, String>> {
         let calc = self
             .registry
-            .get("calculator")
+            .get(&ChildName::Calculator)
             .await
             .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
         match actor_ask!(calc, |reply| AppMsg::Div(a, b, reply)) {
