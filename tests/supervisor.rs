@@ -44,7 +44,7 @@ async fn supervise_actor_initial_ref_matches_registry() {
 
 #[tokio::test]
 async fn child_registry_get_with_generation_is_consistent() {
-    let registry = Arc::new(ChildRegistry::new());
+    let registry: Arc<ChildRegistry<EchoMsg, String>> = Arc::new(ChildRegistry::new());
     let (actor, join) = spawn(Echo, None).await.expect("spawn");
     registry.track_and_bump("echo", actor.clone()).await;
 

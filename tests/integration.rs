@@ -38,7 +38,7 @@ async fn supervisor_restarts_child() {
 
 #[tokio::test]
 async fn child_registry_tracks_named_child() {
-    let registry = std::sync::Arc::new(ChildRegistry::new());
+    let registry: Arc<ChildRegistry<EchoMsg, String>> = std::sync::Arc::new(ChildRegistry::new());
     let spec = spawn_child_spec(0, "echo", registry.clone(), || Echo);
 
     let config = SupervisorConfig {
