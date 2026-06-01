@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 /// Notification sent to supervisor when a child fails.
@@ -134,7 +134,7 @@ struct RegistryInner<M: Send + Sync + 'static> {
 /// Named child refs updated on every spawn/restart — share with actors and main.
 #[derive(Clone)]
 pub struct ChildRegistry<M: Send + Sync + 'static> {
-    inner: Arc<Mutex<RegistryInner<M>>>,
+    inner: Arc<RwLock<RegistryInner<M>>>,
 }
 
 impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
@@ -146,7 +146,7 @@ impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
 impl<M: Send + Sync + 'static> ChildRegistry<M> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RegistryInner {
+            inner: Arc::new(RwLock::new(RegistryInner {
                 refs: HashMap::new(),
                 generations: HashMap::new(),
             })),
@@ -154,29 +154,29 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
     }
 
     pub async fn get(&self, name: &str) -> Option<ActorRef<M>> {
-        self.inner.lock().await.refs.get(name).cloned()
+        self.inner.read().await.refs.get(name).cloned()
     }
 
     pub async fn track(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
-        self.inner.lock().await.refs.insert(name.into(), actor_ref);
+        self.inner.write().await.refs.insert(name.into(), actor_ref);
     }
 
     pub async fn bump_generation(&self, name: &str) {
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.write().await;
         *inner.generations.entry(name.to_string()).or_insert(0) += 1;
     }
 
     /// Atomically register a ref and bump its generation counter.
     pub async fn track_and_bump(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
         let name = name.into();
-        let mut inner = self.inner.lock().await;
+        let mut inner = self.inner.write().await;
         inner.refs.insert(name.clone(), actor_ref);
         *inner.generations.entry(name).or_insert(0) += 1;
     }
 
     pub async fn generation(&self, name: &str) -> u64 {
         self.inner
-            .lock()
+            .read()
             .await
             .generations
             .get(name)
@@ -185,7 +185,7 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
     }
 
     pub async fn get_with_generation(&self, name: &str) -> Option<(ActorRef<M>, u64)> {
-        let inner = self.inner.lock().await;
+        let inner = self.inner.read().await;
         inner.refs.get(name).cloned().map(|actor_ref| {
             let generation = inner.generations.get(name).copied().unwrap_or(0);
             (actor_ref, generation)
@@ -193,7 +193,7 @@ impl<M: Send + Sync + 'static> ChildRegistry<M> {
     }
 
     pub async fn generations(&self) -> HashMap<String, u64> {
-        self.inner.lock().await.generations.clone()
+        self.inner.read().await.generations.clone()
     }
 }
 

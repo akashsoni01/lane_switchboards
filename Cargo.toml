@@ -1,6 +1,6 @@
 [package]
 name = "lane_switchboards"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Telecom-inspired OTP actor runtime for Rust: mailbox routing, supervision trees, let-it-crash fault isolation, and distributed messaging"
 license = "MIT"
@@ -97,6 +97,10 @@ path = "examples/recoverable_timer_calc.rs"
 [[example]]
 name = "rest_for_one_calculator_timer"
 path = "examples/rest_for_one_calculator_timer.rs"
+
+[[example]]
+name = "rest_for_one_calculator_timer_optimized"
+path = "examples/rest_for_one_calculator_timer_optimized.rs"
 
 [[example]]
 name = "handle_timeout_calculator_timer"

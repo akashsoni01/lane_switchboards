@@ -13,6 +13,7 @@ pub mod actor;
 pub mod config;
 pub mod distributed;
 pub mod hash_ring;
+pub mod macros;
 pub mod mesh;
 pub mod monitor;
 pub mod registry;
