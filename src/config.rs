@@ -60,17 +60,9 @@ impl Default for DistributedConfig {
 }
 
 /// Options for building a dedicated Tokio runtime for actors / nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeOptions {
     pub worker_threads: Option<usize>,
-}
-
-impl Default for RuntimeOptions {
-    fn default() -> Self {
-        Self {
-            worker_threads: None,
-        }
-    }
 }
 
 /// Dedicated multi-thread Tokio runtime (keeps the OS runtime alive).

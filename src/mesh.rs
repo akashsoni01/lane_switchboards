@@ -272,14 +272,10 @@ impl MeshRegistry {
 
     pub async fn deregister(&self, service: &str, instance_id: &str) -> Option<ServiceRecord> {
         let mut records = self.records.write().await;
-        if let Some(pos) = records
+        records
             .iter()
             .position(|r| r.service == service && r.instance_id == instance_id)
-        {
-            Some(records.remove(pos))
-        } else {
-            None
-        }
+            .map(|pos| records.remove(pos))
     }
 
     pub async fn list(&self) -> Vec<ServiceRecord> {

@@ -25,8 +25,21 @@ static ACTOR_COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct ActorId(pub u64);
 
 impl ActorId {
+    /// Sentinel id for a child slot whose last restart attempt failed.
+    pub const DEAD: Self = Self(0);
+
     pub fn new() -> Self {
         Self(ACTOR_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub fn is_dead(self) -> bool {
+        self == Self::DEAD
+    }
+}
+
+impl Default for ActorId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -73,8 +86,6 @@ pub enum Envelope<M: Send + Sync + 'static> {
         notify: oneshot::Sender<ExitReason>,
     },
     Demonitor(ActorId),
-    /// Deprecated internal variant; cross-type delivery uses [`ControlMsg::LinkedExit`].
-    LinkedExit(ActorId, ExitReason),
     Kill,
     Stop,
     Upgrade(Box<dyn DynActor<M>>),
@@ -256,7 +267,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
             .map_err(|e| Box::new(e) as ActorProcessingErr)
     }
 
-    pub async fn upgrade(&self, new_impl: impl Actor<M> + Send + Sync + 'static) -> Result<(), ActorProcessingErr> {
+    pub async fn upgrade(&self, new_impl: impl Actor<M> + 'static) -> Result<(), ActorProcessingErr> {
         let boxed = into_dyn_actor(new_impl);
         self.tx
             .send(Envelope::Upgrade(boxed))
@@ -410,12 +421,6 @@ async fn run_actor_sequential<M: Send + Sync + 'static>(
                     Envelope::Demonitor(observer_id) => {
                         monitors.retain(|(id, _)| *id != observer_id);
                     }
-                    Envelope::LinkedExit(peer, reason) => {
-                        if let Some(reason) = linked_exit_reason(id, peer, reason, actor.trap_exit()) {
-                            exit_reason = reason;
-                            break 'actor_loop;
-                        }
-                    }
                     Envelope::Upgrade(new_impl) => {
                         actor = new_impl;
                         if let Err(e) = actor.dyn_on_upgrade(0).await {
@@ -529,7 +534,6 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                         let fail_tx = fail_tx.clone();
                         let shutdown_started = Arc::clone(&shutdown_started);
                         let task_id = id;
-                        let config = config;
                         handlers.spawn(async move {
                             let _permit = permit;
                             let mut guard = actor.lock().await;
@@ -539,10 +543,10 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                             if let Some(reason) =
                                 handle_message(task_id, inner, m, &config).await
                             {
-                                if !shutdown_started.swap(true, Ordering::Relaxed) {
-                                    if fail_tx.try_send(reason).is_err() {
-                                        tracing::warn!(%task_id, "dropped concurrent failure reason");
-                                    }
+                                if !shutdown_started.swap(true, Ordering::Relaxed)
+                                    && fail_tx.try_send(reason).is_err()
+                                {
+                                    tracing::warn!(%task_id, "dropped concurrent failure reason");
                                 }
                             }
                         });
@@ -562,18 +566,6 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                     }
                     Envelope::Demonitor(observer_id) => {
                         monitors.retain(|(id, _)| *id != observer_id);
-                    }
-                    Envelope::LinkedExit(peer, reason) => {
-                        let trap = actor
-                            .lock()
-                            .await
-                            .as_ref()
-                            .map(|a| a.trap_exit())
-                            .unwrap_or(false);
-                        if let Some(reason) = linked_exit_reason(id, peer, reason, trap) {
-                            exit_reason = reason;
-                            break;
-                        }
                     }
                     Envelope::Upgrade(new_impl) => {
                         handlers.abort_all();

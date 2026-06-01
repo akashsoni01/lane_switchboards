@@ -2,7 +2,7 @@
 
 use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef};
 use crate::config::ActorConfig;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,7 +63,7 @@ pub trait ChildSpec<M: Send + Sync + 'static>: Send + Sync {
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
-        actor_config: &ActorConfig,
+        actor_config: ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>;
     fn set_id(&mut self, id: ActorId);
 }
@@ -78,7 +78,10 @@ struct FnChildSpec<M, F> {
 impl<M, F> ChildSpec<M> for FnChildSpec<M, F>
 where
     M: Send + Sync + 'static,
-    F: Fn(mpsc::Sender<RestartSignal>, &ActorConfig) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
+    F: Fn(
+            mpsc::Sender<RestartSignal>,
+            ActorConfig,
+        ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync,
 {
@@ -93,7 +96,7 @@ where
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
-        actor_config: &ActorConfig,
+        actor_config: ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>> {
         (self.factory)(supervisor_tx, actor_config)
     }
@@ -107,7 +110,10 @@ where
 pub fn child_spec<M, F>(order: usize, factory: F) -> Box<dyn ChildSpec<M>>
 where
     M: Send + Sync + 'static,
-    F: Fn(mpsc::Sender<RestartSignal>, &ActorConfig) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
+    F: Fn(
+            mpsc::Sender<RestartSignal>,
+            ActorConfig,
+        ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync
         + 'static,
@@ -120,11 +126,15 @@ where
     })
 }
 
+struct RegistryInner<M: Send + Sync + 'static> {
+    refs: HashMap<String, ActorRef<M>>,
+    generations: HashMap<String, u64>,
+}
+
 /// Named child refs updated on every spawn/restart — share with actors and main.
 #[derive(Clone)]
 pub struct ChildRegistry<M: Send + Sync + 'static> {
-    by_name: Arc<Mutex<HashMap<String, ActorRef<M>>>>,
-    generations: Arc<Mutex<HashMap<String, u64>>>,
+    inner: Arc<Mutex<RegistryInner<M>>>,
 }
 
 impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
@@ -136,30 +146,54 @@ impl<M: Send + Sync + 'static> Default for ChildRegistry<M> {
 impl<M: Send + Sync + 'static> ChildRegistry<M> {
     pub fn new() -> Self {
         Self {
-            by_name: Arc::new(Mutex::new(HashMap::new())),
-            generations: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(RegistryInner {
+                refs: HashMap::new(),
+                generations: HashMap::new(),
+            })),
         }
     }
 
     pub async fn get(&self, name: &str) -> Option<ActorRef<M>> {
-        self.by_name.lock().await.get(name).cloned()
+        self.inner.lock().await.refs.get(name).cloned()
     }
 
     pub async fn track(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
-        self.by_name.lock().await.insert(name.into(), actor_ref);
+        self.inner.lock().await.refs.insert(name.into(), actor_ref);
     }
 
     pub async fn bump_generation(&self, name: &str) {
-        let mut gens = self.generations.lock().await;
-        *gens.entry(name.to_string()).or_insert(0) += 1;
+        let mut inner = self.inner.lock().await;
+        *inner.generations.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Atomically register a ref and bump its generation counter.
+    pub async fn track_and_bump(&self, name: impl Into<String>, actor_ref: ActorRef<M>) {
+        let name = name.into();
+        let mut inner = self.inner.lock().await;
+        inner.refs.insert(name.clone(), actor_ref);
+        *inner.generations.entry(name).or_insert(0) += 1;
     }
 
     pub async fn generation(&self, name: &str) -> u64 {
-        self.generations.lock().await.get(name).copied().unwrap_or(0)
+        self.inner
+            .lock()
+            .await
+            .generations
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub async fn get_with_generation(&self, name: &str) -> Option<(ActorRef<M>, u64)> {
+        let inner = self.inner.lock().await;
+        inner.refs.get(name).cloned().map(|actor_ref| {
+            let generation = inner.generations.get(name).copied().unwrap_or(0);
+            (actor_ref, generation)
+        })
     }
 
     pub async fn generations(&self) -> HashMap<String, u64> {
-        self.generations.lock().await.clone()
+        self.inner.lock().await.generations.clone()
     }
 }
 
@@ -202,9 +236,10 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
         child_spec(order, move |sup_tx, actor_config| {
             let slot = slot.clone();
             let build = build.clone();
-            let actor_config = *actor_config;
             Box::pin(async move {
-                let (actor_ref, _) = spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config).await?;
+                let (actor_ref, _) =
+                    spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config)
+                        .await?;
                 *slot.current.lock().await = Some(actor_ref.clone());
                 Ok(actor_ref)
             })
@@ -230,7 +265,6 @@ where
         let registry = registry.clone();
         let name = name.clone();
         let build = build.clone();
-        let actor_config = *actor_config;
         Box::pin(async move {
             let (actor_ref, _) =
                 spawn_on_runtime(&Handle::current(), build(), Some(sup_tx), &actor_config).await?;
@@ -242,9 +276,21 @@ where
 
 /// Handle to a running supervisor.
 pub struct SupervisorHandle<M: Send + Sync + 'static> {
-    pub id: ActorId,
+    initial_refs: Vec<ActorRef<M>>,
     _join: JoinHandle<()>,
     _marker: std::marker::PhantomData<M>,
+}
+
+impl<M: Send + Sync + 'static> SupervisorHandle<M> {
+    /// First child spawned during supervisor startup (convenience for single-child trees).
+    pub fn initial_ref(&self) -> Option<&ActorRef<M>> {
+        self.initial_refs.first()
+    }
+
+    /// All child refs from the initial spawn pass.
+    pub fn initial_refs(&self) -> &[ActorRef<M>] {
+        &self.initial_refs
+    }
 }
 
 /// OTP supervisor task.
@@ -276,39 +322,58 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
     }
 
     /// Start the supervisor and optionally wait for initial spawns to settle.
+    ///
+    /// `settle` adds a fixed delay after all children are spawned before the supervisor
+    /// begins processing restart signals. Use a non-zero value when children need time
+    /// to run `pre_start` or register themselves before you send traffic (for example
+    /// mesh join or sibling lookups via [`ChildRegistry`]).
     pub async fn start_settled(
         self,
         settle: Duration,
     ) -> Result<SupervisorHandle<M>, ActorProcessingErr> {
-        let children = self.children.clone();
-        let config = self.config.clone();
-        let actor_config = self.actor_config;
+        let Self {
+            config,
+            actor_config,
+            children: children_arc,
+        } = self;
+
+        let mut specs = match Arc::try_unwrap(children_arc) {
+            Ok(mutex) => mutex.into_inner(),
+            Err(_) => {
+                return Err("supervisor children Arc shared before start".into());
+            }
+        };
+
         let (tx, mut rx) = mpsc::channel::<RestartSignal>(config.mailbox_capacity);
 
-        // Initial spawn of all children
-        {
-            let mut slots = children.lock().await;
-            for spec in slots.iter_mut() {
-                let sup_tx = tx.clone();
-                let actor_ref = spec.restart(sup_tx, &actor_config).await?;
-                spec.set_id(actor_ref.id);
-            }
+        let mut initial_refs = Vec::with_capacity(specs.len());
+        for spec in specs.iter_mut() {
+            let sup_tx = tx.clone();
+            let actor_ref = spec.restart(sup_tx, actor_config).await?;
+            spec.set_id(actor_ref.id);
+            initial_refs.push(actor_ref);
         }
 
         if !settle.is_zero() {
             tokio::time::sleep(settle).await;
         }
 
+        let children = Arc::new(Mutex::new(specs));
+        let config_clone = config.clone();
+
         let join = tokio::spawn(async move {
-            let mut restart_log: Vec<Instant> = Vec::new();
+            let mut restart_log: VecDeque<Instant> = VecDeque::new();
 
             while let Some(signal) = rx.recv().await {
                 let now = Instant::now();
-                restart_log.retain(|t| now.duration_since(*t) < Duration::from_secs(config.within_secs));
-                restart_log.push(now);
+                let cutoff = now - Duration::from_secs(config_clone.within_secs);
+                while restart_log.front().is_some_and(|t| *t < cutoff) {
+                    restart_log.pop_front();
+                }
+                restart_log.push_back(now);
 
-                if restart_log.len() > config.max_restarts {
-                    match config.intensity_action {
+                if restart_log.len() > config_clone.max_restarts {
+                    match config_clone.intensity_action {
                         IntensityAction::ShutdownSupervisor => {
                             tracing::error!("supervisor restart intensity exceeded — shutting down");
                             break;
@@ -326,40 +391,67 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                     .find(|s| s.id() == signal.child_id)
                     .map(|s| s.order());
 
-                let indices: Vec<usize> = match config.strategy {
-                    RestartStrategy::OneForOne => slots
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, s)| s.id() == signal.child_id)
-                        .map(|(i, _)| i)
-                        .collect(),
-                    RestartStrategy::OneForAll => (0..slots.len()).collect(),
-                    RestartStrategy::RestForOne => {
-                        let order = failed_order.unwrap_or(0);
-                        slots
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, s)| s.order() >= order)
-                            .map(|(i, _)| i)
-                            .collect()
-                    }
-                };
+                let indices = restart_indices(&config_clone.strategy, &slots, &signal, failed_order);
 
                 for idx in indices {
+                    let child_id = slots[idx].id();
                     let sup_tx = tx.clone();
-                    if let Ok(actor_ref) = slots[idx].restart(sup_tx, &actor_config).await {
-                        slots[idx].set_id(actor_ref.id);
-                        tracing::info!(child = %actor_ref.id, "supervisor restarted child");
+                    match slots[idx].restart(sup_tx, actor_config).await {
+                        Ok(actor_ref) => {
+                            slots[idx].set_id(actor_ref.id);
+                            tracing::info!(child = %actor_ref.id, "supervisor restarted child");
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                child = %child_id,
+                                error = %e,
+                                "supervisor failed to restart child"
+                            );
+                            slots[idx].set_id(ActorId::DEAD);
+                            restart_log.push_back(Instant::now());
+                        }
                     }
                 }
             }
         });
 
         Ok(SupervisorHandle {
-            id: ActorId::new(),
+            initial_refs,
             _join: join,
             _marker: std::marker::PhantomData,
         })
+    }
+}
+
+fn restart_indices<M: Send + Sync + 'static>(
+    strategy: &RestartStrategy,
+    slots: &[Box<dyn ChildSpec<M>>],
+    signal: &RestartSignal,
+    failed_order: Option<usize>,
+) -> Vec<usize> {
+    match strategy {
+        RestartStrategy::OneForOne => slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.id() == signal.child_id)
+            .map(|(i, _)| i)
+            .collect(),
+        RestartStrategy::OneForAll => {
+            let mut idxs: Vec<usize> = (0..slots.len()).collect();
+            idxs.sort_by_key(|&i| slots[i].order());
+            idxs
+        }
+        RestartStrategy::RestForOne => {
+            let order = failed_order.unwrap_or(0);
+            let mut idxs: Vec<usize> = slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.order() >= order)
+                .map(|(i, _)| i)
+                .collect();
+            idxs.sort_by_key(|&i| slots[i].order());
+            idxs
+        }
     }
 }
 
@@ -389,7 +481,6 @@ where
     let child_config = *actor_config;
     let spec = child_spec(0, move |sup_tx, actor_config| {
         let a = actor_prototype.clone();
-        let actor_config = *actor_config;
         Box::pin(async move {
             spawn_on_runtime(&Handle::current(), a, Some(sup_tx), &actor_config)
                 .await
@@ -399,6 +490,9 @@ where
 
     let sup = Supervisor::with_actor_config(child_config, config, vec![spec]);
     let handle = sup.start().await?;
-    let (child_ref, _) = spawn_on_runtime(&Handle::current(), actor, None, actor_config).await?;
+    let child_ref = handle
+        .initial_ref()
+        .cloned()
+        .ok_or_else(|| -> ActorProcessingErr { "supervised child failed to spawn".into() })?;
     Ok((child_ref, handle))
 }
