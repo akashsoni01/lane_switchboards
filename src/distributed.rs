@@ -1,6 +1,6 @@
 //! Distributed actors over TCP with length-prefixed JSON frames.
 
-use crate::actor::{spawn_on_runtime, Actor};
+use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr};
 use crate::config::{spawn_on, ActorConfig, DistributedConfig};
 use crate::hash_ring::{HashRing, RingNode};
 use serde::de::DeserializeOwned;
@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Handle;
@@ -31,6 +32,125 @@ impl<T> RemoteMessage for T where
 pub struct Frame {
     pub target: String,
     pub payload: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct FrameOut<'a, M>
+where
+    M: Serialize,
+{
+    target: &'a str,
+    payload: &'a M,
+}
+
+async fn write_frame<M: RemoteMessage>(
+    stream: &mut TcpStream,
+    target: &str,
+    msg: &M,
+    max_frame_bytes: u32,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(&FrameOut { target, payload: msg }).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+    if body.len() > max_frame_bytes as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame too large: {} bytes", body.len()),
+        ));
+    }
+    stream.write_u32_le(body.len() as u32).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn remote_write_loop<M: RemoteMessage>(
+    node_addr: String,
+    target: String,
+    mut rx: mpsc::Receiver<M>,
+    config: DistributedConfig,
+) {
+    const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+
+    loop {
+        let mut stream = loop {
+            match TcpStream::connect(&node_addr).await {
+                Ok(s) => break s,
+                Err(e) => {
+                    tracing::warn!(%node_addr, error = %e, "remote write reconnect failed");
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    if rx.is_closed() {
+                        return;
+                    }
+                }
+            }
+        };
+
+        loop {
+            let msg = match rx.recv().await {
+                Some(m) => m,
+                None => return,
+            };
+            if write_frame(&mut stream, &target, &msg, config.max_frame_bytes)
+                .await
+                .is_err()
+            {
+                tracing::warn!(%node_addr, "remote write failed — reconnecting");
+                break;
+            }
+        }
+    }
+}
+
+struct PeerWriter<M: RemoteMessage> {
+    tx: mpsc::Sender<M>,
+    _task: JoinHandle<()>,
+}
+
+/// Reference to an actor on a remote node (persistent write channel per ref).
+#[derive(Clone)]
+pub struct RemoteActorRef<M: RemoteMessage> {
+    pub node_addr: String,
+    target: String,
+    writer: Arc<PeerWriter<M>>,
+}
+
+impl<M: RemoteMessage> RemoteActorRef<M> {
+    pub fn new(node_addr: impl Into<String>, target: impl Into<String>) -> Self {
+        Self::with_config(node_addr, target, &DistributedConfig::default())
+    }
+
+    pub fn with_config(
+        node_addr: impl Into<String>,
+        target: impl Into<String>,
+        config: &DistributedConfig,
+    ) -> Self {
+        let node_addr = node_addr.into();
+        let target = target.into();
+        let (tx, rx) = mpsc::channel(config.remote_send_capacity.max(1));
+        let loop_addr = node_addr.clone();
+        let loop_target = target.clone();
+        let loop_config = *config;
+        let task = tokio::spawn(remote_write_loop(loop_addr, loop_target, rx, loop_config));
+        Self {
+            node_addr,
+            target,
+            writer: Arc::new(PeerWriter { tx, _task: task }),
+        }
+    }
+
+    pub async fn send(&self, msg: M) -> std::io::Result<()> {
+        self.writer
+            .tx
+            .send(msg)
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "remote peer write channel closed",
+                )
+            })
+    }
 }
 
 /// Local node: binds TCP and dispatches incoming frames to registered actors.
@@ -69,30 +189,39 @@ impl<M: RemoteMessage> Node<M> {
         let dispatch = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<M>>::new()));
         let dispatch_c = dispatch.clone();
         let in_flight = Arc::new(Semaphore::new(config.max_in_flight.max(1)));
+        let conn_config = *config;
         let runtime = runtime.clone();
 
         let listener_task = spawn_on(Some(&runtime), {
             let runtime = runtime.clone();
             async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        let table = dispatch_c.clone();
-                        let in_flight = in_flight.clone();
-                        let conn_runtime = runtime.clone();
-                        spawn_on(Some(&runtime), async move {
-                            if let Err(e) = handle_conn(stream, table, in_flight, conn_runtime).await {
-                                tracing::warn!(%peer, error = %e, "connection handler error");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "accept failed");
-                        break;
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, peer)) => {
+                            let table = dispatch_c.clone();
+                            let in_flight = in_flight.clone();
+                            let conn_runtime = runtime.clone();
+                            spawn_on(Some(&runtime), async move {
+                                if let Err(e) = handle_conn(
+                                    stream,
+                                    table,
+                                    in_flight,
+                                    conn_runtime,
+                                    conn_config,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(%peer, error = %e, "connection handler error");
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "accept failed");
+                            break;
+                        }
                     }
                 }
             }
-        }
         });
 
         Ok(Self {
@@ -120,22 +249,48 @@ impl<M: RemoteMessage> Node<M> {
     }
 }
 
+async fn read_u32_le_timeout(
+    stream: &mut TcpStream,
+    config: &DistributedConfig,
+) -> std::io::Result<Option<u32>> {
+    match tokio::time::timeout(config.read_timeout, stream.read_u32_le()).await {
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(n)) => {
+            if n > config.max_frame_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame too large: {n} bytes"),
+                ));
+            }
+            Ok(Some(n))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "frame read timed out",
+        )),
+    }
+}
+
 async fn handle_conn<M: RemoteMessage>(
     mut stream: TcpStream,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
     in_flight: Arc<Semaphore>,
     runtime: Handle,
+    config: DistributedConfig,
 ) -> std::io::Result<()> {
     loop {
-        let len = match stream.read_u32_le().await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e),
+        let Some(len) = read_u32_le_timeout(&mut stream, &config).await? else {
+            break;
         };
 
         let mut buf = vec![0u8; len as usize];
-        stream.read_exact(&mut buf).await?;
+        tokio::time::timeout(config.read_timeout, stream.read_exact(&mut buf))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "frame body read timed out")
+            })??;
 
         let frame: Frame = serde_json::from_slice(&buf).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
@@ -151,55 +306,21 @@ async fn handle_conn<M: RemoteMessage>(
         };
 
         let table = dispatch.clone();
-        let target = frame.target.clone();
+        let target = frame.target;
         spawn_on(Some(&runtime), async move {
             let _permit = permit;
-            let table = table.lock().await;
-            if let Some(tx) = table.get(&target) {
+            let tx = {
+                let table = table.lock().await;
+                table.get(&target).cloned()
+            };
+            if let Some(tx) = tx {
                 let _ = tx.send(msg).await;
             } else {
-                tracing::warn!(target = %target, "no local actor for frame target");
+                tracing::warn!(%target, "no local actor for frame target");
             }
         });
     }
     Ok(())
-}
-
-/// Reference to an actor on a remote node (new TCP connection per send).
-#[derive(Clone)]
-pub struct RemoteActorRef<M: RemoteMessage> {
-    pub node_addr: String,
-    pub target: String,
-    _marker: std::marker::PhantomData<M>,
-}
-
-impl<M: RemoteMessage> RemoteActorRef<M> {
-    pub fn new(node_addr: impl Into<String>, target: impl Into<String>) -> Self {
-        Self {
-            node_addr: node_addr.into(),
-            target: target.into(),
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    pub async fn send(&self, msg: M) -> std::io::Result<()> {
-        let frame = Frame {
-            target: self.target.clone(),
-            payload: serde_json::to_value(&msg).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?,
-        };
-
-        let body = serde_json::to_vec(&frame).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-
-        let mut stream = TcpStream::connect(&self.node_addr).await?;
-        stream.write_u32_le(body.len() as u32).await?;
-        stream.write_all(&body).await?;
-        stream.flush().await?;
-        Ok(())
-    }
 }
 
 /// A node in a cluster roster (name + TCP address + frame target).
@@ -291,11 +412,11 @@ impl<M: RemoteMessage> Cluster<M> {
     pub fn leave(&mut self, node_id: &str) -> Option<ClusterMember> {
         self.ring.remove_node(node_id)?;
         let idx = self.refs_by_id.remove(node_id)?;
-        self.refs.remove(idx);
-        let member = self.members.remove(idx);
-        self.refs_by_id.clear();
-        for (i, m) in self.members.iter().enumerate() {
-            self.refs_by_id.insert(m.name.clone(), i);
+        self.refs.swap_remove(idx);
+        let member = self.members.swap_remove(idx);
+        if idx < self.members.len() {
+            self.refs_by_id
+                .insert(self.members[idx].name.clone(), idx);
         }
         Some(member)
     }
@@ -324,6 +445,8 @@ impl<M: RemoteMessage> Cluster<M> {
     }
 
     /// Round-robin index for the next send (does not advance on error).
+    ///
+    /// Uses `fetch_add % len`; u64 wraparound skew is negligible in practice.
     pub fn next(&self) -> std::io::Result<&RemoteActorRef<M>> {
         if self.refs.is_empty() {
             return Err(std::io::Error::new(
@@ -339,14 +462,21 @@ impl<M: RemoteMessage> Cluster<M> {
         self.next()?.send(msg).await
     }
 
+    /// Send to every member; returns the first error after attempting all nodes.
     pub async fn broadcast(&self, msg: M) -> std::io::Result<()>
     where
         M: Clone,
     {
-        for remote in &self.refs {
-            remote.send(msg.clone()).await?;
+        let mut first_err = None;
+        for (_, result) in self.send_all(msg).await {
+            if let Err(e) = result {
+                first_err.get_or_insert(e);
+            }
         }
-        Ok(())
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Send to every member; returns per-node results (continues after individual failures).
@@ -425,7 +555,8 @@ where
     M: RemoteMessage,
     A: Actor<M> + Send + Sync + 'static,
 {
-    serve_actor_on_current_runtime(
+    serve_actor_on_runtime(
+        &Handle::current(),
         node_name,
         bind_addr,
         target,
@@ -434,22 +565,6 @@ where
         &ActorConfig::default(),
     )
     .await
-}
-
-/// Bind a TCP node and bridge incoming frames to a local actor on the current runtime.
-pub async fn serve_actor_with_config<M, A>(
-    node_name: impl Into<String>,
-    bind_addr: impl Into<String>,
-    target: impl Into<String>,
-    actor: A,
-    distributed: &DistributedConfig,
-    actor_config: &ActorConfig,
-) -> std::io::Result<NodeHandle<M>>
-where
-    M: RemoteMessage,
-    A: Actor<M> + Send + Sync + 'static,
-{
-    serve_actor_on_current_runtime(node_name, bind_addr, target, actor, distributed, actor_config).await
 }
 
 /// Bind a TCP node and bridge on the current runtime with explicit channel sizing.
@@ -493,21 +608,29 @@ where
 {
     let node_name = node_name.into();
     let target = target.into();
+    let actor_config = *actor_config;
+
+    let (actor_ref, _actor_join) = spawn_on_runtime(runtime, actor, None, &actor_config)
+        .await
+        .map_err(|e: ActorProcessingErr| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("failed to spawn bridged actor: {e}"),
+            )
+        })?;
+
     let node = Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed).await?;
     let address = node.address().to_string();
 
     let (tx, mut rx) = mpsc::channel(distributed.bridge_capacity);
     node.register(&target, tx).await;
 
-    let actor_config = *actor_config;
-    let runtime = runtime.clone();
-    let actor_runtime = runtime.clone();
-    let bridge = spawn_on(Some(&runtime), async move {
-        let Ok((actor_ref, _)) = spawn_on_runtime(&actor_runtime, actor, None, &actor_config).await else {
-            return;
-        };
+    let bridge = spawn_on(Some(runtime), async move {
         while let Some(msg) = rx.recv().await {
-            let _ = actor_ref.send(msg).await;
+            if actor_ref.send(msg).await.is_err() {
+                tracing::warn!("serve_actor bridge: actor mailbox closed");
+                break;
+            }
         }
     });
 

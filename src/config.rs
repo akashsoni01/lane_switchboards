@@ -41,6 +41,12 @@ pub struct DistributedConfig {
     pub bridge_capacity: usize,
     /// Max in-flight frame dispatches per TCP node (semaphore backpressure).
     pub max_in_flight: usize,
+    /// Reject inbound frames larger than this (bytes).
+    pub max_frame_bytes: u32,
+    /// Per-read timeout on inbound TCP connections.
+    pub read_timeout: Duration,
+    /// Outbound remote send queue depth per [`crate::distributed::RemoteActorRef`].
+    pub remote_send_capacity: usize,
 }
 
 impl Default for DistributedConfig {
@@ -48,6 +54,9 @@ impl Default for DistributedConfig {
         Self {
             bridge_capacity: 32,
             max_in_flight: 32,
+            max_frame_bytes: 4 * 1024 * 1024,
+            read_timeout: Duration::from_secs(30),
+            remote_send_capacity: 32,
         }
     }
 }

@@ -29,9 +29,8 @@ pub use config::{
 };
 pub use monitor::{ActorMonitor, ActorStats};
 pub use distributed::{
-    serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime,
-    serve_actor_with_config, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef,
-    RemoteMessage,
+    serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime, Cluster, ClusterMember,
+    Frame, Node, NodeHandle, RemoteActorRef, RemoteMessage,
 };
 pub use hash_ring::{HashRing, RingNode};
 pub use mesh::{
