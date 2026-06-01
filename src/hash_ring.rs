@@ -1,35 +1,35 @@
 //! Consistent-hash ring for cluster node discovery.
 
+use murmur3::murmur3_x64_128;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::Cursor;
 
-const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
-const FNV_PRIME: u64 = 0x100000001b3;
+/// Ring hash seed — fixed so all cluster members agree on placement.
+const RING_HASH_SEED: u32 = 0;
 
-/// Stable FNV-1a 64-bit hasher for cross-version consistent routing.
-#[derive(Default)]
-struct FnvHasher {
-    state: u64,
+/// Buffers `Hash::hash` output and finishes with MurmurHash3 x64 128 (lower u64).
+struct Murmur3Hasher {
+    buf: Vec<u8>,
 }
 
-impl FnvHasher {
+impl Murmur3Hasher {
     fn new() -> Self {
-        Self {
-            state: FNV_OFFSET_BASIS,
-        }
+        Self { buf: Vec::new() }
     }
 }
 
-impl Hasher for FnvHasher {
+impl Hasher for Murmur3Hasher {
     fn finish(&self) -> u64 {
-        self.state
+        let mut cursor = Cursor::new(&self.buf);
+        match murmur3_x64_128(&mut cursor, RING_HASH_SEED) {
+            Ok(hash) => hash as u64,
+            Err(_) => 0,
+        }
     }
 
     fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.state ^= u64::from(b);
-            self.state = self.state.wrapping_mul(FNV_PRIME);
-        }
+        self.buf.extend_from_slice(bytes);
     }
 }
 
@@ -86,7 +86,7 @@ impl HashRing {
     }
 
     fn hash_key<T: Hash>(&self, key: &T) -> u64 {
-        let mut hasher = FnvHasher::new();
+        let mut hasher = Murmur3Hasher::new();
         key.hash(&mut hasher);
         hasher.finish()
     }
