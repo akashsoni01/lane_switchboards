@@ -6,6 +6,8 @@ OTP-style primitives in Rust: actors, supervision, linking, monitoring, distribu
 
 Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
 
+**Release notes:** [v0.0.4](READMEv0.0.4.md) · [v0.0.3](READMEv0.0.3.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
+
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 
 ## The switchboard analogy
@@ -18,8 +20,8 @@ Erlang was built for telephone exchanges — physical **switchboards** where ope
 | **Each operator’s local plug board** | Process mailbox | `mpsc` channel + `Envelope<M>` |
 | **One bad line must not kill the exchange** | “Let it crash” + supervision | Supervisors restart failed children |
 | **Replace a failed circuit automatically** | `OneForOne` / `RestForOne` restart | `supervisor.rs` strategies + intensity limits |
-| **Know who’s up across the floor** | Process registry | `registry.rs` global `DashMap` |
-| **Calls between exchanges** | Distributed Erlang | `distributed.rs` TCP-framed remote actors |
+| **Know who’s up across the floor** | Process registry | `registry.rs` unified `ACTORS` index |
+| **Calls between exchanges** | Distributed Erlang | `distributed.rs` persistent TCP + framed remote actors |
 
 Telecom switches had to stay up under massive concurrent load — faults contained, components replaced in place. That heritage is why Erlang powers high-concurrency systems (messaging backends, IoT routing, soft real-time services). **lane_switchboards** brings the same *shape* — mailboxes, supervision trees, fault isolation — to Rust on top of Tokio, in a small readable core you can extend.
 
@@ -36,7 +38,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | **Supervision trees** | OneForOne / OneForAll / RestForOne + intensity limits | None — manual restart loops | None | Via `ractor-supervisor` |
 | **Link / monitor / trap_exit** | Yes — OTP semantics | None | None | Partial (monitoring exists) |
 | **Hot code upgrade** | In-process `DynActor` swap | None | None | Not built-in |
-| **Distributed actors** | TCP JSON frames in core (`distributed.rs`) | Bring your own | Not included | Cluster features vary |
+| **Distributed actors** | TCP JSON frames, persistent peer connections, cluster roster | Bring your own | Not included | Cluster features vary |
 | **Global actor registry** | `DashMap` index for cross-actor routing | None | None | Registry patterns available |
 | **Panic → supervisor path** | `catch_unwind` in `handle` | Task dies silently unless you wrap | Request fails; no actor tree | Framework-dependent |
 | **Learning curve** | Small codebase (~1k LOC core) | Low-level, you design everything | Web-focused API | Medium, ecosystem docs |
@@ -64,13 +66,13 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | Module | Capability |
 |--------|------------|
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
-| `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec` |
-| `registry.rs` | Global `DashMap` actor index |
-| `distributed.rs` | TCP-framed remote actors, `Cluster` roster, `serve_actor`, hash-ring routing |
-| `hash_ring.rs` | `HashRing` / `RingNode` consistent-hash discovery |
-| `config.rs` | `ActorConfig` mailbox + timeout tuning, `DistributedConfig` load limits |
+| `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `SupervisorHandle::stop()` |
+| `registry.rs` | Unified `ACTORS` `DashMap` — control + supervisor channels registered atomically |
+| `distributed.rs` | Persistent TCP per peer, frame size limits, read timeouts, `Cluster` roster, `serve_actor` |
+| `hash_ring.rs` | `HashRing` / `RingNode` — MurmurHash3 consistent-hash (stable across builds) |
+| `config.rs` | `ActorConfig` mailbox + timeout tuning; `DistributedConfig` bridge, in-flight, frame limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
-| `mesh.rs` | TCP service mesh — `ServiceMesh`, registry, `MeshRouter`, `serve_microservice` |
+| `mesh.rs` | TCP service mesh — TTL registry, persistent client, diff sync, `serve_microservice` |
 
 ### When to use `supervisor.rs`
 
@@ -82,6 +84,7 @@ Use `src/supervisor.rs` when actor failure should be part of normal control flow
 | Several actors have dependency order | Restart downstream dependents on upstream failure | `Supervisor::new` + `RestartStrategy::RestForOne` |
 | You need stable actor handles after restart | Ref IDs change after respawn | `ChildRegistry<M, K>` or `ChildSlot<M>` |
 | You need restart storm protection | Prevent infinite crash loops | `SupervisorConfig { max_restarts, within_secs, intensity_action }` |
+| Graceful supervisor shutdown | Stop children in reverse order | `SupervisorHandle::stop()` |
 | Startup must finish before traffic | Ensure pre-start/register steps settle | `start_settled(Duration)` |
 
 ## One supervisor, many children
@@ -161,17 +164,20 @@ See [`supervisor_strategies.md`](examples/supervisor_strategies.md) (`cargo run 
 
 Add computing capacity by binding new TCP nodes and joining them to a shared [`Cluster`](src/distributed.rs) roster. Existing nodes keep running — no restart required.
 
+**Data-plane reliability (v0.0.4):** each `RemoteActorRef` keeps a persistent TCP write channel with automatic reconnect; inbound frames are capped (`max_frame_bytes`, default 4 MiB) and reads time out (`read_timeout`, default 30s). `serve_actor` spawns the local actor **before** binding TCP so failed spawns never leave a listener with no handler.
+
 | Helper | When to use |
 |--------|-------------|
 | **`serve_actor(name, bind_addr, target, actor)`** | Bind a local node and bridge frames to a local actor |
+| **`serve_actor_on_runtime(..., distributed, actor_config)`** | Full control over runtime + `DistributedConfig` |
 | **`Cluster::join(member)`** | Register a remote node's address in the roster |
 | **`Cluster::send_by_key(key, msg)`** | Route to the node chosen by consistent hash |
-| **`Cluster::broadcast(msg)`** | Send to every member (`M: Clone`; fails on first error) |
+| **`Cluster::broadcast(msg)`** | Send to every member; returns first error after attempting all |
 | **`Cluster::send_all(msg)`** | Send to every member; returns per-node results |
 | **`Cluster::send_to(names, msg)`** | Send to a named subset |
 | **`Cluster::send_replicas(key, n, msg)`** | Primary + next nodes on hash ring |
 | **`Cluster::send_round_robin(msg)`** | Spread work across all members (no stickiness) |
-| **`HashRing`** | Standalone consistent-hash discovery ([`hash_ring.rs`](src/hash_ring.rs)) |
+| **`HashRing`** | Standalone MurmurHash3 consistent-hash ring ([`hash_ring.rs`](src/hash_ring.rs)) |
 
 ```rust
 use lane_switchboards::distributed::{serve_actor, Cluster};
@@ -199,25 +205,40 @@ Microservices over TCP with a **control plane** (register / discover) and **data
 
 | Component | Role |
 |-----------|------|
-| **`MeshRegistryServer`** | TCP registry — instances call `Register` / clients call `List` |
-| **`serve_microservice`** | Bind one service instance (data plane) |
+| **`MeshRegistryServer`** | TCP registry with lease TTL (`DEFAULT_RECORD_TTL`, 30s) and background eviction |
+| **`MeshRegistryClient`** | Persistent registry connection; `register`, `renew`, `list`, `sync_mesh` |
+| **`serve_microservice`** | Bind one instance — frame `target` is the unique `instance_id` |
 | **`ServiceMesh` / `MeshRouter`** | Route `invoke(service, key, msg)` via hash ring per service |
 | **`join_mesh`** | Register locally + with TCP registry |
 
+Instances must **renew** periodically (`client.renew(record)`) or the registry evicts stale records. `MeshRouter::sync()` applies a **diff** snapshot — the mesh never goes fully empty mid-sync.
+
 ```rust
 use lane_switchboards::mesh::{
-    join_mesh, serve_microservice, MeshRegistryServer, MeshRouter,
+    join_mesh, serve_microservice, MeshRegistryClient, MeshRegistryServer, MeshRouter,
+    ServiceMesh, DEFAULT_RECORD_TTL,
 };
 
 let registry = MeshRegistryServer::bind("127.0.0.1:9050").await?;
 let handle = serve_microservice("orders", "orders-1", "127.0.0.1:0", OrdersActor).await?;
+// handle.record.target == "orders-1" (unique dispatch slot per instance)
+
+let mut mesh = ServiceMesh::new();
 join_mesh(&mut mesh, Some(&registry.address), &handle).await?;
 
 let mut router = MeshRouter::with_registry(&registry.address);
 router.sync().await?;
 router.invoke("orders", &order_id, msg).await?;           // one instance (sticky)
 router.invoke_all("orders", health_msg).await;            // every replica
+
+// Renew lease before DEFAULT_RECORD_TTL (e.g. every 15s)
+if let Some(client) = router.registry_client() {
+    client.renew(handle.record.clone()).await?;
+}
+let _ = DEFAULT_RECORD_TTL; // 30 seconds
 ```
+
+Control-plane frames are capped at 64 KiB with 30s read timeouts on both registry server and client connections.
 
 See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`) and [`serve_microservice.md`](examples/serve_microservice.md) (bind addresses, ports, calling from other processes).
 
@@ -266,6 +287,38 @@ Measured on the current design (`cargo run --example handle_timeout_calculator_t
 | Full demo wall-clock | **~3.4 s** |
 
 The wall-clock run includes demonstration sleeps, restart choreography, and timeout phases; the microsecond figures above are success-path request latency.
+
+## Configuration defaults
+
+```rust
+use lane_switchboards::supervisor::{IntensityAction, RestartStrategy, SupervisorConfig};
+use lane_switchboards::{ActorConfig, DistributedConfig};
+use std::time::Duration;
+
+ActorConfig {
+    mailbox_capacity: 64,
+    handle_timeout: None,
+    slow_handle_threshold: None,
+}
+
+DistributedConfig {
+    bridge_capacity: 32,
+    max_in_flight: 32,                              // per-node dispatch semaphore
+    max_frame_bytes: 4 * 1024 * 1024,               // reject oversized inbound frames
+    read_timeout: Duration::from_secs(30),          // TCP read timeout per frame
+    remote_send_capacity: 32,                       // outbound queue per RemoteActorRef
+}
+
+SupervisorConfig {
+    strategy: RestartStrategy::OneForOne,
+    max_restarts: 5,
+    within_secs: 10,
+    intensity_action: IntensityAction::ShutdownSupervisor,
+    mailbox_capacity: 32,
+}
+```
+
+See [READMEv0.0.4.md](READMEv0.0.4.md) for migration notes (hash ring remapping, mesh client API, `ServiceRecord.target`).
 
 ## Examples
 
