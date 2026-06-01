@@ -14,10 +14,10 @@ use lane_switchboards::tls::{
 };
 use rcgen::{CertificateParams, DnType, KeyPair, SanType};
 use serde::{Deserialize, Serialize};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -58,6 +58,32 @@ fn write_localhost_pem(dir: &PathBuf) -> (PathBuf, PathBuf) {
         .and_then(|mut f| f.write_all(key_pair.serialize_pem().as_bytes()))
         .expect("write key");
     (cert_path, key_path)
+}
+
+/// Overwrite a file with zeros, then delete it (best-effort wipe for demo private keys).
+fn secure_remove_file(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let len = std::fs::metadata(path)?.len();
+    if len > 0 {
+        let mut file = OpenOptions::new().write(true).open(path)?;
+        file.write_all(&vec![0u8; len as usize])?;
+        file.sync_all()?;
+    }
+    std::fs::remove_file(path)
+}
+
+/// Remove demo PEM material. Key is wiped before unlink; cert is removed normally.
+fn remove_ephemeral_pem(cert_path: &Path, key_path: &Path, temp_dir: &Path) -> std::io::Result<()> {
+    secure_remove_file(key_path)?;
+    if cert_path.exists() {
+        std::fs::remove_file(cert_path)?;
+    }
+    if temp_dir.exists() {
+        let _ = std::fs::remove_dir(temp_dir);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -101,5 +127,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // TLS configs are in memory; PEM files are no longer needed after the demo run.
+    if std::env::var("KEEP_DEMO_PEM").is_err() {
+        match remove_ephemeral_pem(&cert_path, &key_path, &temp) {
+            Ok(()) => println!("removed ephemeral demo cert and key from {}", temp.display()),
+            Err(e) => eprintln!("warning: failed to remove demo PEM files: {e}"),
+        }
+    } else {
+        println!(
+            "KEEP_DEMO_PEM set — left cert/key in {}",
+            temp.display()
+        );
+    }
+
     Ok(())
 }

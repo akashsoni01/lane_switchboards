@@ -11,6 +11,7 @@ Expected output:
 ```text
 TLS node listening on 127.0.0.1:56542
 received remote ping (TLS): hello over TLS
+removed ephemeral demo cert and key from /tmp/lane_switchboards_tls_demo
 ```
 
 See also: [horizontal_scaling.md](./horizontal_scaling.md) (plain TCP cluster), [serve_microservice.md](./serve_microservice.md) (mesh data plane).
@@ -111,6 +112,20 @@ The example writes PEM files under `$TMP/lane_switchboards_tls_demo/`:
 - Client trusts the same cert file as CA (`client_config_from_pem(Some(&cert_path), ...)`)
 
 Both sides must agree on trust material. The client validates the server name against the **host** portion of `"host:port"` (SNI).
+
+After the ping completes, the example **removes the demo PEM files** by default:
+
+1. Overwrites `localhost.key` with zeros and deletes it
+2. Deletes `localhost.crt`
+3. Removes the temp directory if empty
+
+TLS acceptor/connector configs are already loaded in memory, so the files are not needed for the rest of the run.
+
+To keep files for inspection (e.g. `openssl x509 -in ...`):
+
+```bash
+KEEP_DEMO_PEM=1 cargo run --example tls_distributed
+```
 
 ### Production — your PEM paths
 
