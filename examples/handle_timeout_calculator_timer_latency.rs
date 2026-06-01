@@ -32,6 +32,23 @@ use tokio::sync::{Mutex, oneshot};
 
 const HANDLE_TIMEOUT: Duration = Duration::from_millis(150);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ChildName {
+    Calculator,
+    Timer,
+    Ledger,
+}
+
+impl ChildName {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChildName::Calculator => "calculator",
+            ChildName::Timer => "timer",
+            ChildName::Ledger => "ledger",
+        }
+    }
+}
+
 enum AppMsg {
     Add(f64, f64, oneshot::Sender<Result<f64, String>>),
     SlowDiv(f64, f64, u64, oneshot::Sender<Result<f64, String>>),
@@ -93,11 +110,12 @@ struct SharedState {
 
 type SharedStateHandle = Arc<Mutex<SharedState>>;
 
-async fn log_generation(registry: &ChildRegistry<AppMsg>, name: &str) {
+async fn log_generation(registry: &ChildRegistry<AppMsg, ChildName>, name: ChildName) {
     registry.bump_generation(name).await;
     println!(
-        "[spawn] {name} generation {}",
-        registry.generation(name).await
+        "[spawn] {} generation {}",
+        name.as_str(),
+        registry.generation(&name).await
     );
 }
 
@@ -105,13 +123,13 @@ async fn log_generation(registry: &ChildRegistry<AppMsg>, name: &str) {
 struct Calculator {
     pending: Option<StuckAction>,
     state: SharedStateHandle,
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
 }
 
 #[async_trait::async_trait]
 impl Actor<AppMsg> for Calculator {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        log_generation(&self.registry, "calculator").await;
+        log_generation(&self.registry, ChildName::Calculator).await;
         let state = self.state.lock().await;
         self.pending = None;
         if let Some(v) = state.last_result {
@@ -179,7 +197,7 @@ impl Actor<AppMsg> for Calculator {
                 // Self-deadlock: mailbox is busy here (`max_in_flight = 1`), so `Ping` never runs.
                 let calc = self
                     .registry
-                    .get("calculator")
+                    .get(&ChildName::Calculator)
                     .await
                     .ok_or("calculator ref missing")?;
                 let (tx, rx) = oneshot::channel();
@@ -196,7 +214,7 @@ impl Actor<AppMsg> for Calculator {
                 // `handle_timeout` should end this handler (and trigger journaling).
                 let ledger = self
                     .registry
-                    .get("ledger")
+                    .get(&ChildName::Ledger)
                     .await
                     .ok_or("ledger ref missing")?;
                 let (tx, _rx) = oneshot::channel();
@@ -220,20 +238,20 @@ impl Actor<AppMsg> for Calculator {
 
 /// Participates in cross-actor deadlock: fetches from calculator while calculator waits on us.
 struct Ledger {
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
 }
 
 #[async_trait::async_trait]
 impl Actor<AppMsg> for Ledger {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        log_generation(&self.registry, "ledger").await;
+        log_generation(&self.registry, ChildName::Ledger).await;
         Ok(())
     }
 
     async fn handle(&mut self, msg: AppMsg) -> Result<(), ActorProcessingErr> {
         match msg {
             AppMsg::LedgerFetch(reply) => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get(&ChildName::Calculator).await {
                     let (tx, rx) = oneshot::channel();
                     calc.send(AppMsg::LastResult(tx)).await?;
                     let _ = reply.send(rx.await.ok().flatten());
@@ -248,7 +266,7 @@ impl Actor<AppMsg> for Ledger {
 }
 
 struct ResultTimer {
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
     self_ref: Option<ActorRef<AppMsg>>,
     interval: Duration,
     running: bool,
@@ -257,7 +275,7 @@ struct ResultTimer {
 #[async_trait::async_trait]
 impl Actor<AppMsg> for ResultTimer {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        log_generation(&self.registry, "timer").await;
+        log_generation(&self.registry, ChildName::Timer).await;
         Ok(())
     }
 
@@ -269,7 +287,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get(&ChildName::Calculator).await {
                     let (tx, rx) = oneshot::channel();
                     let _ = calc.send(AppMsg::LastResult(tx)).await;
                     match rx.await {
@@ -301,13 +319,13 @@ impl ResultTimer {
 }
 
 struct SupervisedApp {
-    registry: Arc<ChildRegistry<AppMsg>>,
+    registry: Arc<ChildRegistry<AppMsg, ChildName>>,
     _supervisor: SupervisorHandle<AppMsg>,
 }
 
 impl SupervisedApp {
     async fn start(interval: Duration) -> Result<Self, ActorProcessingErr> {
-        let registry = Arc::new(ChildRegistry::new());
+        let registry = Arc::new(ChildRegistry::<AppMsg, ChildName>::new());
         let state = Arc::new(Mutex::new(SharedState::default()));
         let calc_registry = registry.clone();
         let timer_registry = registry.clone();
@@ -329,7 +347,7 @@ impl SupervisedApp {
                 ..Default::default()
             },
             vec![
-                spawn_child_spec(0, "calculator", registry.clone(), {
+                spawn_child_spec(0, ChildName::Calculator, registry.clone(), {
                     let registry = calc_registry.clone();
                     let state = calc_state.clone();
                     move || Calculator {
@@ -338,7 +356,7 @@ impl SupervisedApp {
                         registry: registry.clone(),
                     }
                 }),
-                spawn_child_spec(1, "timer", registry.clone(), {
+                spawn_child_spec(1, ChildName::Timer, registry.clone(), {
                     let registry = timer_registry.clone();
                     move || ResultTimer {
                         registry: registry.clone(),
@@ -347,7 +365,7 @@ impl SupervisedApp {
                         running: false,
                     }
                 }),
-                spawn_child_spec(2, "ledger", registry.clone(), {
+                spawn_child_spec(2, ChildName::Ledger, registry.clone(), {
                     let registry = ledger_registry.clone();
                     move || Ledger {
                         registry: registry.clone(),
@@ -367,7 +385,7 @@ impl SupervisedApp {
     async fn start_timer(&self) -> anyhow::Result<()> {
         let timer = self
             .registry
-            .get("timer")
+            .get(&ChildName::Timer)
             .await
             .ok_or_else(|| anyhow::anyhow!("timer not running"))?;
         timer
@@ -385,7 +403,7 @@ fn actor_err(e: ActorProcessingErr) -> anyhow::Error {
 async fn add(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<f64> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -403,7 +421,7 @@ async fn slow_div(
 ) -> anyhow::Result<Result<f64, String>> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -421,7 +439,7 @@ async fn slow_div(
 async fn probe_self_deadlock(app: &SupervisedApp) -> anyhow::Result<Result<(), String>> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -442,7 +460,7 @@ async fn probe_cross_deadlock(
 ) -> anyhow::Result<Result<(), String>> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -460,7 +478,7 @@ async fn probe_cross_deadlock(
 async fn stuck_journal(app: &SupervisedApp) -> anyhow::Result<Vec<StuckAction>> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -472,7 +490,7 @@ async fn stuck_journal(app: &SupervisedApp) -> anyhow::Result<Vec<StuckAction>> 
 async fn last_result(app: &SupervisedApp) -> anyhow::Result<Option<f64>> {
     let calc = app
         .registry
-        .get("calculator")
+        .get(&ChildName::Calculator)
         .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
@@ -554,7 +572,7 @@ async fn measure_success_latencies(app: &SupervisedApp) -> anyhow::Result<()> {
     }
     last_stats.print();
 
-    if let Some(calc) = app.registry.get("calculator").await {
+    if let Some(calc) = app.registry.get(&ChildName::Calculator).await {
         if let Some(stats) = ActorMonitor::global().get(calc.id) {
             println!(
                 "[latency] ActorMonitor (calculator) last_handle_ms={} max_handle_ms={}",
@@ -567,10 +585,14 @@ async fn measure_success_latencies(app: &SupervisedApp) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_generations(label: &str, gens: &HashMap<String, u64>) {
+fn print_generations(label: &str, gens: &HashMap<ChildName, u64>) {
     println!("{label}");
-    for name in ["calculator", "timer", "ledger"] {
-        println!("  {name}: generation {}", gens.get(name).copied().unwrap_or(0));
+    for name in [ChildName::Calculator, ChildName::Timer, ChildName::Ledger] {
+        println!(
+            "  {}: generation {}",
+            name.as_str(),
+            gens.get(&name).copied().unwrap_or(0)
+        );
     }
 }
 
@@ -610,8 +632,8 @@ async fn phase1_slow_handle(app: &SupervisedApp) -> anyhow::Result<()> {
         &app.registry.generations().await,
     );
     assert!(
-        app.registry.generation("calculator").await
-            > before_gen.get("calculator").copied().unwrap_or(0),
+        app.registry.generation(&ChildName::Calculator).await
+            > before_gen.get(&ChildName::Calculator).copied().unwrap_or(0),
         "calculator should restart after slow handle timeout"
     );
 
@@ -688,8 +710,8 @@ async fn phase2_deadlock_prevention(app: &SupervisedApp) -> anyhow::Result<()> {
         &app.registry.generations().await,
     );
     assert!(
-        app.registry.generation("calculator").await
-            > before_gen.get("calculator").copied().unwrap_or(0),
+        app.registry.generation(&ChildName::Calculator).await
+            > before_gen.get(&ChildName::Calculator).copied().unwrap_or(0),
         "calculator should restart after deadlock timeout"
     );
 

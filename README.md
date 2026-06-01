@@ -72,6 +72,18 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | TCP service mesh — `ServiceMesh`, registry, `MeshRouter`, `serve_microservice` |
 
+### When to use `supervisor.rs`
+
+Use `src/supervisor.rs` when actor failure should be part of normal control flow (OTP style), not a process-ending bug.
+
+| Situation | Why supervisor is the right fit | API to start with |
+|-----------|----------------------------------|-------------------|
+| One actor must auto-recover from panic/timeout | Keep mailbox endpoint alive across restarts | `supervise_actor`, `supervise_actor_with_config` |
+| Several actors have dependency order | Restart downstream dependents on upstream failure | `Supervisor::new` + `RestartStrategy::RestForOne` |
+| You need stable actor handles after restart | Ref IDs change after respawn | `ChildRegistry<M, K>` or `ChildSlot<M>` |
+| You need restart storm protection | Prevent infinite crash loops | `SupervisorConfig { max_restarts, within_secs, intensity_action }` |
+| Startup must finish before traffic | Ensure pre-start/register steps settle | `start_settled(Duration)` |
+
 ## One supervisor, many children
 
 Yes — a single `Supervisor` manages **multiple child actors**. Pass several child specs to `Supervisor::new`; on `start()` the supervisor spawns every child and listens on one shared restart channel.
@@ -268,7 +280,7 @@ The wall-clock run includes demonstration sleeps, restart choreography, and time
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
 | RestForOne calculator + timer (optimized macros) | `cargo run --example rest_for_one_calculator_timer_optimized` — see [rest_for_one_calculator_timer_optimized.md](examples/rest_for_one_calculator_timer_optimized.md) |
-| Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` |
+| Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` — typed child keys (`ChildRegistry<M, K>`) + success-path latency probes |
 | Distributed messaging | `cargo run --example distributed_demo` |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
