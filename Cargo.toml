@@ -10,7 +10,7 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio = { version = "=1.38.0", features = ["full"] }
-tracing = { version = "=0.1.40", features = ["log"] } #"release_max_level_warn"
+tracing = { version = "=0.1.40", features = ["log", "max_level_info", "release_max_level_warn"] }
 dashmap = "=6.1.0"
 serde = { version = "=1.0.210", features = ["derive", "rc"] }
 async-trait = "=0.1.83"
