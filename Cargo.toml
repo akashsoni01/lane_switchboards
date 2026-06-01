@@ -7,6 +7,12 @@ license = "MIT"
 readme = "README.md"
 keywords = ["actor", "otp", "supervision", "concurrency", "erlang"]
 categories = ["asynchronous", "concurrency"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "src/**",
+]
 
 [dependencies]
 tokio = { version = "=1.38.0", features = ["full"] }
