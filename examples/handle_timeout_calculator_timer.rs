@@ -319,7 +319,6 @@ impl SupervisedApp {
         let actor_config = ActorConfig {
             handle_timeout: Some(HANDLE_TIMEOUT),
             slow_handle_threshold: Some(HANDLE_TIMEOUT),
-            max_in_flight: 1,
             ..Default::default()
         };
 

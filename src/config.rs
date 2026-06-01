@@ -6,16 +6,10 @@ use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 
-/// Actor mailbox sizing, concurrency, and deadlock / slow-handle limits.
+/// Actor mailbox sizing and deadlock / slow-handle limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
-    /// Max concurrent `handle()` calls per actor (`1` = classic sequential mailbox).
-    ///
-    /// Values above `1` spawn overlapping handler tasks, but each task still acquires
-    /// an exclusive lock on the actor — useful for overlapping I/O waits, not CPU
-    /// parallelism over mutable actor state.
-    pub max_in_flight: usize,
     /// Max wall time for one `handle()` call. Exceeded → `on_handle_stuck` then actor exit.
     /// `None` disables handle timeouts.
     pub handle_timeout: Option<Duration>,
@@ -28,7 +22,6 @@ impl Default for ActorConfig {
     fn default() -> Self {
         Self {
             mailbox_capacity: 64,
-            max_in_flight: 1,
             handle_timeout: None,
             slow_handle_threshold: None,
         }
