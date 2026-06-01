@@ -15,6 +15,21 @@ macro_rules! actor_ask {
     }};
 }
 
+/// Lookup a child in [`ChildRegistry`] and perform an `actor_ask!` in one step.
+///
+/// Usage:
+/// `let reply = registry_ask!(registry, ChildName::Calculator, "calculator not running", |reply| Msg::Get(reply))?;`
+#[macro_export]
+macro_rules! registry_ask {
+    ($registry:expr, $name:expr, $missing:expr, |$reply:ident| $msg:expr) => {{
+        let __name = $name;
+        match $registry.get(&__name).await {
+            Some(__actor) => $crate::actor_ask!(__actor, |$reply| $msg),
+            None => Err::<_, $crate::actor::ActorProcessingErr>($missing.into()),
+        }
+    }};
+}
+
 /// Build a named child spec for a shared [`ChildRegistry`] with less closure boilerplate.
 ///
 /// Usage:

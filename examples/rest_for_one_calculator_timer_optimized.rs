@@ -10,7 +10,7 @@ use lane_switchboards::actor::{Actor, ActorProcessingErr, ActorRef};
 use lane_switchboards::supervisor::{
     ChildRegistry, IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
-use lane_switchboards::{actor_ask, registry_child_spec};
+use lane_switchboards::{actor_ask, registry_ask, registry_child_spec};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -37,8 +37,8 @@ enum ChildName {
 // }
 
 enum AppMsg {
-    Add(f64, f64, oneshot::Sender<Result<f64, String>>),
-    Div(f64, f64, oneshot::Sender<Result<f64, String>>),
+    Add(f64, f64, oneshot::Sender<f64>),
+    Div(f64, f64, oneshot::Sender<f64>),
     LastResult(oneshot::Sender<Option<f64>>),
     TimerStart(ActorRef<AppMsg>),
     TimerTick,
@@ -56,7 +56,7 @@ impl Actor<AppMsg> for Calculator {
             AppMsg::Add(a, b, reply) => {
                 let value = a + b;
                 self.last_result = Some(value);
-                let _ = reply.send(Ok(value));
+                let _ = reply.send(value);
             }
             AppMsg::Div(a, b, reply) => {
                 if b == 0.0 {
@@ -64,7 +64,7 @@ impl Actor<AppMsg> for Calculator {
                 }
                 let value = a / b;
                 self.last_result = Some(value);
-                let _ = reply.send(Ok(value));
+                let _ = reply.send(value);
             }
             AppMsg::LastResult(reply) => {
                 let _ = reply.send(self.last_result);
@@ -185,28 +185,23 @@ impl App {
     }
 
     async fn add(&self, a: f64, b: f64) -> anyhow::Result<f64> {
-        let calc = self
-            .registry
-            .get(&ChildName::Calculator)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
-        actor_ask!(calc, |reply| AppMsg::Add(a, b, reply))
-            .map_err(actor_err)?
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        registry_ask!(
+            self.registry,
+            ChildName::Calculator,
+            "calculator not running",
+            |reply| AppMsg::Add(a, b, reply)
+        )
+        .map_err(actor_err)
     }
 
-    async fn div(&self, a: f64, b: f64) -> anyhow::Result<Result<f64, String>> {
-        let calc = self
-            .registry
-            .get(&ChildName::Calculator)
-            .await
-            .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
-        match actor_ask!(calc, |reply| AppMsg::Div(a, b, reply)) {
-            Ok(v) => Ok(v),
-            Err(_) => Err(anyhow::anyhow!(
-                "calculator crashed (RestForOne restarts calculator + timer)"
-            )),
-        }
+    async fn div(&self, a: f64, b: f64) -> anyhow::Result<f64> {
+        registry_ask!(
+            self.registry,
+            ChildName::Calculator,
+            "calculator not running",
+            |reply| AppMsg::Div(a, b, reply)
+        )
+        .map_err(|_| anyhow::anyhow!("calculator crashed (RestForOne restarts calculator + timer)"))
     }
 }
 
