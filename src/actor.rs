@@ -2,7 +2,7 @@
 
 use crate::config::{spawn_on, ActorConfig};
 use crate::monitor::ActorMonitor;
-use crate::registry::{get_control_sender, register_actor, register_supervisor, unregister_actor};
+use crate::registry::{get_control_sender, register_actor, unregister_actor};
 use crate::supervisor::RestartSignal;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -348,11 +348,7 @@ where
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(config.mailbox_capacity);
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
-    if let Some(sup_tx) = supervisor_tx {
-        register_supervisor(id, sup_tx);
-    }
-
-    register_actor(id, control_tx);
+    register_actor(id, control_tx, supervisor_tx);
     ActorMonitor::global().register(id);
 
     let boxed = into_dyn_actor(actor);
