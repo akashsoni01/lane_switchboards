@@ -1,23 +1,22 @@
-//! Global actor index: message routing and supervisor notification channels.
+//! Global actor index: control routing and supervisor notification channels.
 
-use crate::actor::{ActorId, Envelope};
+use crate::actor::{ActorId, ControlMsg};
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use std::any::Any;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::supervisor::RestartSignal;
 
-type ErasedSender = mpsc::Sender<Envelope<Box<dyn Any + Send + Sync>>>;
+type ControlSender = mpsc::Sender<ControlMsg>;
 
-static ACTOR_SENDERS: Lazy<DashMap<ActorId, ErasedSender>> = Lazy::new(DashMap::new);
+static ACTOR_CONTROL_SENDERS: Lazy<DashMap<ActorId, ControlSender>> = Lazy::new(DashMap::new);
 static SUPERVISOR_CHANNELS: Lazy<DashMap<ActorId, mpsc::Sender<RestartSignal>>> =
     Lazy::new(DashMap::new);
 
-/// Register an actor's type-erased mailbox for link/monitor/cross-type routing.
-pub fn register_actor(id: ActorId, tx: ErasedSender) {
-    ACTOR_SENDERS.insert(id, tx);
+/// Register an actor's control channel for cross-type link / linked-exit routing.
+pub(crate) fn register_actor(id: ActorId, tx: ControlSender) {
+    ACTOR_CONTROL_SENDERS.insert(id, tx);
 }
 
 /// Register a supervisor notification channel for a child actor id.
@@ -26,12 +25,12 @@ pub fn register_supervisor(child_id: ActorId, tx: mpsc::Sender<RestartSignal>) {
 }
 
 pub fn unregister_actor(id: ActorId) {
-    ACTOR_SENDERS.remove(&id);
+    ACTOR_CONTROL_SENDERS.remove(&id);
     SUPERVISOR_CHANNELS.remove(&id);
 }
 
-pub fn get_actor_sender(id: ActorId) -> Option<ErasedSender> {
-    ACTOR_SENDERS.get(&id).map(|e| e.value().clone())
+pub(crate) fn get_control_sender(id: ActorId) -> Option<ControlSender> {
+    ACTOR_CONTROL_SENDERS.get(&id).map(|e| e.value().clone())
 }
 
 pub fn get_supervisor_sender(id: ActorId) -> Option<mpsc::Sender<RestartSignal>> {
@@ -48,6 +47,6 @@ impl Registry {
     }
 
     pub fn actor_count(&self) -> usize {
-        ACTOR_SENDERS.len()
+        ACTOR_CONTROL_SENDERS.len()
     }
 }

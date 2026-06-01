@@ -11,6 +11,10 @@ use tokio::task::JoinHandle;
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
     /// Max concurrent `handle()` calls per actor (`1` = classic sequential mailbox).
+    ///
+    /// Values above `1` spawn overlapping handler tasks, but each task still acquires
+    /// an exclusive lock on the actor — useful for overlapping I/O waits, not CPU
+    /// parallelism over mutable actor state.
     pub max_in_flight: usize,
     /// Max wall time for one `handle()` call. Exceeded → `on_handle_stuck` then actor exit.
     /// `None` disables handle timeouts.

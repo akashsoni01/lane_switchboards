@@ -2,16 +2,16 @@
 
 use crate::config::{spawn_on, ActorConfig};
 use crate::monitor::ActorMonitor;
-use crate::registry::{get_actor_sender, register_actor, register_supervisor, unregister_actor};
+use crate::registry::{get_control_sender, register_actor, register_supervisor, unregister_actor};
 use crate::supervisor::RestartSignal;
 use async_trait::async_trait;
 use futures_util::FutureExt;
-use std::any::Any;
+use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
@@ -48,6 +48,13 @@ pub enum ExitReason {
     Killed,
 }
 
+/// Cross-type control signals routed through the global registry.
+#[derive(Debug, Clone)]
+pub(crate) enum ControlMsg {
+    Link(ActorId),
+    LinkedExit(ActorId, ExitReason),
+}
+
 /// Context passed to [`Actor::on_handle_stuck`] when a handle times out.
 #[derive(Debug, Clone)]
 pub struct HandleStuckContext {
@@ -66,6 +73,7 @@ pub enum Envelope<M: Send + Sync + 'static> {
         notify: oneshot::Sender<ExitReason>,
     },
     Demonitor(ActorId),
+    /// Deprecated internal variant; cross-type delivery uses [`ControlMsg::LinkedExit`].
     LinkedExit(ActorId, ExitReason),
     Kill,
     Stop,
@@ -79,6 +87,10 @@ pub type ActorProcessingErr = Box<dyn std::error::Error + Send + Sync>;
 pub trait DynActor<M: Send + Sync + 'static>: Send + Sync {
     fn dyn_pre_start(
         &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>>;
+    fn dyn_on_upgrade(
+        &mut self,
+        old_version: u32,
     ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>>;
     fn dyn_on_handle_begin<'a>(
         &'a mut self,
@@ -105,6 +117,10 @@ pub trait DynActor<M: Send + Sync + 'static>: Send + Sync {
 #[async_trait]
 pub trait Actor<M: Send + Sync + 'static>: Send + Sync {
     async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
+        Ok(())
+    }
+    /// Called when the implementation is hot-swapped via [`ActorRef::upgrade`].
+    async fn on_upgrade(&mut self, _old_version: u32) -> Result<(), ActorProcessingErr> {
         Ok(())
     }
     /// Called before each `handle()` — store pending work here for recovery on timeout.
@@ -137,6 +153,13 @@ impl<A: Actor<M> + Send + Sync, M: Send + Sync + 'static> DynActor<M> for ActorW
         &mut self,
     ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>> {
         Box::pin(async move { self.inner.pre_start().await })
+    }
+
+    fn dyn_on_upgrade(
+        &mut self,
+        old_version: u32,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ActorProcessingErr>> + Send + '_>> {
+        Box::pin(async move { self.inner.on_upgrade(old_version).await })
     }
 
     fn dyn_on_handle_begin<'a>(
@@ -312,134 +335,147 @@ where
 {
     let id = ActorId::new();
     let (tx, rx) = mpsc::channel::<Envelope<M>>(config.mailbox_capacity);
+    let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(config.mailbox_capacity);
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
     if let Some(sup_tx) = supervisor_tx {
         register_supervisor(id, sup_tx);
     }
 
-    let erased_tx = erase_sender(tx.clone());
-    register_actor(id, erased_tx);
+    register_actor(id, control_tx);
     ActorMonitor::global().register(id);
 
     let boxed = into_dyn_actor(actor);
     let config = *config;
     let runtime = runtime.clone();
-    let actor_runtime = runtime.clone();
     let join = spawn_on(Some(&runtime), async move {
-        run_actor(id, rx, boxed, config, actor_runtime).await;
+        run_actor(id, rx, control_rx, boxed, config).await;
     });
 
     Ok((actor_ref, join))
 }
 
-fn erase_sender<M: Send + Sync + 'static>(
-    tx: mpsc::Sender<Envelope<M>>,
-) -> mpsc::Sender<Envelope<Box<dyn Any + Send + Sync>>> {
-    // SAFETY: LinkedExit only carries (ActorId, ExitReason) across actor types — no M payload.
-    unsafe { std::mem::transmute(tx) }
-}
-
 async fn run_actor<M: Send + Sync + 'static>(
     id: ActorId,
     rx: mpsc::Receiver<Envelope<M>>,
+    control_rx: mpsc::Receiver<ControlMsg>,
     actor: Box<dyn DynActor<M>>,
     config: ActorConfig,
-    _runtime: Handle,
 ) {
     if config.max_in_flight <= 1 {
-        run_actor_sequential(id, rx, actor, config).await;
+        run_actor_sequential(id, rx, control_rx, actor, config).await;
     } else {
-        run_actor_concurrent(id, rx, actor, config).await;
+        run_actor_concurrent(id, rx, control_rx, actor, config).await;
     }
 }
 
 async fn run_actor_sequential<M: Send + Sync + 'static>(
     id: ActorId,
     mut rx: mpsc::Receiver<Envelope<M>>,
+    mut control_rx: mpsc::Receiver<ControlMsg>,
     mut actor: Box<dyn DynActor<M>>,
     config: ActorConfig,
 ) {
-    let mut links: Vec<ActorId> = Vec::new();
+    let mut links: HashSet<ActorId> = HashSet::new();
     let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
     let mut exit_reason = ExitReason::Normal;
 
     if let Err(e) = actor.dyn_pre_start().await {
-        exit_reason = ExitReason::Error(e.to_string());
         unregister_actor(id);
         ActorMonitor::global().mark_inactive(id);
+        let _ = e;
         return;
     }
 
-    'actor_loop: while let Some(envelope) = rx.recv().await {
-        match envelope {
-            Envelope::Msg(m) => {
-                if let Some(reason) = handle_message(id, &mut actor, m, &config, &links).await {
-                    exit_reason = reason;
-                    break 'actor_loop;
+    'actor_loop: loop {
+        tokio::select! {
+            envelope = rx.recv() => {
+                let Some(envelope) = envelope else { break 'actor_loop };
+                match envelope {
+                    Envelope::Msg(m) => {
+                        if let Some(reason) = handle_message(id, &mut actor, m, &config).await {
+                            exit_reason = reason;
+                            break 'actor_loop;
+                        }
+                    }
+                    Envelope::Link(peer) => {
+                        register_link(id, peer, &mut links).await;
+                    }
+                    Envelope::Unlink(peer) => {
+                        links.remove(&peer);
+                    }
+                    Envelope::Monitor { observer, notify } => {
+                        monitors.push((observer, notify));
+                    }
+                    Envelope::Demonitor(observer_id) => {
+                        monitors.retain(|(id, _)| *id != observer_id);
+                    }
+                    Envelope::LinkedExit(peer, reason) => {
+                        if let Some(reason) = linked_exit_reason(id, peer, reason, actor.trap_exit()) {
+                            exit_reason = reason;
+                            break 'actor_loop;
+                        }
+                    }
+                    Envelope::Upgrade(new_impl) => {
+                        actor = new_impl;
+                        if let Err(e) = actor.dyn_on_upgrade(0).await {
+                            exit_reason = ExitReason::Error(e.to_string());
+                            break 'actor_loop;
+                        }
+                        tracing::info!(%id, "hot code upgrade applied");
+                    }
+                    Envelope::Stop => {
+                        exit_reason = ExitReason::Shutdown;
+                        break 'actor_loop;
+                    }
+                    Envelope::Kill => {
+                        exit_reason = ExitReason::Killed;
+                        break 'actor_loop;
+                    }
                 }
             }
-            Envelope::Link(peer) => {
-                if !links.contains(&peer) {
-                    links.push(peer);
+            ctrl = control_rx.recv() => {
+                let Some(ctrl) = ctrl else { break 'actor_loop };
+                match ctrl {
+                    ControlMsg::Link(peer) => {
+                        links.insert(peer);
+                    }
+                    ControlMsg::LinkedExit(peer, reason) => {
+                        if let Some(reason) = linked_exit_reason(id, peer, reason, actor.trap_exit()) {
+                            exit_reason = reason;
+                            break 'actor_loop;
+                        }
+                    }
                 }
-            }
-            Envelope::Unlink(peer) => {
-                links.retain(|&x| x != peer);
-            }
-            Envelope::Monitor { observer: _, notify } => {
-                monitors.push((ActorId::new(), notify));
-            }
-            Envelope::Demonitor(_) => {}
-            Envelope::LinkedExit(peer, reason) => {
-                if actor.trap_exit() {
-                    tracing::debug!(%id, %peer, ?reason, "trapped linked exit");
-                    continue;
-                }
-                exit_reason = ExitReason::Linked(peer, Box::new(reason));
-                break 'actor_loop;
-            }
-            Envelope::Upgrade(new_impl) => {
-                actor = new_impl;
-                if let Err(e) = actor.dyn_pre_start().await {
-                    exit_reason = ExitReason::Error(e.to_string());
-                    break 'actor_loop;
-                }
-                tracing::info!(%id, "hot code upgrade applied");
-            }
-            Envelope::Stop => {
-                exit_reason = ExitReason::Shutdown;
-                break 'actor_loop;
-            }
-            Envelope::Kill => {
-                exit_reason = ExitReason::Killed;
-                break 'actor_loop;
             }
         }
     }
 
-    finish_actor(id, actor, exit_reason, &config, &links, monitors).await;
+    finish_actor(id, actor, exit_reason, &links, monitors).await;
 }
 
+/// Overlapping handler tasks; each still holds an exclusive lock on the actor impl.
 async fn run_actor_concurrent<M: Send + Sync + 'static>(
     id: ActorId,
     mut rx: mpsc::Receiver<Envelope<M>>,
+    mut control_rx: mpsc::Receiver<ControlMsg>,
     actor: Box<dyn DynActor<M>>,
     config: ActorConfig,
 ) {
     let actor: Arc<Mutex<Option<Box<dyn DynActor<M>>>>> = Arc::new(Mutex::new(Some(actor)));
     let in_flight = Arc::new(Semaphore::new(config.max_in_flight));
-    let links: Arc<Mutex<Vec<ActorId>>> = Arc::new(Mutex::new(Vec::new()));
+    let links: Arc<Mutex<HashSet<ActorId>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
     let mut exit_reason = ExitReason::Normal;
     let mut handlers = JoinSet::new();
-    let (fail_tx, mut fail_rx) = mpsc::channel::<ExitReason>(1);
+    let shutdown_started = Arc::new(AtomicBool::new(false));
+    let (fail_tx, mut fail_rx) = mpsc::channel::<ExitReason>(config.max_in_flight);
 
     {
         let mut guard = actor.lock().await;
         if let Some(inner) = guard.as_mut() {
             if let Err(e) = inner.dyn_pre_start().await {
-                exit_reason = ExitReason::Error(e.to_string());
+                let _ = e;
                 unregister_actor(id);
                 ActorMonitor::global().mark_inactive(id);
                 return;
@@ -456,6 +492,26 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                     break;
                 }
             }
+            ctrl = control_rx.recv() => {
+                let Some(ctrl) = ctrl else { break };
+                match ctrl {
+                    ControlMsg::Link(peer) => {
+                        links.lock().await.insert(peer);
+                    }
+                    ControlMsg::LinkedExit(peer, reason) => {
+                        let trap = actor
+                            .lock()
+                            .await
+                            .as_ref()
+                            .map(|a| a.trap_exit())
+                            .unwrap_or(false);
+                        if let Some(reason) = linked_exit_reason(id, peer, reason, trap) {
+                            exit_reason = reason;
+                            break;
+                        }
+                    }
+                }
+            }
             join = handlers.join_next(), if !handlers.is_empty() => {
                 if let Some(Err(e)) = join {
                     tracing::warn!(%id, error = %e, "actor handler task failed");
@@ -470,8 +526,8 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                             Err(_) => break,
                         };
                         let actor = Arc::clone(&actor);
-                        let links_snapshot = links.lock().await.clone();
                         let fail_tx = fail_tx.clone();
+                        let shutdown_started = Arc::clone(&shutdown_started);
                         let task_id = id;
                         let config = config;
                         handlers.spawn(async move {
@@ -481,25 +537,32 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                                 return;
                             };
                             if let Some(reason) =
-                                handle_message(task_id, inner, m, &config, &links_snapshot).await
+                                handle_message(task_id, inner, m, &config).await
                             {
-                                let _ = fail_tx.send(reason).await;
+                                if !shutdown_started.swap(true, Ordering::Relaxed) {
+                                    if fail_tx.try_send(reason).is_err() {
+                                        tracing::warn!(%task_id, "dropped concurrent failure reason");
+                                    }
+                                }
                             }
                         });
                     }
                     Envelope::Link(peer) => {
                         let mut guard = links.lock().await;
-                        if !guard.contains(&peer) {
-                            guard.push(peer);
+                        if guard.insert(peer) {
+                            drop(guard);
+                            send_reverse_link(id, peer).await;
                         }
                     }
                     Envelope::Unlink(peer) => {
-                        links.lock().await.retain(|&x| x != peer);
+                        links.lock().await.remove(&peer);
                     }
-                    Envelope::Monitor { observer: _, notify } => {
-                        monitors.push((ActorId::new(), notify));
+                    Envelope::Monitor { observer, notify } => {
+                        monitors.push((observer, notify));
                     }
-                    Envelope::Demonitor(_) => {}
+                    Envelope::Demonitor(observer_id) => {
+                        monitors.retain(|(id, _)| *id != observer_id);
+                    }
                     Envelope::LinkedExit(peer, reason) => {
                         let trap = actor
                             .lock()
@@ -507,18 +570,19 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
                             .as_ref()
                             .map(|a| a.trap_exit())
                             .unwrap_or(false);
-                        if trap {
-                            tracing::debug!(%id, %peer, ?reason, "trapped linked exit");
-                            continue;
+                        if let Some(reason) = linked_exit_reason(id, peer, reason, trap) {
+                            exit_reason = reason;
+                            break;
                         }
-                        exit_reason = ExitReason::Linked(peer, Box::new(reason));
-                        break;
                     }
                     Envelope::Upgrade(new_impl) => {
+                        handlers.abort_all();
+                        while handlers.join_next().await.is_some() {}
+
                         let mut guard = actor.lock().await;
                         if let Some(inner) = guard.as_mut() {
                             *inner = new_impl;
-                            if let Err(e) = inner.dyn_pre_start().await {
+                            if let Err(e) = inner.dyn_on_upgrade(0).await {
                                 exit_reason = ExitReason::Error(e.to_string());
                                 break;
                             }
@@ -545,7 +609,7 @@ async fn run_actor_concurrent<M: Send + Sync + 'static>(
     let links = links.lock().await.clone();
 
     if let Some(actor) = actor {
-        finish_actor(id, actor, exit_reason, &config, &links, monitors).await;
+        finish_actor(id, actor, exit_reason, &links, monitors).await;
     } else {
         unregister_actor(id);
         ActorMonitor::global().mark_inactive(id);
@@ -557,7 +621,6 @@ async fn handle_message<M: Send + Sync + 'static>(
     actor: &mut Box<dyn DynActor<M>>,
     msg: M,
     config: &ActorConfig,
-    links: &[ActorId],
 ) -> Option<ExitReason> {
     let monitor = ActorMonitor::global();
     let started = Instant::now();
@@ -567,7 +630,6 @@ async fn handle_message<M: Send + Sync + 'static>(
         monitor.record_error(id);
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
-        propagate_linked_exit(id, &reason, links).await;
         return Some(reason);
     }
 
@@ -595,7 +657,6 @@ async fn handle_message<M: Send + Sync + 'static>(
                     limit_ms: limit.as_millis().min(u64::MAX as u128) as u64,
                 };
                 notify_supervisor(id, &reason).await;
-                propagate_linked_exit(id, &reason, links).await;
                 return Some(reason);
             }
         }
@@ -612,14 +673,12 @@ async fn handle_message<M: Send + Sync + 'static>(
             monitor.record_error(id);
             let reason = ExitReason::Error(e.to_string());
             notify_supervisor(id, &reason).await;
-            propagate_linked_exit(id, &reason, links).await;
             Some(reason)
         }
         Err(_) => {
             monitor.record_panic(id);
             let reason = ExitReason::Error("panic in handle".into());
             notify_supervisor(id, &reason).await;
-            propagate_linked_exit(id, &reason, links).await;
             Some(reason)
         }
     }
@@ -629,17 +688,48 @@ async fn finish_actor<M: Send + Sync + 'static>(
     id: ActorId,
     mut actor: Box<dyn DynActor<M>>,
     exit_reason: ExitReason,
-    _config: &ActorConfig,
-    links: &[ActorId],
+    links: &HashSet<ActorId>,
     monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)>,
 ) {
     let _ = actor.dyn_post_stop().await;
     for (_, notify) in monitors {
         let _ = notify.send(exit_reason.clone());
     }
-    propagate_linked_exit(id, &exit_reason, links).await;
+    if should_propagate_linked_exit(&exit_reason) {
+        propagate_linked_exit(id, &exit_reason, links).await;
+    }
     unregister_actor(id);
     ActorMonitor::global().mark_inactive(id);
+}
+
+fn should_propagate_linked_exit(reason: &ExitReason) -> bool {
+    !matches!(reason, ExitReason::Normal | ExitReason::Shutdown)
+}
+
+fn linked_exit_reason(
+    id: ActorId,
+    peer: ActorId,
+    reason: ExitReason,
+    trap: bool,
+) -> Option<ExitReason> {
+    if trap {
+        tracing::debug!(%id, %peer, ?reason, "trapped linked exit");
+        None
+    } else {
+        Some(ExitReason::Linked(peer, Box::new(reason)))
+    }
+}
+
+async fn register_link(self_id: ActorId, peer: ActorId, links: &mut HashSet<ActorId>) {
+    if links.insert(peer) {
+        send_reverse_link(self_id, peer).await;
+    }
+}
+
+async fn send_reverse_link(self_id: ActorId, peer: ActorId) {
+    if let Some(tx) = get_control_sender(peer) {
+        let _ = tx.send(ControlMsg::Link(self_id)).await;
+    }
 }
 
 async fn notify_supervisor(id: ActorId, reason: &ExitReason) {
@@ -653,11 +743,11 @@ async fn notify_supervisor(id: ActorId, reason: &ExitReason) {
     }
 }
 
-async fn propagate_linked_exit(id: ActorId, reason: &ExitReason, links: &[ActorId]) {
+async fn propagate_linked_exit(id: ActorId, reason: &ExitReason, links: &HashSet<ActorId>) {
     for peer in links {
-        if let Some(tx) = get_actor_sender(*peer) {
+        if let Some(tx) = get_control_sender(*peer) {
             let _ = tx
-                .send(Envelope::LinkedExit(id, reason.clone()))
+                .send(ControlMsg::LinkedExit(id, reason.clone()))
                 .await;
         }
     }
