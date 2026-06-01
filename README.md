@@ -6,7 +6,7 @@ OTP-style primitives in Rust: actors, supervision, linking, monitoring, distribu
 
 Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
 
-**Release notes:** [v0.0.4](READMEv0.0.4.md) · [v0.0.3](READMEv0.0.3.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
+**Release notes:** [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [v0.0.3](READMEv0.0.3.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
 
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 
@@ -68,7 +68,8 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
 | `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `SupervisorHandle::stop()` |
 | `registry.rs` | Unified `ACTORS` `DashMap` — control + supervisor channels registered atomically |
-| `distributed.rs` | Persistent TCP per peer, frame size limits, read timeouts, `Cluster` roster, `serve_actor` |
+| `distributed.rs` | Persistent TCP per peer, optional TLS, frame limits, `Cluster`, `serve_actor` |
+| `tls.rs` | rustls helpers — `MaybeTlsStream`, PEM loaders, `TlsAcceptor` / `TlsConnector` |
 | `hash_ring.rs` | `HashRing` / `RingNode` — MurmurHash3 consistent-hash (stable across builds) |
 | `config.rs` | `ActorConfig` mailbox + timeout tuning; `DistributedConfig` bridge, in-flight, frame limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
@@ -199,6 +200,25 @@ cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
 
 See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`) and [`horizontal_scaling_rest_for_one.md`](examples/horizontal_scaling_rest_for_one.md) (RestForOne processor + reporter per site, multi-send APIs).
 
+## TLS on distributed and mesh TCP (v0.0.5)
+
+Optional **rustls** encryption wraps the same length-prefixed JSON frames. Plain TCP is still the default when no TLS config is passed.
+
+| Layer | Server | Client |
+|-------|--------|--------|
+| Distributed | `Node::bind_tls_on_runtime`, `serve_actor_tls_on_runtime` | `RemoteActorRef::with_tls`, `Cluster::set_tls_connector` |
+| Service mesh | `MeshRegistryServer::bind_tls`, `serve_microservice_tls` | `MeshRegistryClient::with_tls`, `MeshRouter::with_registry_tls` |
+
+```rust
+use lane_switchboards::tls::{build_acceptor, build_connector, client_config_from_pem, server_config_from_pem};
+use std::sync::Arc;
+
+let acceptor = Arc::new(build_acceptor(server_config_from_pem("server.crt", "server.key", None)?));
+let connector = Arc::new(build_connector(client_config_from_pem(Some("ca.crt"), None, None)?));
+```
+
+See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes and [`tls_distributed.md`](examples/tls_distributed.md) (`cargo run --example tls_distributed`) for mermaid architecture diagrams.
+
 ## TCP service mesh
 
 Microservices over TCP with a **control plane** (register / discover) and **data plane** (route frames by service name).
@@ -318,7 +338,7 @@ SupervisorConfig {
 }
 ```
 
-See [READMEv0.0.4.md](READMEv0.0.4.md) for migration notes (hash ring remapping, mesh client API, `ServiceRecord.target`).
+See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping, mesh client API, `ServiceRecord.target`, TLS).
 
 ## Examples
 
@@ -335,6 +355,7 @@ See [READMEv0.0.4.md](READMEv0.0.4.md) for migration notes (hash ring remapping,
 | RestForOne calculator + timer (optimized macros) | `cargo run --example rest_for_one_calculator_timer_optimized` — see [rest_for_one_calculator_timer_optimized.md](examples/rest_for_one_calculator_timer_optimized.md) |
 | Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` — typed child keys (`ChildRegistry<M, K>`) + success-path latency probes |
 | Distributed messaging | `cargo run --example distributed_demo` |
+| Distributed messaging (TLS) | `cargo run --example tls_distributed` — see [tls_distributed.md](examples/tls_distributed.md) |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
 | TCP service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md), [serve_microservice.md](examples/serve_microservice.md) |

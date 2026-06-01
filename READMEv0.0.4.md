@@ -3,7 +3,8 @@
 Release notes for **v0.0.4** — production hardening across the registry, distributed TCP layer, consistent-hash ring, and service mesh.
 
 For the full project overview see [README.md](./README.md).  
-Previous release notes: [READMEv0.0.3.md](./READMEv0.0.3.md) · [READMEv0.0.2.md](./READMEv0.0.2.md)
+Previous release notes: [READMEv0.0.3.md](./READMEv0.0.3.md) · [READMEv0.0.2.md](./READMEv0.0.2.md)  
+**Next:** [READMEv0.0.5.md](./READMEv0.0.5.md) (TLS)
 
 **Ideas-first overview:** [docs/lane_switchboards_blog.md](./docs/lane_switchboards_blog.md)
 

@@ -31,6 +31,7 @@ rustls = "=0.23.26"
 tokio-rustls = "=0.26.1"
 rustls-pemfile = "=2.2.0"
 webpki-roots = "=0.26.8"
+rcgen = "0.13"
 
 [dev-dependencies]
 tokio = { version = "=1.38.0", features = ["full"] }
@@ -70,6 +71,10 @@ path = "examples/hot_upgrade.rs"
 [[example]]
 name = "distributed_demo"
 path = "examples/distributed_demo.rs"
+
+[[example]]
+name = "tls_distributed"
+path = "examples/tls_distributed.rs"
 
 [[example]]
 name = "horizontal_scaling"
