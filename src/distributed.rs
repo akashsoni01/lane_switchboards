@@ -7,7 +7,7 @@ use crate::hash_ring::{HashRing, RingNode};
 use crate::tls::{self, MaybeTlsStream};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -996,6 +996,84 @@ impl<M: RemoteMessage> Cluster<M> {
             .take(count)
             .collect()
     }
+
+    /// Remote refs for members tagged with datacenter `dc`.
+    pub fn dc_members(&self, dc: &str) -> Vec<&RemoteActorRef<M>> {
+        self.members
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.dc.as_deref() == Some(dc))
+            .map(|(i, _)| &self.refs[i])
+            .collect()
+    }
+
+    /// Hash-ring replica refs for `key` limited to datacenter `dc`.
+    ///
+    /// Members with `dc = None` are treated as belonging to `local_dc`.
+    /// When the ring yields fewer than `count` nodes, remaining slots are filled
+    /// from [`Self::dc_members`] / untagged local members.
+    pub fn dc_replicas_for_key<T: Hash>(
+        &self,
+        key: &T,
+        dc: &str,
+        local_dc: &str,
+        count: usize,
+    ) -> Vec<&RemoteActorRef<M>> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        for node in self.ring.get_nodes(key, self.refs.len()) {
+            if out.len() >= count {
+                break;
+            }
+            let Some(&idx) = self.refs_by_id.get(&node.id) else {
+                continue;
+            };
+            if member_effective_dc(&self.members[idx], local_dc) != dc {
+                continue;
+            }
+            if seen.insert(idx) {
+                out.push(&self.refs[idx]);
+            }
+        }
+
+        if out.len() < count {
+            for (idx, member) in self.members.iter().enumerate() {
+                if out.len() >= count {
+                    break;
+                }
+                let in_dc = match &member.dc {
+                    Some(name) => name == dc,
+                    None if dc == local_dc => true,
+                    None => false,
+                };
+                if in_dc && seen.insert(idx) {
+                    out.push(&self.refs[idx]);
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Distinct datacenter names in this cluster (`dc = None` → `local_dc`).
+    pub fn datacenters(&self, local_dc: &str) -> Vec<String> {
+        let mut dcs: Vec<String> = self
+            .members
+            .iter()
+            .map(|m| member_effective_dc(m, local_dc).to_string())
+            .collect();
+        dcs.sort();
+        dcs.dedup();
+        dcs
+    }
+}
+
+fn member_effective_dc<'a>(member: &'a ClusterMember, local_dc: &'a str) -> &'a str {
+    match &member.dc {
+        None => local_dc,
+        Some(dc) => dc.as_str(),
+    }
 }
 
 fn member_is_local_dc(member: &ClusterMember, local_dc: &str) -> bool {
@@ -1300,5 +1378,72 @@ mod ack_tests {
         // None dc counts as local
         let local_default = cluster.local_replicas_for_key(&key, 3, "any");
         assert!(!local_default.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dc_members_groups_by_tag() {
+        let a = serve_actor(
+            "a",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("a");
+        let b = serve_actor(
+            "b",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("b");
+
+        let mut cluster = Cluster::<RemotePing>::new();
+        cluster.join(a.member.clone());
+        cluster.join(
+            ClusterMember::new("b-west", &b.member.node_addr, "worker").with_dc("west"),
+        );
+
+        assert_eq!(cluster.dc_members("west").len(), 1);
+        assert_eq!(cluster.datacenters("local"), vec!["local", "west"]);
+    }
+
+    #[tokio::test]
+    async fn dc_replicas_for_key_includes_all_dc_members() {
+        let mut records = Vec::new();
+        for (id, dc) in [
+            ("east-1", "east"),
+            ("east-2", "east"),
+            ("west-1", "west"),
+            ("west-2", "west"),
+        ] {
+            let h = serve_actor(
+                id,
+                "127.0.0.1:0",
+                "worker",
+                PingCounter(Arc::new(AtomicU64::new(0))),
+            )
+            .await
+            .expect("serve");
+            let mut member = h.member.clone();
+            member.dc = Some(dc.into());
+            records.push((member, dc));
+        }
+
+        let mut cluster = Cluster::<RemotePing>::new();
+        for (member, _) in &records {
+            cluster.join(member.clone());
+        }
+
+        let key = "order-99";
+        assert_eq!(
+            cluster.dc_replicas_for_key(&key, "east", "local", 2).len(),
+            2
+        );
+        assert_eq!(
+            cluster.dc_replicas_for_key(&key, "west", "local", 2).len(),
+            2
+        );
     }
 }

@@ -260,6 +260,8 @@ pub struct ConsistencyConfig {
     pub local_rf: usize,
     /// Per-datacenter replication factors (for [`WriteConsistency::EachQuorum`]).
     pub dc_rfs: Vec<usize>,
+    /// Datacenter names parallel to [`Self::dc_rfs`] (for [`WriteConsistency::EachQuorum`]).
+    pub dc_names: Vec<String>,
     /// Name of this node's datacenter (for LOCAL_* levels).
     pub local_dc: String,
     pub write_cl: WriteConsistency,
@@ -273,6 +275,7 @@ impl Default for ConsistencyConfig {
             rf: 3,
             local_rf: 3,
             dc_rfs: vec![3],
+            dc_names: vec!["local".into()],
             local_dc: "local".into(),
             write_cl: WriteConsistency::LocalQuorum,
             read_cl: ReadConsistency::LocalQuorum,

@@ -1,8 +1,9 @@
 //! TCP service mesh: register microservice instances, discover by name, route via hash ring.
 
 use crate::consistency::{
-    is_local_only, is_local_only_read, is_paxos_read, read_acks_required, write_acks_required,
-    ConsistencyConfig, ConsistencyError, ReadConsistency, WriteConsistency,
+    each_quorum_acks_required, is_local_only, is_local_only_read, is_paxos_read,
+    read_acks_required, write_acks_required, ConsistencyConfig, ConsistencyError,
+    ReadConsistency, WriteConsistency,
 };
 use crate::config::DistributedConfig;
 use crate::distributed::{
@@ -278,6 +279,10 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             return Ok(());
         }
 
+        if config.write_cl == WriteConsistency::EachQuorum {
+            return fan_out_each_quorum(cluster, key, config, msg).await;
+        }
+
         let required = write_acks_required(
             config.write_cl,
             config.rf,
@@ -298,7 +303,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             });
         }
 
-        fan_out_quorum(&replicas, msg, required, config.ack_timeout).await
+        fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await
     }
 
     /// Read-side consistency: wait for R replica acks of receipt (not response data).
@@ -399,7 +404,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             });
         }
 
-        fan_out_quorum(&replicas, msg, required, config.ack_timeout).await
+        fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await
     }
 
     pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
@@ -442,7 +447,13 @@ fn consistency_from_io(_err: std::io::Error) -> ConsistencyError {
     }
 }
 
-async fn fan_out_quorum<M>(replicas: &[&RemoteActorRef<M>], msg: M, required: usize, timeout: Duration) -> Result<(), ConsistencyError>
+async fn fan_out_quorum<M>(
+    replicas: &[&RemoteActorRef<M>],
+    msg: M,
+    required: usize,
+    timeout: Duration,
+    dc: Option<String>,
+) -> Result<(), ConsistencyError>
 where
     M: RemoteMessage + Clone,
 {
@@ -473,9 +484,94 @@ where
         Ok(acks) => Err(ConsistencyError::NotEnoughAcks {
             required,
             received: acks,
-            dc: None,
+            dc,
         }),
         Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
+    }
+}
+
+async fn fan_out_each_quorum<M, T>(
+    cluster: &Cluster<M>,
+    key: &T,
+    config: &ConsistencyConfig,
+    msg: M,
+) -> Result<(), ConsistencyError>
+where
+    M: RemoteMessage + Clone,
+    T: Hash,
+{
+    let per_dc_required = each_quorum_acks_required(&config.dc_rfs)?;
+    let dc_names: Vec<String> = if config.dc_names.is_empty() {
+        cluster.datacenters(&config.local_dc)
+    } else {
+        config.dc_names.clone()
+    };
+
+    if dc_names.len() != config.dc_rfs.len() || dc_names.len() != per_dc_required.len() {
+        return Err(ConsistencyError::NotEnoughReplicas {
+            required: config.dc_rfs.len(),
+            available: dc_names.len(),
+        });
+    }
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for ((dc, &dc_rf), &required) in dc_names
+        .iter()
+        .zip(config.dc_rfs.iter())
+        .zip(per_dc_required.iter())
+    {
+        let replicas: Vec<RemoteActorRef<M>> = cluster
+            .dc_replicas_for_key(key, dc, &config.local_dc, dc_rf)
+            .into_iter()
+            .cloned()
+            .collect();
+
+        if replicas.len() < required {
+            return Err(ConsistencyError::NotEnoughReplicas {
+                required,
+                available: replicas.len(),
+            });
+        }
+
+        let dc = dc.clone();
+        let msg = msg.clone();
+        let timeout = config.ack_timeout;
+        let refs = replicas;
+        join_set.spawn(async move {
+            let slice: Vec<&RemoteActorRef<M>> = refs.iter().collect();
+            fan_out_quorum(&slice, msg, required, timeout, Some(dc)).await
+        });
+    }
+
+    let outcome = tokio::time::timeout(config.ack_timeout, async {
+        let mut first_err = None;
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(Err(e)) => {
+                    first_err.get_or_insert(e);
+                }
+                Ok(Ok(())) => {}
+                Err(_) => {
+                    first_err.get_or_insert(ConsistencyError::NotEnoughAcks {
+                        required: 1,
+                        received: 0,
+                        dc: None,
+                    });
+                }
+            }
+        }
+        first_err
+    })
+    .await;
+
+    join_set.abort_all();
+
+    match outcome {
+        Ok(None) => Ok(()),
+        Ok(Some(e)) => Err(e),
+        Err(_) => Err(ConsistencyError::Timeout {
+            after: config.ack_timeout,
+        }),
     }
 }
 
@@ -1153,5 +1249,71 @@ mod tests {
             ConsistencyError::NotEnoughReplicas { required: 2, available: 1 }
                 | ConsistencyError::NotEnoughAcks { required: 2, received: 1, .. }
         ));
+    }
+
+    fn record_with_dc(mut record: ServiceRecord, dc: &str) -> ServiceRecord {
+        record.dc = Some(dc.into());
+        record
+    }
+
+    #[tokio::test]
+    async fn invoke_each_quorum_requires_quorum_in_every_dc() {
+        let east1 = serve_microservice("orders", "east-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("east1");
+        let east2 = serve_microservice("orders", "east-2", "127.0.0.1:0", Echo)
+            .await
+            .expect("east2");
+        let west1 = serve_microservice("orders", "west-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("west1");
+        let west2 = serve_microservice("orders", "west-2", "127.0.0.1:0", Echo)
+            .await
+            .expect("west2");
+
+        let config = ConsistencyConfig {
+            rf: 4,
+            local_rf: 2,
+            dc_rfs: vec![2, 2],
+            dc_names: vec!["east".into(), "west".into()],
+            write_cl: WriteConsistency::EachQuorum,
+            ack_timeout: Duration::from_millis(500),
+            ..ConsistencyConfig::default()
+        };
+        let mut mesh = ServiceMesh::with_consistency(config);
+        mesh.register(record_with_dc(east1.record.clone(), "east"));
+        mesh.register(record_with_dc(east2.record.clone(), "east"));
+        mesh.register(record_with_dc(west1.record.clone(), "west"));
+        mesh.register(record_with_dc(west2.record.clone(), "west"));
+
+        let key = "order-99";
+        mesh.invoke_consistent("orders", &key, Ping("write".into()))
+            .await
+            .expect("each quorum all alive");
+
+        let east2_record = east2.record.clone();
+        drop(east2);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut dead_east = east2_record;
+        dead_east.address = "127.0.0.1:1".into();
+        mesh.register(dead_east);
+
+        let err = mesh
+            .invoke_consistent("orders", &key, Ping("degraded".into()))
+            .await
+            .expect_err("east lost a replica");
+        match err {
+            ConsistencyError::NotEnoughAcks {
+                dc: Some(dc),
+                required: 2,
+                ..
+            } => assert_eq!(dc, "east"),
+            ConsistencyError::NotEnoughReplicas {
+                required: 2,
+                available: 1,
+            } => {}
+            ConsistencyError::Timeout { .. } => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }
