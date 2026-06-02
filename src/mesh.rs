@@ -2,13 +2,15 @@
 
 use crate::consistency::{
     is_local_only, is_local_only_read, is_paxos_read, read_acks_required, write_acks_required,
-    ConsistencyConfig, ConsistencyError, WriteConsistency,
+    ConsistencyConfig, ConsistencyError, ReadConsistency, WriteConsistency,
 };
+use crate::config::DistributedConfig;
 use crate::distributed::{
     serve_actor, serve_actor_tls_on_runtime, Cluster, ClusterMember, NodeHandle, RemoteActorRef,
     RemoteMessage, TlsAcceptor,
 };
 use crate::hash_ring::HashRing;
+use crate::paxos::{PaxosProposer, PaxosReplica};
 use crate::tls::{self, MaybeTlsStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -300,7 +302,10 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     }
 
     /// Read-side consistency: wait for R replica acks of receipt (not response data).
-    pub async fn read_consistent<T: Hash>(
+    ///
+    /// For [`ReadConsistency::Serial`] / [`ReadConsistency::LocalSerial`], runs a Paxos
+    /// prepare round instead (see [`Self::read_serial_value`]).
+    pub async fn read_consistent<T: Hash + std::fmt::Debug>(
         &self,
         service: &str,
         key: &T,
@@ -311,7 +316,20 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     {
         let config = self.config_for(service);
         if is_paxos_read(config.read_cl) {
-            // Phase 5: PaxosProposer::read
+            self.read_serial_value(service, key).await.map(|_| ())
+        } else {
+            self.read_quorum(service, key, msg, config).await
+        }
+    }
+
+    /// Linearizable Paxos read returning the highest accepted value for `key`.
+    pub async fn read_serial_value<T: Hash + std::fmt::Debug>(
+        &self,
+        service: &str,
+        key: &T,
+    ) -> Result<Option<Vec<u8>>, ConsistencyError> {
+        let config = self.config_for(service);
+        if !is_paxos_read(config.read_cl) {
             return Err(ConsistencyError::NotEnoughAcks {
                 required: 1,
                 received: 0,
@@ -319,6 +337,52 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             });
         }
 
+        let cluster = &self.route(service).map_err(consistency_from_io)?.cluster;
+        let quorum = read_acks_required(config.read_cl, config.rf, config.local_rf)?;
+        let paxos_key = format!("{key:?}");
+
+        let replicas: Vec<PaxosReplica> = if config.read_cl == ReadConsistency::LocalSerial {
+            cluster
+                .local_replicas_for_key(key, config.rf, &config.local_dc)
+                .iter()
+                .map(|r| PaxosReplica {
+                    node_addr: r.node_addr.clone(),
+                    target: crate::paxos::paxos_target(service),
+                })
+                .collect()
+        } else {
+            cluster
+                .all_replicas_for_key(key)
+                .iter()
+                .map(|r| PaxosReplica {
+                    node_addr: r.node_addr.clone(),
+                    target: crate::paxos::paxos_target(service),
+                })
+                .collect()
+        };
+
+        if replicas.len() < quorum {
+            return Err(ConsistencyError::NotEnoughReplicas {
+                required: quorum,
+                available: replicas.len(),
+            });
+        }
+
+        PaxosProposer::new(DistributedConfig::default())
+            .read(&paxos_key, &replicas, quorum, config.ack_timeout)
+            .await
+    }
+
+    async fn read_quorum<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+        msg: M,
+        config: &ConsistencyConfig,
+    ) -> Result<(), ConsistencyError>
+    where
+        M: Clone,
+    {
         let cluster = &self.route(service).map_err(consistency_from_io)?.cluster;
         let required = read_acks_required(config.read_cl, config.rf, config.local_rf)?;
 
@@ -378,14 +442,9 @@ fn consistency_from_io(_err: std::io::Error) -> ConsistencyError {
     }
 }
 
-async fn fan_out_quorum<M: RemoteMessage>(
-    replicas: &[&RemoteActorRef<M>],
-    msg: M,
-    required: usize,
-    timeout: Duration,
-) -> Result<(), ConsistencyError>
+async fn fan_out_quorum<M>(replicas: &[&RemoteActorRef<M>], msg: M, required: usize, timeout: Duration) -> Result<(), ConsistencyError>
 where
-    M: Clone,
+    M: RemoteMessage + Clone,
 {
     let mut join_set = tokio::task::JoinSet::new();
     for replica in replicas {
@@ -931,7 +990,7 @@ impl<M: RemoteMessage> MeshRouter<M> {
         self.mesh.invoke_consistent(service, key, msg).await
     }
 
-    pub async fn read_consistent<T: Hash>(
+    pub async fn read_consistent<T: Hash + std::fmt::Debug>(
         &self,
         service: &str,
         key: &T,
@@ -941,6 +1000,14 @@ impl<M: RemoteMessage> MeshRouter<M> {
         M: Clone,
     {
         self.mesh.read_consistent(service, key, msg).await
+    }
+
+    pub async fn read_serial_value<T: Hash + std::fmt::Debug>(
+        &self,
+        service: &str,
+        key: &T,
+    ) -> Result<Option<Vec<u8>>, ConsistencyError> {
+        self.mesh.read_serial_value(service, key).await
     }
 
     pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>

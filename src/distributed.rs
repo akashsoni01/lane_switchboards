@@ -57,6 +57,82 @@ pub struct AckFrame {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Optional RPC payload (used by Paxos acceptors).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Inbound Paxos RPC dispatched outside the typed actor mailbox.
+pub struct PaxosRpc {
+    pub payload: serde_json::Value,
+    pub reply: oneshot::Sender<Result<serde_json::Value, String>>,
+}
+
+/// Returns true when `target` is a Paxos acceptor route (`__paxos__*`).
+pub fn is_paxos_target(target: &str) -> bool {
+    target.starts_with("__paxos__")
+}
+
+/// Length-prefixed JSON request/response for Paxos (same framing as data-plane frames).
+pub async fn paxos_request(
+    node_addr: &str,
+    target: &str,
+    payload: serde_json::Value,
+    timeout: Duration,
+    config: &DistributedConfig,
+    tls: Option<&TlsConnector>,
+) -> Result<serde_json::Value, ConsistencyError> {
+    let mut stream = tokio::time::timeout(timeout, tls::connect(node_addr, tls))
+        .await
+        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
+        .map_err(|_| ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        })?;
+
+    let frame_id = next_frame_id();
+    let frame = Frame {
+        target: target.to_string(),
+        payload,
+        frame_id,
+        expect_ack: true,
+    };
+    let body = serde_json::to_vec(&frame).map_err(|_| ConsistencyError::NotEnoughAcks {
+        required: 1,
+        received: 0,
+        dc: None,
+    })?;
+    tokio::time::timeout(timeout, write_length_prefixed_json(&mut stream, &body, config.max_frame_bytes))
+        .await
+        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
+        .map_err(|_| ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        })?;
+
+    let ack = tokio::time::timeout(timeout, read_ack_frame(&mut stream, config))
+        .await
+        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
+        .map_err(|_| ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        })?;
+
+    if ack.frame_id != frame_id || !ack.ok {
+        return Err(ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        });
+    }
+    ack.data.ok_or(ConsistencyError::NotEnoughAcks {
+        required: 1,
+        received: 0,
+        dc: None,
+    })
 }
 
 #[derive(Serialize)]
@@ -366,6 +442,7 @@ pub struct Node<M: RemoteMessage> {
     name: String,
     bind_addr: String,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
+    paxos: Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>>,
     _listener: JoinHandle<()>,
 }
 
@@ -412,7 +489,9 @@ impl<M: RemoteMessage> Node<M> {
         );
 
         let dispatch = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<M>>::new()));
+        let paxos = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<PaxosRpc>>::new()));
         let dispatch_c = dispatch.clone();
+        let paxos_c = paxos.clone();
         let in_flight = Arc::new(Semaphore::new(config.max_in_flight.max(1)));
         let conn_config = *config;
         let runtime = runtime.clone();
@@ -425,6 +504,7 @@ impl<M: RemoteMessage> Node<M> {
                     match listener.accept().await {
                         Ok((stream, peer)) => {
                             let table = dispatch_c.clone();
+                            let paxos_table = paxos_c.clone();
                             let in_flight = in_flight.clone();
                             let conn_runtime = runtime.clone();
                             let acceptor = tls_acceptor.clone();
@@ -434,6 +514,7 @@ impl<M: RemoteMessage> Node<M> {
                                         if let Err(e) = handle_conn(
                                             stream,
                                             table,
+                                            paxos_table,
                                             in_flight,
                                             conn_runtime,
                                             conn_config,
@@ -462,8 +543,21 @@ impl<M: RemoteMessage> Node<M> {
             name,
             bind_addr: actual_addr.to_string(),
             dispatch,
+            paxos,
             _listener: listener_task,
         })
+    }
+
+    pub async fn register_paxos(&self, target: impl Into<String>, tx: mpsc::Sender<PaxosRpc>) {
+        self.paxos.lock().await.insert(target.into(), tx);
+    }
+
+    pub async fn unregister_paxos(&self, target: &str) {
+        self.paxos.lock().await.remove(target);
+    }
+
+    pub(crate) fn paxos_dispatch(&self) -> Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>> {
+        self.paxos.clone()
     }
 
     pub fn address(&self) -> &str {
@@ -510,6 +604,7 @@ async fn read_u32_le_timeout<S: AsyncRead + Unpin>(
 async fn handle_conn<M: RemoteMessage>(
     stream: MaybeTlsStream,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
+    paxos: Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>>,
     in_flight: Arc<Semaphore>,
     runtime: Handle,
     config: DistributedConfig,
@@ -524,6 +619,55 @@ async fn handle_conn<M: RemoteMessage>(
         let frame: Frame = serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
+
+        if frame.expect_ack && is_paxos_target(&frame.target) {
+            let target = frame.target.clone();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let rpc = PaxosRpc {
+                payload: frame.payload,
+                reply: reply_tx,
+            };
+            let send_result = {
+                let tx = paxos.lock().await.get(&target).cloned();
+                if let Some(tx) = tx {
+                    tx.send(rpc).await.map_err(|_| "paxos handler closed".to_string())
+                } else {
+                    Err(format!("no paxos handler for target {target}"))
+                }
+            };
+
+            let ack = if send_result.is_ok() {
+                match tokio::time::timeout(config.read_timeout, reply_rx).await {
+                    Ok(Ok(Ok(data))) => AckFrame {
+                        frame_id: frame.frame_id,
+                        ok: true,
+                        error: None,
+                        data: Some(data),
+                    },
+                    Ok(Ok(Err(e))) => AckFrame {
+                        frame_id: frame.frame_id,
+                        ok: false,
+                        error: Some(e),
+                        data: None,
+                    },
+                    Ok(Err(_)) | Err(_) => AckFrame {
+                        frame_id: frame.frame_id,
+                        ok: false,
+                        error: Some("paxos handler dropped reply".into()),
+                        data: None,
+                    },
+                }
+            } else {
+                AckFrame {
+                    frame_id: frame.frame_id,
+                    ok: false,
+                    error: send_result.err(),
+                    data: None,
+                }
+            };
+            write_ack_frame(&mut writer, &ack, config.max_frame_bytes).await?;
+            continue;
+        }
 
         let msg: M = serde_json::from_value(frame.payload).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
@@ -548,6 +692,7 @@ async fn handle_conn<M: RemoteMessage>(
                 frame_id: frame.frame_id,
                 ok: send_result.is_ok(),
                 error: send_result.err(),
+                data: None,
             };
             write_ack_frame(&mut writer, &ack, config.max_frame_bytes).await?;
         } else {

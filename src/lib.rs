@@ -17,6 +17,7 @@ pub mod hash_ring;
 pub mod macros;
 pub mod mesh;
 pub mod monitor;
+pub mod paxos;
 pub mod registry;
 pub mod supervisor;
 pub mod tls;
@@ -45,6 +46,11 @@ pub use mesh::{
     join_mesh, serve_microservice, serve_microservice_tls, MeshControlMsg, MeshRegistry,
     MeshRegistryClient, MeshRegistryServer, MeshRouter, MicroserviceHandle, ServiceMesh,
     ServiceRecord, DEFAULT_RECORD_TTL,
+};
+pub use paxos::{
+    paxos_target, serve_paxos_acceptor, serve_paxos_acceptor_on_runtime, Accept, Commit,
+    PaxosAcceptor, PaxosHandle, PaxosMsg, PaxosNode, PaxosProposer, PaxosReplica, PaxosWireMsg,
+    Prepare, Promise, Propose, Reject,
 };
 pub use tls::{
     build_acceptor, build_connector, client_config_from_pem, connect as tls_connect,
