@@ -11,6 +11,16 @@ struct CounterV2 {
     label: String,
 }
 
+impl CounterV2 {
+    /// Build V2 from a V1 snapshot (count is read via `Get` before `upgrade`).
+    fn from_v1_count(count: u64) -> Self {
+        Self {
+            count,
+            label: format!("migrated from v1 (count was {count})"),
+        }
+    }
+}
+
 enum CounterMsg {
     Inc,
     Get(tokio::sync::oneshot::Sender<u64>),
@@ -62,14 +72,14 @@ async fn main() -> anyhow::Result<()> {
         .send(CounterMsg::Get(tx))
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    println!("V1 count: {}", rx.await?);
+    let v1_count = rx.await?;
+    println!("V1 count: {v1_count}");
 
-    // Hot upgrade: migrate state into V2
+    // Hot upgrade: carry V1 state into the new implementation (not a fresh counter).
+    let v2 = CounterV2::from_v1_count(v1_count);
+    println!("{}", v2.label);
     actor
-        .upgrade(CounterV2 {
-            count: 3,
-            label: "upgraded".into(),
-        })
+        .upgrade(v2)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
