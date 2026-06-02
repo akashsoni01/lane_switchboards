@@ -2,22 +2,29 @@
 
 use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr};
 use crate::config::{spawn_on, ActorConfig, DistributedConfig};
+use crate::consistency::ConsistencyError;
 use crate::hash_ring::{HashRing, RingNode};
 use crate::tls::{self, MaybeTlsStream};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 pub use tokio_rustls::TlsAcceptor;
+
+static FRAME_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_frame_id() -> u64 {
+    FRAME_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Messages that can traverse the network layer.
 pub trait RemoteMessage:
@@ -35,6 +42,21 @@ impl<T> RemoteMessage for T where
 pub struct Frame {
     pub target: String,
     pub payload: serde_json::Value,
+    /// Unique id for correlating [`AckFrame`] responses.
+    #[serde(default)]
+    pub frame_id: u64,
+    /// When true, the receiver writes an [`AckFrame`] after dispatch.
+    #[serde(default)]
+    pub expect_ack: bool,
+}
+
+/// Acknowledgement sent back when [`Frame::expect_ack`] is true.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AckFrame {
+    pub frame_id: u64,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -44,20 +66,15 @@ where
 {
     target: &'a str,
     payload: &'a M,
+    frame_id: u64,
+    expect_ack: bool,
 }
 
-async fn write_frame<M, S: AsyncWrite + Unpin>(
+async fn write_length_prefixed_json<S: AsyncWrite + Unpin>(
     stream: &mut S,
-    target: &str,
-    msg: &M,
+    body: &[u8],
     max_frame_bytes: u32,
-) -> std::io::Result<()>
-where
-    M: RemoteMessage,
-{
-    let body = serde_json::to_vec(&FrameOut { target, payload: msg }).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+) -> std::io::Result<()> {
     if body.len() > max_frame_bytes as usize {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -65,27 +82,97 @@ where
         ));
     }
     stream.write_u32_le(body.len() as u32).await?;
-    stream.write_all(&body).await?;
+    stream.write_all(body).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn read_length_prefixed_json<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    config: &DistributedConfig,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let Some(len) = read_u32_le_timeout(stream, config).await? else {
+        return Ok(None);
+    };
+    let mut buf = vec![0u8; len as usize];
+    tokio::time::timeout(config.read_timeout, stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "frame body read timed out")
+        })??;
+    Ok(Some(buf))
+}
+
+async fn write_frame<M, S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    target: &str,
+    msg: &M,
+    frame_id: u64,
+    expect_ack: bool,
+    max_frame_bytes: u32,
+) -> std::io::Result<()>
+where
+    M: RemoteMessage,
+{
+    let body = serde_json::to_vec(&FrameOut {
+        target,
+        payload: msg,
+        frame_id,
+        expect_ack,
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_length_prefixed_json(stream, &body, max_frame_bytes).await
+}
+
+async fn write_ack_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    ack: &AckFrame,
+    max_frame_bytes: u32,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(ack)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_length_prefixed_json(stream, &body, max_frame_bytes).await
+}
+
+async fn read_ack_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    config: &DistributedConfig,
+) -> std::io::Result<AckFrame> {
+    let body = read_length_prefixed_json(stream, config)
+        .await?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "missing ack"))?;
+    serde_json::from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+struct OutboundMsg<M: RemoteMessage> {
+    msg: M,
+    frame_id: u64,
+    expect_ack: bool,
+    ack_tx: Option<oneshot::Sender<Result<(), ConsistencyError>>>,
 }
 
 async fn remote_write_loop<M: RemoteMessage>(
     node_addr: String,
     target: String,
-    mut rx: mpsc::Receiver<M>,
+    mut rx: mpsc::Receiver<OutboundMsg<M>>,
     config: DistributedConfig,
     tls: Option<Arc<TlsConnector>>,
 ) {
-    const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+    const RECONNECT_BASE: Duration = Duration::from_millis(100);
+    const RECONNECT_MAX: Duration = Duration::from_secs(30);
+    let mut backoff = RECONNECT_BASE;
 
     loop {
         let mut stream = loop {
             match tls::connect(&node_addr, tls.as_deref()).await {
-                Ok(s) => break s,
+                Ok(s) => {
+                    backoff = RECONNECT_BASE;
+                    break s;
+                }
                 Err(e) => {
                     tracing::warn!(%node_addr, error = %e, "remote write reconnect failed");
-                    tokio::time::sleep(RECONNECT_DELAY).await;
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(RECONNECT_MAX);
                     if rx.is_closed() {
                         return;
                     }
@@ -94,23 +181,77 @@ async fn remote_write_loop<M: RemoteMessage>(
         };
 
         loop {
-            let msg = match rx.recv().await {
+            let outbound = match rx.recv().await {
                 Some(m) => m,
                 None => return,
             };
-            if write_frame(&mut stream, &target, &msg, config.max_frame_bytes)
-                .await
-                .is_err()
-            {
+
+            let write_result = write_frame(
+                &mut stream,
+                &target,
+                &outbound.msg,
+                outbound.frame_id,
+                outbound.expect_ack,
+                config.max_frame_bytes,
+            )
+            .await;
+
+            if write_result.is_err() {
                 tracing::warn!(%node_addr, "remote write failed — reconnecting");
+                if let Some(ack_tx) = outbound.ack_tx {
+                    let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
+                        required: 1,
+                        received: 0,
+                        dc: None,
+                    }));
+                }
                 break;
+            }
+
+            if outbound.expect_ack {
+                match read_ack_frame(&mut stream, &config).await {
+                    Ok(ack) if ack.frame_id == outbound.frame_id && ack.ok => {
+                        if let Some(ack_tx) = outbound.ack_tx {
+                            let _ = ack_tx.send(Ok(()));
+                        }
+                    }
+                    Ok(ack) if ack.frame_id == outbound.frame_id => {
+                        if let Some(ack_tx) = outbound.ack_tx {
+                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
+                                required: 1,
+                                received: 0,
+                                dc: None,
+                            }));
+                        }
+                    }
+                    Ok(_) => {
+                        if let Some(ack_tx) = outbound.ack_tx {
+                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
+                                required: 1,
+                                received: 0,
+                                dc: None,
+                            }));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(%node_addr, error = %e, "remote ack read failed");
+                        if let Some(ack_tx) = outbound.ack_tx {
+                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
+                                required: 1,
+                                received: 0,
+                                dc: None,
+                            }));
+                        }
+                        break;
+                    }
+                }
             }
         }
     }
 }
 
 struct PeerWriter<M: RemoteMessage> {
-    tx: mpsc::Sender<M>,
+    tx: mpsc::Sender<OutboundMsg<M>>,
     _task: JoinHandle<()>,
 }
 
@@ -163,10 +304,19 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
         }
     }
 
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
     pub async fn send(&self, msg: M) -> std::io::Result<()> {
         self.writer
             .tx
-            .send(msg)
+            .send(OutboundMsg {
+                msg,
+                frame_id: 0,
+                expect_ack: false,
+                ack_tx: None,
+            })
             .await
             .map_err(|_| {
                 std::io::Error::new(
@@ -174,6 +324,40 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
                     "remote peer write channel closed",
                 )
             })
+    }
+
+    /// Send with acknowledgement; waits up to `timeout` for the remote node to confirm dispatch.
+    pub async fn send_with_ack(
+        &self,
+        msg: M,
+        timeout: Duration,
+    ) -> Result<(), ConsistencyError> {
+        let frame_id = next_frame_id();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.writer
+            .tx
+            .send(OutboundMsg {
+                msg,
+                frame_id,
+                expect_ack: true,
+                ack_tx: Some(ack_tx),
+            })
+            .await
+            .map_err(|_| ConsistencyError::NotEnoughAcks {
+                required: 1,
+                received: 0,
+                dc: None,
+            })?;
+
+        match tokio::time::timeout(timeout, ack_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(ConsistencyError::NotEnoughAcks {
+                required: 1,
+                received: 0,
+                dc: None,
+            }),
+            Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
+        }
     }
 }
 
@@ -324,25 +508,20 @@ async fn read_u32_le_timeout<S: AsyncRead + Unpin>(
 }
 
 async fn handle_conn<M: RemoteMessage>(
-    mut stream: MaybeTlsStream,
+    stream: MaybeTlsStream,
     dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
     in_flight: Arc<Semaphore>,
     runtime: Handle,
     config: DistributedConfig,
 ) -> std::io::Result<()> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+
     loop {
-        let Some(len) = read_u32_le_timeout(&mut stream, &config).await? else {
+        let Some(body) = read_length_prefixed_json(&mut reader, &config).await? else {
             break;
         };
 
-        let mut buf = vec![0u8; len as usize];
-        tokio::time::timeout(config.read_timeout, stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::TimedOut, "frame body read timed out")
-            })??;
-
-        let frame: Frame = serde_json::from_slice(&buf).map_err(|e| {
+        let frame: Frame = serde_json::from_slice(&body).map_err(|e| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
 
@@ -350,25 +529,48 @@ async fn handle_conn<M: RemoteMessage>(
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
 
-        let permit = match in_flight.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(_) => break,
-        };
-
-        let table = dispatch.clone();
-        let target = frame.target;
-        spawn_on(Some(&runtime), async move {
-            let _permit = permit;
+        if frame.expect_ack {
+            let target = frame.target.clone();
             let tx = {
-                let table = table.lock().await;
+                let table = dispatch.lock().await;
                 table.get(&target).cloned()
             };
-            if let Some(tx) = tx {
-                let _ = tx.send(msg).await;
+            let send_result = if let Some(tx) = tx {
+                tx.send(msg).await.map(|_| ()).map_err(|_| {
+                    "actor mailbox closed".to_string()
+                })
             } else {
                 tracing::warn!(%target, "no local actor for frame target");
-            }
-        });
+                Err(format!("no local actor for frame target {target}"))
+            };
+
+            let ack = AckFrame {
+                frame_id: frame.frame_id,
+                ok: send_result.is_ok(),
+                error: send_result.err(),
+            };
+            write_ack_frame(&mut writer, &ack, config.max_frame_bytes).await?;
+        } else {
+            let permit = match in_flight.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+
+            let table = dispatch.clone();
+            let target = frame.target;
+            spawn_on(Some(&runtime), async move {
+                let _permit = permit;
+                let tx = {
+                    let table = table.lock().await;
+                    table.get(&target).cloned()
+                };
+                if let Some(tx) = tx {
+                    let _ = tx.send(msg).await;
+                } else {
+                    tracing::warn!(%target, "no local actor for frame target");
+                }
+            });
+        }
     }
     Ok(())
 }
@@ -379,6 +581,8 @@ pub struct ClusterMember {
     pub name: String,
     pub node_addr: String,
     pub target: String,
+    /// Datacenter tag; `None` is treated as the local DC.
+    pub dc: Option<String>,
 }
 
 impl ClusterMember {
@@ -391,7 +595,13 @@ impl ClusterMember {
             name: name.into(),
             node_addr: node_addr.into(),
             target: target.into(),
+            dc: None,
         }
+    }
+
+    pub fn with_dc(mut self, dc: impl Into<String>) -> Self {
+        self.dc = Some(dc.into());
+        self
     }
 
     pub fn remote_ref<M: RemoteMessage>(&self) -> RemoteActorRef<M> {
@@ -603,6 +813,51 @@ impl<M: RemoteMessage> Cluster<M> {
     pub fn ref_by_name(&self, name: &str) -> Option<&RemoteActorRef<M>> {
         self.refs_by_id.get(name).map(|&idx| &self.refs[idx])
     }
+
+    /// Replica refs for `key` walking the hash ring (up to `count`).
+    pub fn replicas_for_key<T: Hash>(&self, key: &T, count: usize) -> Vec<&RemoteActorRef<M>> {
+        self.ring
+            .get_nodes(key, count)
+            .into_iter()
+            .filter_map(|node| self.refs_by_id.get(&node.id).map(|&i| &self.refs[i]))
+            .collect()
+    }
+
+    /// All replica refs for `key` (every cluster member on the ring).
+    pub fn all_replicas_for_key<T: Hash>(&self, key: &T) -> Vec<&RemoteActorRef<M>> {
+        self.replicas_for_key(key, self.refs.len())
+    }
+
+    /// Replica refs for `key` limited to the local datacenter.
+    ///
+    /// Members with `dc = None` are treated as local. `local_dc` names the caller's DC.
+    pub fn local_replicas_for_key<T: Hash>(
+        &self,
+        key: &T,
+        count: usize,
+        local_dc: &str,
+    ) -> Vec<&RemoteActorRef<M>> {
+        self.ring
+            .get_nodes(key, self.refs.len())
+            .into_iter()
+            .filter_map(|node| {
+                let idx = *self.refs_by_id.get(&node.id)?;
+                if member_is_local_dc(&self.members[idx], local_dc) {
+                    Some(&self.refs[idx])
+                } else {
+                    None
+                }
+            })
+            .take(count)
+            .collect()
+    }
+}
+
+fn member_is_local_dc(member: &ClusterMember, local_dc: &str) -> bool {
+    match &member.dc {
+        None => true,
+        Some(dc) => dc == local_dc,
+    }
 }
 
 /// Local TCP node serving one actor target — use `member()` to join a [`Cluster`].
@@ -749,8 +1004,156 @@ where
             name: node_name,
             node_addr: address,
             target,
+            dc: None,
         },
         _node: node,
         _bridge: bridge,
     })
+}
+
+#[cfg(test)]
+mod ack_tests {
+    use super::*;
+    use crate::actor::{spawn, Actor, ActorProcessingErr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct RemotePing(u64);
+
+    struct PingCounter(Arc<AtomicU64>);
+
+    #[async_trait::async_trait]
+    impl Actor<RemotePing> for PingCounter {
+        async fn handle(&mut self, msg: RemotePing) -> Result<(), ActorProcessingErr> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            let _ = msg;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_with_ack_round_trip() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let handle = serve_actor(
+            "ack-node",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(counter.clone()),
+        )
+        .await
+        .expect("serve");
+
+        let remote = RemoteActorRef::<RemotePing>::new(&handle.member.node_addr, "worker");
+        remote
+            .send_with_ack(RemotePing(1), Duration::from_secs(2))
+            .await
+            .expect("ack");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_ack_times_out_when_mailbox_full() {
+        let node = Node::<RemotePing>::bind("blocked", "127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = node.address().to_string();
+
+        // Capacity 1, no consumer — second ack'd send blocks in handle_conn.
+        let (tx, _rx) = mpsc::channel(1);
+        node.register("worker", tx).await;
+
+        let remote = RemoteActorRef::<RemotePing>::new(&addr, "worker");
+        remote
+            .send_with_ack(RemotePing(1), Duration::from_secs(2))
+            .await
+            .expect("first ack");
+
+        let err = remote
+            .send_with_ack(RemotePing(2), Duration::from_millis(200))
+            .await
+            .expect_err("timeout");
+        assert!(matches!(err, ConsistencyError::Timeout { .. }));
+    }
+
+    #[tokio::test]
+    async fn fire_and_forget_send_without_ack() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let (actor_ref, _join) = spawn(PingCounter(counter.clone()), None)
+            .await
+            .expect("spawn");
+
+        let node = Node::<RemotePing>::bind("ff", "127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = node.address().to_string();
+        let (tx, mut rx) = mpsc::channel(8);
+        node.register("worker", tx).await;
+
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                let _ = actor_ref.send(msg).await;
+            }
+        });
+
+        let remote = RemoteActorRef::<RemotePing>::new(&addr, "worker");
+        remote.send(RemotePing(7)).await.expect("send");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn replicas_for_key_and_local_dc_filter() {
+        let a = serve_actor(
+            "a",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("a");
+        let b = serve_actor(
+            "b",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("b");
+        let c = serve_actor(
+            "c",
+            "127.0.0.1:0",
+            "worker",
+            PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("c");
+
+        let mut cluster = Cluster::<RemotePing>::new();
+        cluster.join(a.member.clone());
+        cluster.join(
+            ClusterMember::new("b-west", &b.member.node_addr, "worker").with_dc("west"),
+        );
+        cluster.join(
+            ClusterMember::new("c-east", &c.member.node_addr, "worker").with_dc("east"),
+        );
+
+        let key = "user-123";
+        assert_eq!(cluster.replicas_for_key(&key, 2).len(), 2);
+        assert_eq!(cluster.all_replicas_for_key(&key).len(), 3);
+
+        let local = cluster.local_replicas_for_key(&key, 2, "east");
+        assert!(local.len() <= 2);
+        for r in local {
+            assert!(r.target() == "worker");
+        }
+
+        // None dc counts as local
+        let local_default = cluster.local_replicas_for_key(&key, 3, "any");
+        assert!(!local_default.is_empty());
+    }
 }

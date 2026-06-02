@@ -1,5 +1,9 @@
 //! TCP service mesh: register microservice instances, discover by name, route via hash ring.
 
+use crate::consistency::{
+    is_local_only, is_local_only_read, is_paxos_read, read_acks_required, write_acks_required,
+    ConsistencyConfig, ConsistencyError, WriteConsistency,
+};
 use crate::distributed::{
     serve_actor, serve_actor_tls_on_runtime, Cluster, ClusterMember, NodeHandle, RemoteActorRef,
     RemoteMessage, TlsAcceptor,
@@ -44,6 +48,9 @@ pub struct ServiceRecord {
     pub address: String,
     /// TCP frame target on the remote node — unique per instance (typically `instance_id`).
     pub target: String,
+    /// Datacenter tag; `None` is treated as local everywhere.
+    #[serde(default)]
+    pub dc: Option<String>,
     /// Unix seconds when this record was last registered or renewed.
     #[serde(default)]
     pub registered_at: u64,
@@ -51,18 +58,22 @@ pub struct ServiceRecord {
 
 impl ServiceRecord {
     pub fn member(&self) -> ClusterMember {
-        ClusterMember::new(&self.instance_id, &self.address, &self.target)
+        let mut member = ClusterMember::new(&self.instance_id, &self.address, &self.target);
+        member.dc = self.dc.clone();
+        member
     }
 }
 
 /// Per-service routing table (hash ring over instances).
 struct ServiceRoute<M: RemoteMessage> {
     cluster: Cluster<M>,
+    consistency: Option<ConsistencyConfig>,
 }
 
 /// In-process mesh control plane + data-plane router.
 pub struct ServiceMesh<M: RemoteMessage> {
     routes: HashMap<String, ServiceRoute<M>>,
+    consistency: ConsistencyConfig,
 }
 
 impl<M: RemoteMessage> Default for ServiceMesh<M> {
@@ -73,9 +84,35 @@ impl<M: RemoteMessage> Default for ServiceMesh<M> {
 
 impl<M: RemoteMessage> ServiceMesh<M> {
     pub fn new() -> Self {
+        Self::with_consistency(ConsistencyConfig::default())
+    }
+
+    pub fn with_consistency(consistency: ConsistencyConfig) -> Self {
         Self {
             routes: HashMap::new(),
+            consistency,
         }
+    }
+
+    pub fn consistency(&self) -> &ConsistencyConfig {
+        &self.consistency
+    }
+
+    pub fn set_consistency(&mut self, config: ConsistencyConfig) {
+        self.consistency = config;
+    }
+
+    pub fn set_service_consistency(&mut self, service: &str, config: ConsistencyConfig) {
+        if let Some(route) = self.routes.get_mut(service) {
+            route.consistency = Some(config);
+        }
+    }
+
+    fn config_for(&self, service: &str) -> &ConsistencyConfig {
+        self.routes
+            .get(service)
+            .and_then(|r| r.consistency.as_ref())
+            .unwrap_or(&self.consistency)
     }
 
     pub fn services(&self) -> Vec<String> {
@@ -104,6 +141,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
                         instance_id: m.name.clone(),
                         address: m.node_addr.clone(),
                         target: m.target.clone(),
+                        dc: m.dc.clone(),
                         registered_at: 0,
                     })
                     .collect()
@@ -127,6 +165,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             .entry(service.clone())
             .or_insert_with(|| ServiceRoute {
                 cluster: Cluster::new(),
+                consistency: None,
             });
         let displaced = if route
             .cluster
@@ -139,6 +178,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
                 instance_id: member.name,
                 address: member.node_addr,
                 target: member.target,
+                dc: member.dc,
                 registered_at: 0,
             })
         } else {
@@ -159,6 +199,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             instance_id: member.name,
             address: member.node_addr,
             target: member.target,
+            dc: member.dc,
             registered_at: 0,
         })
     }
@@ -214,6 +255,89 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             .await
     }
 
+    /// Write with Cassandra-style consistency: fan out to replicas and wait for W acks.
+    pub async fn invoke_consistent<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+        msg: M,
+    ) -> Result<(), ConsistencyError>
+    where
+        M: Clone,
+    {
+        let config = self.config_for(service);
+        let cluster = &self.route(service).map_err(consistency_from_io)?.cluster;
+
+        if config.write_cl == WriteConsistency::Any {
+            cluster
+                .send_by_key(key, msg)
+                .await
+                .map_err(consistency_from_io)?;
+            return Ok(());
+        }
+
+        let required = write_acks_required(
+            config.write_cl,
+            config.rf,
+            config.local_rf,
+            Some(&config.dc_rfs),
+        )?;
+
+        let replicas: Vec<_> = if is_local_only(config.write_cl) {
+            cluster.local_replicas_for_key(key, config.rf, &config.local_dc)
+        } else {
+            cluster.replicas_for_key(key, config.rf)
+        };
+
+        if replicas.len() < required {
+            return Err(ConsistencyError::NotEnoughReplicas {
+                required,
+                available: replicas.len(),
+            });
+        }
+
+        fan_out_quorum(&replicas, msg, required, config.ack_timeout).await
+    }
+
+    /// Read-side consistency: wait for R replica acks of receipt (not response data).
+    pub async fn read_consistent<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+        msg: M,
+    ) -> Result<(), ConsistencyError>
+    where
+        M: Clone,
+    {
+        let config = self.config_for(service);
+        if is_paxos_read(config.read_cl) {
+            // Phase 5: PaxosProposer::read
+            return Err(ConsistencyError::NotEnoughAcks {
+                required: 1,
+                received: 0,
+                dc: None,
+            });
+        }
+
+        let cluster = &self.route(service).map_err(consistency_from_io)?.cluster;
+        let required = read_acks_required(config.read_cl, config.rf, config.local_rf)?;
+
+        let replicas: Vec<_> = if is_local_only_read(config.read_cl) {
+            cluster.local_replicas_for_key(key, config.rf, &config.local_dc)
+        } else {
+            cluster.replicas_for_key(key, config.rf)
+        };
+
+        if replicas.len() < required {
+            return Err(ConsistencyError::NotEnoughReplicas {
+                required,
+                available: replicas.len(),
+            });
+        }
+
+        fan_out_quorum(&replicas, msg, required, config.ack_timeout).await
+    }
+
     pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
     where
         M: Clone,
@@ -243,6 +367,56 @@ impl<M: RemoteMessage> ServiceMesh<M> {
                 format!("unknown service: {service}"),
             )
         })
+    }
+}
+
+fn consistency_from_io(_err: std::io::Error) -> ConsistencyError {
+    ConsistencyError::NotEnoughAcks {
+        required: 1,
+        received: 0,
+        dc: None,
+    }
+}
+
+async fn fan_out_quorum<M: RemoteMessage>(
+    replicas: &[&RemoteActorRef<M>],
+    msg: M,
+    required: usize,
+    timeout: Duration,
+) -> Result<(), ConsistencyError>
+where
+    M: Clone,
+{
+    let mut join_set = tokio::task::JoinSet::new();
+    for replica in replicas {
+        let replica = (*replica).clone();
+        let msg = msg.clone();
+        join_set.spawn(async move { replica.send_with_ack(msg, timeout).await });
+    }
+
+    let count = tokio::time::timeout(timeout, async {
+        let mut acks = 0usize;
+        while acks < required {
+            match join_set.join_next().await {
+                Some(Ok(Ok(()))) => acks += 1,
+                Some(Ok(Err(_))) | Some(Err(_)) => {}
+                None => break,
+            }
+        }
+        acks
+    })
+    .await;
+
+    join_set.abort_all();
+
+    match count {
+        Ok(acks) if acks >= required => Ok(()),
+        Ok(acks) => Err(ConsistencyError::NotEnoughAcks {
+            required,
+            received: acks,
+            dc: None,
+        }),
+        Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
     }
 }
 
@@ -287,6 +461,7 @@ where
             instance_id,
             address: node.address().to_string(),
             target,
+            dc: None,
             registered_at: 0,
         },
         _node: node,
@@ -328,6 +503,7 @@ where
             instance_id,
             address: node.address().to_string(),
             target,
+            dc: None,
             registered_at: 0,
         },
         _node: node,
@@ -697,6 +873,13 @@ impl<M: RemoteMessage> MeshRouter<M> {
         }
     }
 
+    pub fn with_consistency(config: ConsistencyConfig) -> Self {
+        Self {
+            mesh: ServiceMesh::with_consistency(config),
+            client: None,
+        }
+    }
+
     pub fn with_registry(registry_addr: impl Into<String>) -> Self {
         Self {
             mesh: ServiceMesh::new(),
@@ -708,6 +891,16 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::new(),
             client: Some(MeshRegistryClient::with_tls(registry_addr, tls)),
+        }
+    }
+
+    pub fn with_registry_and_consistency(
+        registry_addr: impl Into<String>,
+        config: ConsistencyConfig,
+    ) -> Self {
+        Self {
+            mesh: ServiceMesh::with_consistency(config),
+            client: Some(MeshRegistryClient::new(registry_addr)),
         }
     }
 
@@ -724,6 +917,30 @@ impl<M: RemoteMessage> MeshRouter<M> {
 
     pub async fn invoke<T: Hash>(&self, service: &str, key: &T, msg: M) -> std::io::Result<()> {
         self.mesh.invoke(service, key, msg).await
+    }
+
+    pub async fn invoke_consistent<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+        msg: M,
+    ) -> Result<(), ConsistencyError>
+    where
+        M: Clone,
+    {
+        self.mesh.invoke_consistent(service, key, msg).await
+    }
+
+    pub async fn read_consistent<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+        msg: M,
+    ) -> Result<(), ConsistencyError>
+    where
+        M: Clone,
+    {
+        self.mesh.read_consistent(service, key, msg).await
     }
 
     pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
@@ -798,6 +1015,7 @@ mod tests {
             instance_id: "inv-1".into(),
             address: "127.0.0.1:9999".into(),
             target: "inv-1".into(),
+            dc: None,
             registered_at: 0,
         };
         let mut client = MeshRegistryClient::new(&server.address);
@@ -820,5 +1038,53 @@ mod tests {
 
         mesh.apply_snapshot_diff(vec![a.record.clone()]);
         assert_eq!(mesh.instance_count("orders"), 1);
+    }
+
+    #[tokio::test]
+    async fn invoke_consistent_quorum_survives_one_replica_loss() {
+        let h1 = serve_microservice("echo", "echo-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("h1");
+        let h2 = serve_microservice("echo", "echo-2", "127.0.0.1:0", Echo)
+            .await
+            .expect("h2");
+        let h3 = serve_microservice("echo", "echo-3", "127.0.0.1:0", Echo)
+            .await
+            .expect("h3");
+
+        let config = ConsistencyConfig {
+            rf: 3,
+            local_rf: 3,
+            write_cl: WriteConsistency::Quorum,
+            ack_timeout: Duration::from_secs(2),
+            ..ConsistencyConfig::default()
+        };
+        let mut mesh = ServiceMesh::with_consistency(config);
+        mesh.register(h1.record.clone());
+        mesh.register(h2.record.clone());
+        mesh.register(h3.record.clone());
+
+        let key = "k";
+        mesh.invoke_consistent("echo", &key, Ping("all".into()))
+            .await
+            .expect("quorum with 3 nodes");
+
+        drop(h3);
+        mesh.deregister("echo", "echo-3");
+        mesh.invoke_consistent("echo", &key, Ping("two".into()))
+            .await
+            .expect("quorum with 2 of 3");
+
+        drop(h2);
+        mesh.deregister("echo", "echo-2");
+        let err = mesh
+            .invoke_consistent("echo", &key, Ping("one".into()))
+            .await
+            .expect_err("only one replica left");
+        assert!(matches!(
+            err,
+            ConsistencyError::NotEnoughReplicas { required: 2, available: 1 }
+                | ConsistencyError::NotEnoughAcks { required: 2, received: 1, .. }
+        ));
     }
 }

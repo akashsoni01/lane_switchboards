@@ -11,6 +11,7 @@
 
 pub mod actor;
 pub mod config;
+pub mod consistency;
 pub mod distributed;
 pub mod hash_ring;
 pub mod macros;
@@ -28,11 +29,16 @@ pub use config::{
     build_multi_thread_runtime, spawn_on, ActorConfig, DedicatedRuntime, DistributedConfig,
     RuntimeOptions,
 };
+pub use consistency::{
+    each_quorum_acks_required, is_local_only, is_local_only_read, is_paxos_read,
+    quorum_for, read_acks_required, write_acks_required, ConsistencyConfig, ConsistencyError,
+    ReadConsistency, WriteConsistency,
+};
 pub use monitor::{ActorMonitor, ActorStats};
 pub use distributed::{
     serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime,
-    serve_actor_tls_on_runtime, Cluster, ClusterMember, Frame, Node, NodeHandle, RemoteActorRef,
-    RemoteMessage, TlsAcceptor,
+    serve_actor_tls_on_runtime, AckFrame, Cluster, ClusterMember, Frame, Node, NodeHandle,
+    RemoteActorRef, RemoteMessage, TlsAcceptor,
 };
 pub use hash_ring::{HashRing, RingNode};
 pub use mesh::{
