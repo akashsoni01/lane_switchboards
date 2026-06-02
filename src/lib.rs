@@ -35,6 +35,8 @@ pub use consistency::{
     quorum_for, read_acks_required, write_acks_required, ConsistencyConfig, ConsistencyError,
     ReadConsistency, WriteConsistency,
 };
+#[cfg(feature = "metrics")]
+pub use consistency::ConsistencyMetrics;
 pub use monitor::{ActorMonitor, ActorStats};
 pub use distributed::{
     serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime,

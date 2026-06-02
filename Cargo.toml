@@ -12,6 +12,7 @@ include = [
     "README.md",
     "LICENSE",
     "src/**",
+    "docs/**",
 ]
 
 [dependencies]
@@ -32,6 +33,10 @@ tokio-rustls = "=0.26.1"
 rustls-pemfile = "=2.2.0"
 webpki-roots = "=0.26.8"
 rcgen = "0.13"
+
+[features]
+default = []
+metrics = []
 
 [dev-dependencies]
 tokio = { version = "=1.38.0", features = ["full"] }

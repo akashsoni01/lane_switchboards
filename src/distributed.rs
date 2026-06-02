@@ -403,6 +403,19 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
     }
 
     /// Send with acknowledgement; waits up to `timeout` for the remote node to confirm dispatch.
+    ///
+    /// Used by quorum write/read paths ([`WriteConsistency::Quorum`], etc.).
+    /// Fire-and-forget callers should use [`Self::send`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lane_switchboards::RemoteActorRef;
+    /// # use std::time::Duration;
+    /// # async fn example(r: RemoteActorRef<()>) -> Result<(), lane_switchboards::ConsistencyError> {
+    /// r.send_with_ack((), Duration::from_secs(1)).await
+    /// # }
+    /// ```
     pub async fn send_with_ack(
         &self,
         msg: M,

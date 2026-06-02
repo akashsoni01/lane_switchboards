@@ -90,6 +90,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         Self::with_consistency(ConsistencyConfig::default())
     }
 
+    /// Mesh with custom replication and consistency defaults for [`Self::invoke_consistent`].
     pub fn with_consistency(consistency: ConsistencyConfig) -> Self {
         Self {
             routes: HashMap::new(),
@@ -105,6 +106,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         self.consistency = config;
     }
 
+    /// Per-service override for [`Self::invoke_consistent`] / [`Self::read_consistent`].
     pub fn set_service_consistency(&mut self, service: &str, config: ConsistencyConfig) {
         if let Some(route) = self.routes.get_mut(service) {
             route.consistency = Some(config);
@@ -259,6 +261,18 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     }
 
     /// Write with Cassandra-style consistency: fan out to replicas and wait for W acks.
+    ///
+    /// Uses the mesh or per-service [`ConsistencyConfig::write_cl`]. For fire-and-forget
+    /// routing use [`Self::invoke`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lane_switchboards::{ConsistencyConfig, ServiceMesh, WriteConsistency};
+    /// # async fn example(mesh: &ServiceMesh<()>, key: &str) -> Result<(), lane_switchboards::ConsistencyError> {
+    /// mesh.invoke_consistent("orders", &key, ()).await
+    /// # }
+    /// ```
     pub async fn invoke_consistent<T: Hash>(
         &self,
         service: &str,
@@ -269,47 +283,127 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         M: Clone,
     {
         let config = self.config_for(service);
-        let cluster = &self.route(service).map_err(consistency_from_io)?.cluster;
+        let start = std::time::Instant::now();
+        let span = tracing::info_span!(
+            "mesh.invoke",
+            service = service,
+            consistency_level = ?config.write_cl,
+            replicas_contacted = tracing::field::Empty,
+            acks_received = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+        );
+        let _guard = span.enter();
 
-        if config.write_cl == WriteConsistency::Any {
-            cluster
-                .send_by_key(key, msg)
-                .await
-                .map_err(consistency_from_io)?;
-            return Ok(());
-        }
-
-        if config.write_cl == WriteConsistency::EachQuorum {
-            return fan_out_each_quorum(cluster, key, config, msg).await;
-        }
-
-        let required = write_acks_required(
-            config.write_cl,
-            config.rf,
-            config.local_rf,
-            Some(&config.dc_rfs),
-        )?;
-
-        let replicas: Vec<_> = if is_local_only(config.write_cl) {
-            cluster.local_replicas_for_key(key, config.rf, &config.local_dc)
-        } else {
-            cluster.replicas_for_key(key, config.rf)
+        let cluster = match self.route(service) {
+            Ok(route) => &route.cluster,
+            Err(e) => {
+                let result = Err(consistency_from_io(e));
+                finish_consistency_op(
+                    config,
+                    service,
+                    config.write_cl,
+                    0,
+                    0,
+                    0,
+                    start,
+                    &span,
+                    config.rf,
+                    &result,
+                );
+                return result;
+            }
         };
 
-        if replicas.len() < required {
-            return Err(ConsistencyError::NotEnoughReplicas {
-                required,
-                available: replicas.len(),
-            });
-        }
+        let (result, stats, required) = if config.write_cl == WriteConsistency::Any {
+            let result = cluster
+                .send_by_key(key, msg)
+                .await
+                .map_err(consistency_from_io);
+            (
+                result,
+                QuorumOutcome {
+                    acks_received: 0,
+                    replicas_contacted: 1,
+                    acks_required: 0,
+                },
+                0usize,
+            )
+        } else if config.write_cl == WriteConsistency::EachQuorum {
+            fan_out_each_quorum(cluster, key, config, msg).await
+        } else {
+            let required = write_acks_required(
+                config.write_cl,
+                config.rf,
+                config.local_rf,
+                Some(&config.dc_rfs),
+            );
+            match required {
+                Ok(required) => {
+                    let replicas: Vec<_> = if is_local_only(config.write_cl) {
+                        cluster.local_replicas_for_key(key, config.rf, &config.local_dc)
+                    } else {
+                        cluster.replicas_for_key(key, config.rf)
+                    };
 
-        fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await
+                    if replicas.len() < required {
+                        (
+                            Err(ConsistencyError::NotEnoughReplicas {
+                                required,
+                                available: replicas.len(),
+                            }),
+                            QuorumOutcome {
+                                acks_received: 0,
+                                replicas_contacted: replicas.len(),
+                                acks_required: required,
+                            },
+                            required,
+                        )
+                    } else {
+                        let (result, stats) =
+                            fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await;
+                        (result, stats, required)
+                    }
+                }
+                Err(e) => (
+                    Err(e),
+                    QuorumOutcome {
+                        acks_received: 0,
+                        replicas_contacted: 0,
+                        acks_required: 0,
+                    },
+                    0,
+                ),
+            }
+        };
+
+        finish_consistency_op(
+            config,
+            service,
+            config.write_cl,
+            required,
+            stats.acks_received,
+            stats.replicas_contacted,
+            start,
+            &span,
+            config.rf,
+            &result,
+        );
+        result
     }
 
     /// Read-side consistency: wait for R replica acks of receipt (not response data).
     ///
     /// For [`ReadConsistency::Serial`] / [`ReadConsistency::LocalSerial`], runs a Paxos
     /// prepare round instead (see [`Self::read_serial_value`]).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lane_switchboards::ServiceMesh;
+    /// # async fn example(mesh: &ServiceMesh<()>, key: &str) -> Result<(), lane_switchboards::ConsistencyError> {
+    /// mesh.read_consistent("orders", &key, ()).await
+    /// # }
+    /// ```
     pub async fn read_consistent<T: Hash + std::fmt::Debug>(
         &self,
         service: &str,
@@ -320,14 +414,89 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         M: Clone,
     {
         let config = self.config_for(service);
-        if is_paxos_read(config.read_cl) {
-            self.read_serial_value(service, key).await.map(|_| ())
+        let start = std::time::Instant::now();
+        let span = tracing::info_span!(
+            "mesh.read",
+            service = service,
+            consistency_level = ?config.read_cl,
+            replicas_contacted = tracing::field::Empty,
+            acks_received = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let (result, stats, required) = if is_paxos_read(config.read_cl) {
+            match self.read_serial_value(service, key).await {
+                Ok(_) => {
+                    let quorum = read_acks_required(config.read_cl, config.rf, config.local_rf)
+                        .unwrap_or(0);
+                    (
+                        Ok(()),
+                        QuorumOutcome {
+                            acks_received: quorum,
+                            replicas_contacted: quorum,
+                            acks_required: quorum,
+                        },
+                        quorum,
+                    )
+                }
+                Err(e) => {
+                    let quorum = read_acks_required(config.read_cl, config.rf, config.local_rf)
+                        .unwrap_or(0);
+                    (
+                        Err(e),
+                        QuorumOutcome {
+                            acks_received: 0,
+                            replicas_contacted: quorum,
+                            acks_required: quorum,
+                        },
+                        quorum,
+                    )
+                }
+            }
         } else {
-            self.read_quorum(service, key, msg, config).await
-        }
+            match self.read_quorum(service, key, msg, config).await {
+                Ok(stats) => {
+                    let required = stats.acks_required;
+                    (Ok(()), stats, required)
+                }
+                Err(e) => {
+                    let stats = quorum_stats_from_error(&e);
+                    let required = read_acks_required(config.read_cl, config.rf, config.local_rf)
+                        .unwrap_or(0);
+                    (Err(e), stats, required)
+                }
+            }
+        };
+
+        finish_consistency_op(
+            config,
+            service,
+            config.read_cl,
+            required,
+            stats.acks_received,
+            stats.replicas_contacted,
+            start,
+            &span,
+            config.rf,
+            &result,
+        );
+        result
     }
 
     /// Linearizable Paxos read returning the highest accepted value for `key`.
+    ///
+    /// Applies to [`ReadConsistency::Serial`] and [`ReadConsistency::LocalSerial`].
+    /// Returns `Ok(None)` when no value has been accepted yet.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lane_switchboards::ServiceMesh;
+    /// # async fn example(mesh: &ServiceMesh<()>, key: &str) -> Result<Option<Vec<u8>>, lane_switchboards::ConsistencyError> {
+    /// mesh.read_serial_value("orders", &key).await
+    /// # }
+    /// ```
     pub async fn read_serial_value<T: Hash + std::fmt::Debug>(
         &self,
         service: &str,
@@ -384,7 +553,7 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         key: &T,
         msg: M,
         config: &ConsistencyConfig,
-    ) -> Result<(), ConsistencyError>
+    ) -> Result<QuorumOutcome, ConsistencyError>
     where
         M: Clone,
     {
@@ -404,7 +573,12 @@ impl<M: RemoteMessage> ServiceMesh<M> {
             });
         }
 
-        fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await
+        let (result, stats) =
+            fan_out_quorum(&replicas, msg, required, config.ack_timeout, None).await;
+        result.map(|()| QuorumOutcome {
+            acks_required: required,
+            ..stats
+        })
     }
 
     pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
@@ -447,16 +621,87 @@ fn consistency_from_io(_err: std::io::Error) -> ConsistencyError {
     }
 }
 
+/// Ack counts collected during a quorum fan-out.
+struct QuorumOutcome {
+    acks_received: usize,
+    replicas_contacted: usize,
+    acks_required: usize,
+}
+
+impl QuorumOutcome {
+    fn new(replicas_contacted: usize) -> Self {
+        Self {
+            acks_received: 0,
+            replicas_contacted,
+            acks_required: 0,
+        }
+    }
+}
+
+fn quorum_stats_from_error(err: &ConsistencyError) -> QuorumOutcome {
+    match err {
+        ConsistencyError::NotEnoughAcks { received, .. } => QuorumOutcome {
+            acks_received: *received,
+            replicas_contacted: 0,
+            acks_required: 0,
+        },
+        _ => QuorumOutcome::new(0),
+    }
+}
+
+fn finish_consistency_op(
+    config: &ConsistencyConfig,
+    service: &str,
+    consistency_level: impl std::fmt::Debug,
+    acks_required: usize,
+    acks_received: usize,
+    replicas_contacted: usize,
+    start: std::time::Instant,
+    span: &tracing::Span,
+    rf: usize,
+    result: &Result<(), ConsistencyError>,
+) {
+    let latency = start.elapsed();
+    span.record("replicas_contacted", replicas_contacted);
+    span.record("acks_received", acks_received);
+    span.record("latency_ms", latency.as_millis() as u64);
+
+    if result.is_ok() && acks_received < rf && acks_required > 0 {
+        tracing::warn!(
+            service,
+            ?consistency_level,
+            acks_received,
+            rf,
+            "consistency operation succeeded with fewer acks than replication factor (degraded)"
+        );
+    }
+
+    #[cfg(feature = "metrics")]
+    crate::consistency::emit_metrics(
+        config,
+        service,
+        consistency_level,
+        acks_required,
+        acks_received,
+        replicas_contacted,
+        latency,
+        result.is_ok(),
+    );
+    #[cfg(not(feature = "metrics"))]
+    let _ = config;
+}
+
 async fn fan_out_quorum<M>(
     replicas: &[&RemoteActorRef<M>],
     msg: M,
     required: usize,
     timeout: Duration,
     dc: Option<String>,
-) -> Result<(), ConsistencyError>
+) -> (Result<(), ConsistencyError>, QuorumOutcome)
 where
     M: RemoteMessage + Clone,
 {
+    let replicas_contacted = replicas.len();
     let mut join_set = tokio::task::JoinSet::new();
     for replica in replicas {
         let replica = (*replica).clone();
@@ -479,7 +724,13 @@ where
 
     join_set.abort_all();
 
-    match count {
+    let stats = QuorumOutcome {
+        acks_received: count.as_ref().copied().unwrap_or(0),
+        replicas_contacted,
+        acks_required: required,
+    };
+
+    let result = match count {
         Ok(acks) if acks >= required => Ok(()),
         Ok(acks) => Err(ConsistencyError::NotEnoughAcks {
             required,
@@ -487,7 +738,9 @@ where
             dc,
         }),
         Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
-    }
+    };
+
+    (result, stats)
 }
 
 async fn fan_out_each_quorum<M, T>(
@@ -495,12 +748,21 @@ async fn fan_out_each_quorum<M, T>(
     key: &T,
     config: &ConsistencyConfig,
     msg: M,
-) -> Result<(), ConsistencyError>
+) -> (Result<(), ConsistencyError>, QuorumOutcome, usize)
 where
     M: RemoteMessage + Clone,
     T: Hash,
 {
-    let per_dc_required = each_quorum_acks_required(&config.dc_rfs)?;
+    let per_dc_required = match each_quorum_acks_required(&config.dc_rfs) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                Err(e),
+                QuorumOutcome::new(0),
+                0,
+            );
+        }
+    };
     let dc_names: Vec<String> = if config.dc_names.is_empty() {
         cluster.datacenters(&config.local_dc)
     } else {
@@ -508,11 +770,19 @@ where
     };
 
     if dc_names.len() != config.dc_rfs.len() || dc_names.len() != per_dc_required.len() {
-        return Err(ConsistencyError::NotEnoughReplicas {
-            required: config.dc_rfs.len(),
-            available: dc_names.len(),
-        });
+        return (
+            Err(ConsistencyError::NotEnoughReplicas {
+                required: config.dc_rfs.len(),
+                available: dc_names.len(),
+            }),
+            QuorumOutcome::new(0),
+            0,
+        );
     }
+
+    let total_required: usize = per_dc_required.iter().sum();
+    let mut total_replicas = 0usize;
+    let mut total_acks = 0usize;
 
     let mut join_set = tokio::task::JoinSet::new();
     for ((dc, &dc_rf), &required) in dc_names
@@ -526,11 +796,21 @@ where
             .cloned()
             .collect();
 
+        total_replicas += replicas.len();
+
         if replicas.len() < required {
-            return Err(ConsistencyError::NotEnoughReplicas {
-                required,
-                available: replicas.len(),
-            });
+            return (
+                Err(ConsistencyError::NotEnoughReplicas {
+                    required,
+                    available: replicas.len(),
+                }),
+                QuorumOutcome {
+                    acks_received: 0,
+                    replicas_contacted: total_replicas,
+                    acks_required: total_required,
+                },
+                total_required,
+            );
         }
 
         let dc = dc.clone();
@@ -547,10 +827,13 @@ where
         let mut first_err = None;
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok(Err(e)) => {
+                Ok((Ok(()), stats)) => {
+                    total_acks += stats.acks_received;
+                }
+                Ok((Err(e), stats)) => {
+                    total_acks += stats.acks_received;
                     first_err.get_or_insert(e);
                 }
-                Ok(Ok(())) => {}
                 Err(_) => {
                     first_err.get_or_insert(ConsistencyError::NotEnoughAcks {
                         required: 1,
@@ -566,13 +849,21 @@ where
 
     join_set.abort_all();
 
-    match outcome {
+    let stats = QuorumOutcome {
+        acks_received: total_acks,
+        replicas_contacted: total_replicas,
+        acks_required: total_required,
+    };
+
+    let result = match outcome {
         Ok(None) => Ok(()),
         Ok(Some(e)) => Err(e),
         Err(_) => Err(ConsistencyError::Timeout {
             after: config.ack_timeout,
         }),
-    }
+    };
+
+    (result, stats, total_required)
 }
 
 /// Handle returned when a microservice instance is bound to TCP.
@@ -1028,6 +1319,7 @@ impl<M: RemoteMessage> MeshRouter<M> {
         }
     }
 
+    /// Sidecar router with a custom [`ConsistencyConfig`] (no registry client).
     pub fn with_consistency(config: ConsistencyConfig) -> Self {
         Self {
             mesh: ServiceMesh::with_consistency(config),
@@ -1086,6 +1378,7 @@ impl<M: RemoteMessage> MeshRouter<M> {
         self.mesh.invoke_consistent(service, key, msg).await
     }
 
+    /// Read with configured [`ReadConsistency`] (including Paxos for `SERIAL` levels).
     pub async fn read_consistent<T: Hash + std::fmt::Debug>(
         &self,
         service: &str,
@@ -1315,5 +1608,38 @@ mod tests {
             ConsistencyError::Timeout { .. } => {}
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[cfg(feature = "metrics")]
+    #[tokio::test]
+    async fn invoke_consistent_emits_metrics_callback() {
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_cb = Arc::clone(&captured);
+        let config = ConsistencyConfig {
+            rf: 1,
+            local_rf: 1,
+            write_cl: WriteConsistency::One,
+            ack_timeout: Duration::from_secs(2),
+            on_metrics: Some(Arc::new(move |m| captured_cb.lock().unwrap().push(m))),
+            ..ConsistencyConfig::default()
+        };
+
+        let h = serve_microservice("metrics-echo", "m-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("echo");
+        let mut mesh = ServiceMesh::with_consistency(config);
+        mesh.register(h.record.clone());
+
+        mesh.invoke_consistent("metrics-echo", &"k", Ping("x".into()))
+            .await
+            .expect("invoke");
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].succeeded);
+        assert_eq!(events[0].service, "metrics-echo");
+        assert_eq!(events[0].acks_required, 1);
     }
 }

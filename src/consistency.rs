@@ -3,42 +3,64 @@
 //! These types describe how many replica acknowledgements are required for
 //! writes and reads. The mesh uses them to fan out to replicas and wait for
 //! quorum before returning.
+//!
+//! # Example
+//!
+//! ```
+//! use lane_switchboards::{ConsistencyConfig, WriteConsistency, ReadConsistency};
+//!
+//! let cfg = ConsistencyConfig {
+//!     write_cl: WriteConsistency::Quorum,
+//!     read_cl: ReadConsistency::Quorum,
+//!     ..Default::default()
+//! };
+//! ```
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+#[cfg(feature = "metrics")]
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Write-side consistency level (W).
+///
+/// Used by [`crate::ServiceMesh::invoke_consistent`] to decide how many replica
+/// acks are required before a write returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WriteConsistency {
     /// Fire-and-forget to any replica; hinted handoff counts as success.
+    /// Example: `write_cl = WriteConsistency::Any` — no ack wait.
     Any,
-    /// Wait for one replica to acknowledge.
+    /// Wait for one replica to acknowledge. Applies to all single-replica writes.
     One,
-    /// Wait for two replicas to acknowledge.
+    /// Wait for two replicas to acknowledge. Requires `rf >= 2`.
     Two,
-    /// Wait for three replicas to acknowledge.
+    /// Wait for three replicas to acknowledge. Requires `rf >= 3`.
     Three,
-    /// Wait for one replica in the local datacenter.
+    /// Wait for one replica in the local datacenter (`LOCAL_*` levels).
     LocalOne,
     /// Wait for a quorum of replicas in the local datacenter.
     LocalQuorum,
     /// Wait for a quorum of replicas cluster-wide.
     Quorum,
-    /// Wait for a quorum in **each** datacenter (requires `dc_rfs`).
+    /// Wait for a quorum in **each** datacenter; requires [`ConsistencyConfig::dc_rfs`].
     EachQuorum,
-    /// Wait for all replicas to acknowledge.
+    /// Wait for all replicas to acknowledge. Requires every replica to respond.
     All,
 }
 
 /// Read-side consistency level (R).
+///
+/// Used by [`crate::ServiceMesh::read_consistent`] and
+/// [`crate::ServiceMesh::read_serial_value`]. [`ReadConsistency::Serial`] and
+/// [`ReadConsistency::LocalSerial`] use the Paxos prepare path instead of simple quorum acks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReadConsistency {
     /// Read from one replica.
     One,
-    /// Read from two replicas.
+    /// Read from two replicas. Requires `rf >= 2`.
     Two,
-    /// Read from three replicas.
+    /// Read from three replicas. Requires `rf >= 3`.
     Three,
     /// Read from one replica in the local datacenter.
     LocalOne,
@@ -46,7 +68,7 @@ pub enum ReadConsistency {
     LocalQuorum,
     /// Read from a quorum of replicas cluster-wide.
     Quorum,
-    /// Linearizable read via Paxos (cluster-wide).
+    /// Linearizable read via Paxos (cluster-wide). Use with [`crate::paxos::PaxosProposer::read`].
     Serial,
     /// Linearizable read via Paxos (local datacenter only).
     LocalSerial,
@@ -55,6 +77,9 @@ pub enum ReadConsistency {
 }
 
 /// Errors raised when consistency requirements cannot be met.
+///
+/// Returned by [`crate::ServiceMesh::invoke_consistent`],
+/// [`crate::ServiceMesh::read_consistent`], and quorum helper functions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsistencyError {
     /// Fewer replicas are reachable than the level requires.
@@ -63,13 +88,16 @@ pub enum ConsistencyError {
         available: usize,
     },
     /// Not enough replicas acknowledged within the timeout.
+    ///
+    /// For [`WriteConsistency::EachQuorum`], `dc` names the datacenter that failed.
     NotEnoughAcks {
         required: usize,
         received: usize,
         /// Set for [`WriteConsistency::EachQuorum`] DC-level failures.
         dc: Option<String>,
     },
-    /// Paxos prepare/propose rounds exhausted due to contention.
+    /// Paxos prepare/propose rounds exhausted due to contention
+    /// ([`ReadConsistency::Serial`] / [`ReadConsistency::LocalSerial`]).
     PaxosContention { rounds: usize },
     /// Operation timed out waiting for acknowledgements.
     Timeout { after: Duration },
@@ -117,7 +145,33 @@ impl From<ConsistencyError> for std::io::Error {
     }
 }
 
+/// Snapshot of a completed consistency operation (opt-in via the `metrics` feature).
+///
+/// Emitted through [`ConsistencyConfig::on_metrics`] after each
+/// [`crate::ServiceMesh::invoke_consistent`] or [`crate::ServiceMesh::read_consistent`] call.
+#[cfg(feature = "metrics")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsistencyMetrics {
+    /// Acknowledgements required for the configured level.
+    pub acks_required: usize,
+    /// Acknowledgements actually received before return.
+    pub acks_received: usize,
+    /// Replica endpoints contacted (fan-out size).
+    pub replicas_contacted: usize,
+    /// Wall-clock duration of the operation in milliseconds.
+    pub duration_ms: u64,
+    /// Debug representation of the write or read consistency level used.
+    pub consistency_level: String,
+    /// Service name passed to the mesh invoke/read call.
+    pub service: String,
+    /// Whether the operation returned `Ok(())`.
+    pub succeeded: bool,
+}
+
 /// Returns the quorum size for a replication factor: `floor(rf / 2) + 1`.
+///
+/// Used by [`WriteConsistency::Quorum`], [`WriteConsistency::LocalQuorum`],
+/// [`ReadConsistency::Quorum`], and [`WriteConsistency::EachQuorum`] per-DC math.
 ///
 /// # Example
 ///
@@ -131,6 +185,9 @@ pub fn quorum_for(rf: usize) -> usize {
 }
 
 /// Per-datacenter quorum requirements for [`WriteConsistency::EachQuorum`].
+///
+/// Returns one quorum size per entry in `dc_rfs`. Used internally by
+/// [`crate::ServiceMesh::invoke_consistent`] when `write_cl = EachQuorum`.
 pub fn each_quorum_acks_required(dc_rfs: &[usize]) -> Result<Vec<usize>, ConsistencyError> {
     if dc_rfs.is_empty() {
         return Err(ConsistencyError::NotEnoughReplicas {
@@ -155,7 +212,15 @@ pub fn each_quorum_acks_required(dc_rfs: &[usize]) -> Result<Vec<usize>, Consist
 /// Number of write acknowledgements required for `cl` given replication factors.
 ///
 /// For [`WriteConsistency::EachQuorum`], pass `dc_rfs`; the return value is the
-/// sum of per-DC quorum requirements (Phase 6 uses per-DC values separately).
+/// sum of per-DC quorum requirements (Phase 6 uses per-DC values separately via
+/// [`each_quorum_acks_required`]).
+///
+/// # Example
+///
+/// ```
+/// use lane_switchboards::{write_acks_required, WriteConsistency};
+/// assert_eq!(write_acks_required(WriteConsistency::Quorum, 3, 3, None).unwrap(), 2);
+/// ```
 pub fn write_acks_required(
     cl: WriteConsistency,
     rf: usize,
@@ -194,6 +259,13 @@ pub fn write_acks_required(
 ///
 /// [`ReadConsistency::Serial`] and [`ReadConsistency::LocalSerial`] return the
 /// Paxos quorum size; use [`is_paxos_read`] to select the Paxos code path.
+///
+/// # Example
+///
+/// ```
+/// use lane_switchboards::{read_acks_required, ReadConsistency};
+/// assert_eq!(read_acks_required(ReadConsistency::Quorum, 3, 3).unwrap(), 2);
+/// ```
 pub fn read_acks_required(
     cl: ReadConsistency,
     rf: usize,
@@ -228,6 +300,8 @@ pub fn read_acks_required(
 }
 
 /// Returns `true` for [`ReadConsistency::Serial`] and [`ReadConsistency::LocalSerial`].
+///
+/// When true, [`crate::ServiceMesh::read_consistent`] delegates to Paxos instead of quorum acks.
 pub fn is_paxos_read(cl: ReadConsistency) -> bool {
     matches!(
         cl,
@@ -236,6 +310,8 @@ pub fn is_paxos_read(cl: ReadConsistency) -> bool {
 }
 
 /// Returns `true` for write levels scoped to the local datacenter.
+///
+/// Applies to [`WriteConsistency::LocalOne`] and [`WriteConsistency::LocalQuorum`].
 pub fn is_local_only(cl: WriteConsistency) -> bool {
     matches!(
         cl,
@@ -244,6 +320,9 @@ pub fn is_local_only(cl: WriteConsistency) -> bool {
 }
 
 /// Returns `true` for read levels scoped to the local datacenter.
+///
+/// Applies to [`ReadConsistency::LocalOne`], [`ReadConsistency::LocalQuorum`], and
+/// [`ReadConsistency::LocalSerial`].
 pub fn is_local_only_read(cl: ReadConsistency) -> bool {
     matches!(
         cl,
@@ -252,22 +331,82 @@ pub fn is_local_only_read(cl: ReadConsistency) -> bool {
 }
 
 /// Replication and consistency defaults for mesh operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Configure once on [`crate::ServiceMesh::with_consistency`] or override per service via
+/// [`crate::ServiceMesh::set_service_consistency`].
+///
+/// # Example
+///
+/// ```
+/// use lane_switchboards::{ConsistencyConfig, WriteConsistency, ReadConsistency};
+///
+/// let cfg = ConsistencyConfig {
+///     rf: 3,
+///     write_cl: WriteConsistency::LocalQuorum,
+///     read_cl: ReadConsistency::LocalQuorum,
+///     ..Default::default()
+/// };
+/// ```
+#[derive(Clone)]
 pub struct ConsistencyConfig {
-    /// Cluster-wide replication factor.
+    /// Cluster-wide replication factor (`N` in the W + R > N formula).
     pub rf: usize,
-    /// Replication factor in the local datacenter.
+    /// Replication factor in the local datacenter (for `LOCAL_*` levels).
     pub local_rf: usize,
     /// Per-datacenter replication factors (for [`WriteConsistency::EachQuorum`]).
     pub dc_rfs: Vec<usize>,
     /// Datacenter names parallel to [`Self::dc_rfs`] (for [`WriteConsistency::EachQuorum`]).
     pub dc_names: Vec<String>,
-    /// Name of this node's datacenter (for LOCAL_* levels).
+    /// Name of this node's datacenter (for `LOCAL_*` levels and untagged replicas).
     pub local_dc: String,
+    /// Default write consistency for [`crate::ServiceMesh::invoke_consistent`].
     pub write_cl: WriteConsistency,
+    /// Default read consistency for [`crate::ServiceMesh::read_consistent`].
     pub read_cl: ReadConsistency,
+    /// Maximum time to wait for required acks on a single invoke/read.
     pub ack_timeout: Duration,
+    /// Optional callback invoked after each consistency operation when the `metrics` feature is enabled.
+    #[cfg(feature = "metrics")]
+    pub on_metrics: Option<Arc<dyn Fn(ConsistencyMetrics) + Send + Sync>>,
 }
+
+impl fmt::Debug for ConsistencyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut dbg = f.debug_struct("ConsistencyConfig");
+        dbg.field("rf", &self.rf)
+            .field("local_rf", &self.local_rf)
+            .field("dc_rfs", &self.dc_rfs)
+            .field("dc_names", &self.dc_names)
+            .field("local_dc", &self.local_dc)
+            .field("write_cl", &self.write_cl)
+            .field("read_cl", &self.read_cl)
+            .field("ack_timeout", &self.ack_timeout);
+        #[cfg(feature = "metrics")]
+        dbg.field(
+            "on_metrics",
+            &self
+                .on_metrics
+                .as_ref()
+                .map(|_| "<callback>"),
+        );
+        dbg.finish()
+    }
+}
+
+impl PartialEq for ConsistencyConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.rf == other.rf
+            && self.local_rf == other.local_rf
+            && self.dc_rfs == other.dc_rfs
+            && self.dc_names == other.dc_names
+            && self.local_dc == other.local_dc
+            && self.write_cl == other.write_cl
+            && self.read_cl == other.read_cl
+            && self.ack_timeout == other.ack_timeout
+    }
+}
+
+impl Eq for ConsistencyConfig {}
 
 impl Default for ConsistencyConfig {
     fn default() -> Self {
@@ -280,7 +419,33 @@ impl Default for ConsistencyConfig {
             write_cl: WriteConsistency::LocalQuorum,
             read_cl: ReadConsistency::LocalQuorum,
             ack_timeout: Duration::from_secs(5),
+            #[cfg(feature = "metrics")]
+            on_metrics: None,
         }
+    }
+}
+
+#[cfg(feature = "metrics")]
+pub(crate) fn emit_metrics(
+    config: &ConsistencyConfig,
+    service: &str,
+    consistency_level: impl fmt::Debug,
+    acks_required: usize,
+    acks_received: usize,
+    replicas_contacted: usize,
+    duration: Duration,
+    succeeded: bool,
+) {
+    if let Some(cb) = &config.on_metrics {
+        cb(ConsistencyMetrics {
+            acks_required,
+            acks_received,
+            replicas_contacted,
+            duration_ms: duration.as_millis() as u64,
+            consistency_level: format!("{consistency_level:?}"),
+            service: service.to_string(),
+            succeeded,
+        });
     }
 }
 

@@ -27,12 +27,14 @@ pub fn paxos_target(service: &str) -> String {
     format!("__paxos__{service}")
 }
 
+/// Prepare phase message for Paxos reads ([`ReadConsistency::Serial`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Prepare {
     pub ballot: u64,
     pub key: String,
 }
 
+/// Acceptor response to [`Prepare`] carrying the highest accepted value, if any.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Promise {
     pub ballot: u64,
@@ -214,6 +216,19 @@ impl PaxosProposer {
     }
 
     /// Run Prepare against a quorum and return the highest accepted value, if any.
+    ///
+    /// Used by [`crate::ServiceMesh::read_serial_value`] for
+    /// [`ReadConsistency::Serial`] / [`ReadConsistency::LocalSerial`].
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use lane_switchboards::{PaxosProposer, PaxosReplica};
+    /// # use std::time::Duration;
+    /// # async fn example(replicas: &[PaxosReplica]) -> Result<Option<Vec<u8>>, lane_switchboards::ConsistencyError> {
+    /// PaxosProposer::default().read("my-key", replicas, 2, Duration::from_secs(5)).await
+    /// # }
+    /// ```
     pub async fn read(
         &self,
         key: &str,
