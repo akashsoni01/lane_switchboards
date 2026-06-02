@@ -1,0 +1,824 @@
+//! TCP service mesh: register microservice instances, discover by name, route via hash ring.
+
+use crate::distributed::{
+    serve_actor, serve_actor_tls_on_runtime, Cluster, ClusterMember, NodeHandle, RemoteActorRef,
+    RemoteMessage, TlsAcceptor,
+};
+use crate::hash_ring::HashRing;
+use crate::tls::{self, MaybeTlsStream};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
+use tokio_rustls::TlsConnector;
+
+/// Max inbound control-plane frame size (registration/list replies are small JSON).
+const MAX_CONTROL_FRAME: u32 = 64 * 1024;
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Records must be renewed via `Register` within this window or the registry evicts them.
+pub const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(30);
+const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn record_expired(record: &ServiceRecord, now: u64, ttl: Duration) -> bool {
+    let age = now.saturating_sub(record.registered_at);
+    age > ttl.as_secs()
+}
+
+/// A running microservice instance (data-plane endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceRecord {
+    pub service: String,
+    pub instance_id: String,
+    pub address: String,
+    /// TCP frame target on the remote node — unique per instance (typically `instance_id`).
+    pub target: String,
+    /// Unix seconds when this record was last registered or renewed.
+    #[serde(default)]
+    pub registered_at: u64,
+}
+
+impl ServiceRecord {
+    pub fn member(&self) -> ClusterMember {
+        ClusterMember::new(&self.instance_id, &self.address, &self.target)
+    }
+}
+
+/// Per-service routing table (hash ring over instances).
+struct ServiceRoute<M: RemoteMessage> {
+    cluster: Cluster<M>,
+}
+
+/// In-process mesh control plane + data-plane router.
+pub struct ServiceMesh<M: RemoteMessage> {
+    routes: HashMap<String, ServiceRoute<M>>,
+}
+
+impl<M: RemoteMessage> Default for ServiceMesh<M> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<M: RemoteMessage> ServiceMesh<M> {
+    pub fn new() -> Self {
+        Self {
+            routes: HashMap::new(),
+        }
+    }
+
+    pub fn services(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.routes.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn instance_count(&self, service: &str) -> usize {
+        self.routes
+            .get(service)
+            .map(|r| r.cluster.len())
+            .unwrap_or(0)
+    }
+
+    pub fn records(&self, service: &str) -> Vec<ServiceRecord> {
+        self.routes
+            .get(service)
+            .map(|route| {
+                route
+                    .cluster
+                    .members()
+                    .iter()
+                    .map(|m| ServiceRecord {
+                        service: service.to_string(),
+                        instance_id: m.name.clone(),
+                        address: m.node_addr.clone(),
+                        target: m.target.clone(),
+                        registered_at: 0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn ring(&self, service: &str) -> Option<&HashRing> {
+        self.routes.get(service).map(|r| r.cluster.ring())
+    }
+
+    /// Register or upsert an instance under `record.service`.
+    ///
+    /// Returns the previous record when upserting the same `instance_id` (address/target may
+    /// have changed). Callers holding a stale [`RemoteActorRef`] should refresh via
+    /// [`Self::ref_for_key`] after an upsert.
+    pub fn register(&mut self, record: ServiceRecord) -> Option<ServiceRecord> {
+        let service = record.service.clone();
+        let route = self
+            .routes
+            .entry(service.clone())
+            .or_insert_with(|| ServiceRoute {
+                cluster: Cluster::new(),
+            });
+        let displaced = if route
+            .cluster
+            .members()
+            .iter()
+            .any(|m| m.name == record.instance_id)
+        {
+            route.cluster.leave(&record.instance_id).map(|member| ServiceRecord {
+                service: service.clone(),
+                instance_id: member.name,
+                address: member.node_addr,
+                target: member.target,
+                registered_at: 0,
+            })
+        } else {
+            None
+        };
+        route.cluster.join(record.member());
+        displaced
+    }
+
+    pub fn deregister(&mut self, service: &str, instance_id: &str) -> Option<ServiceRecord> {
+        let route = self.routes.get_mut(service)?;
+        let member = route.cluster.leave(instance_id)?;
+        if route.cluster.is_empty() {
+            self.routes.remove(service);
+        }
+        Some(ServiceRecord {
+            service: service.to_string(),
+            instance_id: member.name,
+            address: member.node_addr,
+            target: member.target,
+            registered_at: 0,
+        })
+    }
+
+    /// Replace mesh state from a registry snapshot without clearing all routes first.
+    pub fn apply_snapshot_diff(&mut self, records: Vec<ServiceRecord>) {
+        let incoming: HashMap<(String, String), ServiceRecord> = records
+            .into_iter()
+            .map(|r| ((r.service.clone(), r.instance_id.clone()), r))
+            .collect();
+
+        let services: Vec<String> = self.routes.keys().cloned().collect();
+        for service in services {
+            let stale_ids: Vec<String> = self
+                .routes
+                .get(&service)
+                .map(|route| {
+                    route
+                        .cluster
+                        .members()
+                        .iter()
+                        .filter(|m| {
+                            !incoming.contains_key(&(service.clone(), m.name.clone()))
+                        })
+                        .map(|m| m.name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(route) = self.routes.get_mut(&service) {
+                for id in stale_ids {
+                    route.cluster.leave(&id);
+                }
+                if route.cluster.is_empty() {
+                    self.routes.remove(&service);
+                }
+            }
+        }
+
+        for record in incoming.into_values() {
+            self.register(record);
+        }
+    }
+
+    pub fn apply_snapshot(&mut self, records: impl IntoIterator<Item = ServiceRecord>) {
+        self.apply_snapshot_diff(records.into_iter().collect());
+    }
+
+    pub async fn invoke<T: Hash>(&self, service: &str, key: &T, msg: M) -> std::io::Result<()> {
+        self.route(service)?
+            .cluster
+            .send_by_key(key, msg)
+            .await
+    }
+
+    pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
+    where
+        M: Clone,
+    {
+        match self.routes.get(service) {
+            Some(route) => route.cluster.send_all(msg).await,
+            None => Vec::new(),
+        }
+    }
+
+    pub async fn invoke_any(&self, service: &str, msg: M) -> std::io::Result<()> {
+        self.route(service)?.cluster.send_round_robin(msg).await
+    }
+
+    pub fn ref_for_key<T: Hash>(
+        &self,
+        service: &str,
+        key: &T,
+    ) -> Option<&RemoteActorRef<M>> {
+        self.routes.get(service)?.cluster.ref_for_key(key)
+    }
+
+    fn route(&self, service: &str) -> std::io::Result<&ServiceRoute<M>> {
+        self.routes.get(service).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("unknown service: {service}"),
+            )
+        })
+    }
+}
+
+/// Handle returned when a microservice instance is bound to TCP.
+pub struct MicroserviceHandle<M: RemoteMessage> {
+    pub record: ServiceRecord,
+    _node: NodeHandle<M>,
+}
+
+impl<M: RemoteMessage> MicroserviceHandle<M> {
+    pub fn service(&self) -> &str {
+        &self.record.service
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.record.instance_id
+    }
+
+    pub fn address(&self) -> &str {
+        &self.record.address
+    }
+}
+
+/// Bind a microservice actor on TCP. Frame `target` is the unique `instance_id`.
+pub async fn serve_microservice<M, A>(
+    service: impl Into<String>,
+    instance_id: impl Into<String>,
+    bind_addr: impl Into<String>,
+    actor: A,
+) -> std::io::Result<MicroserviceHandle<M>>
+where
+    M: RemoteMessage,
+    A: crate::actor::Actor<M> + Send + Sync + 'static,
+{
+    let service = service.into();
+    let instance_id = instance_id.into();
+    let target = instance_id.clone();
+    let node = serve_actor(&instance_id, bind_addr, &target, actor).await?;
+    Ok(MicroserviceHandle {
+        record: ServiceRecord {
+            service,
+            instance_id,
+            address: node.address().to_string(),
+            target,
+            registered_at: 0,
+        },
+        _node: node,
+    })
+}
+
+/// Bind a microservice with TLS on the data plane.
+pub async fn serve_microservice_tls<M, A>(
+    service: impl Into<String>,
+    instance_id: impl Into<String>,
+    bind_addr: impl Into<String>,
+    actor: A,
+    tls: Arc<TlsAcceptor>,
+) -> std::io::Result<MicroserviceHandle<M>>
+where
+    M: RemoteMessage,
+    A: crate::actor::Actor<M> + Send + Sync + 'static,
+{
+    use crate::config::{ActorConfig, DistributedConfig};
+    use tokio::runtime::Handle;
+
+    let service = service.into();
+    let instance_id = instance_id.into();
+    let target = instance_id.clone();
+    let node = serve_actor_tls_on_runtime(
+        &Handle::current(),
+        &instance_id,
+        bind_addr,
+        &target,
+        actor,
+        &DistributedConfig::default(),
+        &ActorConfig::default(),
+        tls,
+    )
+    .await?;
+    Ok(MicroserviceHandle {
+        record: ServiceRecord {
+            service,
+            instance_id,
+            address: node.address().to_string(),
+            target,
+            registered_at: 0,
+        },
+        _node: node,
+    })
+}
+
+// --- TCP control plane (discovery) ---
+
+/// Control-plane message (length-prefixed JSON over TCP).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MeshControlMsg {
+    Register(ServiceRecord),
+    Deregister { service: String, instance_id: String },
+    List,
+    ListReply(Vec<ServiceRecord>),
+    Ping,
+    Pong,
+}
+
+async fn write_control<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &MeshControlMsg,
+) -> std::io::Result<()> {
+    let body = serde_json::to_vec(msg).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+    if body.len() > MAX_CONTROL_FRAME as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("control frame too large: {} bytes", body.len()),
+        ));
+    }
+    stream.write_u32_le(body.len() as u32).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_control_len<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<u32>> {
+    match tokio::time::timeout(CONTROL_READ_TIMEOUT, stream.read_u32_le()).await {
+        Ok(Ok(0)) => Ok(None),
+        Ok(Ok(n)) => {
+            if n > MAX_CONTROL_FRAME {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("control frame too large: {n} bytes"),
+                ));
+            }
+            Ok(Some(n))
+        }
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "control read timed out",
+        )),
+    }
+}
+
+async fn read_control<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<MeshControlMsg>> {
+    let Some(len) = read_control_len(stream).await? else {
+        return Ok(None);
+    };
+    let mut buf = vec![0u8; len as usize];
+    tokio::time::timeout(CONTROL_READ_TIMEOUT, stream.read_exact(&mut buf))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "control body read timed out")
+        })??;
+    let msg = serde_json::from_slice(&buf).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    })?;
+    Ok(Some(msg))
+}
+
+/// Shared mesh registry backing the TCP control plane.
+#[derive(Clone)]
+pub struct MeshRegistry {
+    records: Arc<RwLock<HashMap<(String, String), ServiceRecord>>>,
+    ttl: Duration,
+}
+
+impl Default for MeshRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MeshRegistry {
+    pub fn new() -> Self {
+        Self::with_ttl(DEFAULT_RECORD_TTL)
+    }
+
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            records: Arc::new(RwLock::new(HashMap::new())),
+            ttl,
+        }
+    }
+
+    pub async fn register(&self, mut record: ServiceRecord) {
+        record.registered_at = unix_now();
+        let key = (record.service.clone(), record.instance_id.clone());
+        self.records.write().await.insert(key, record);
+    }
+
+    pub async fn deregister(&self, service: &str, instance_id: &str) -> Option<ServiceRecord> {
+        self.records
+            .write()
+            .await
+            .remove(&(service.to_string(), instance_id.to_string()))
+    }
+
+    pub async fn list(&self) -> Vec<ServiceRecord> {
+        let now = unix_now();
+        self.records
+            .read()
+            .await
+            .values()
+            .filter(|r| !record_expired(r, now, self.ttl))
+            .cloned()
+            .collect()
+    }
+
+    pub async fn evict_expired(&self) {
+        let now = unix_now();
+        self.records
+            .write()
+            .await
+            .retain(|_, r| !record_expired(r, now, self.ttl));
+    }
+
+    pub async fn apply_to_mesh<M: RemoteMessage>(&self, mesh: &mut ServiceMesh<M>) {
+        mesh.apply_snapshot_diff(self.list().await);
+    }
+}
+
+/// TCP mesh registry (control plane). Microservices register here for discovery.
+pub struct MeshRegistryServer {
+    pub address: String,
+    registry: MeshRegistry,
+    _task: JoinHandle<()>,
+    _eviction: JoinHandle<()>,
+}
+
+impl MeshRegistryServer {
+    pub async fn bind(addr: impl Into<String>) -> std::io::Result<Self> {
+        Self::bind_on_runtime(addr, None).await
+    }
+
+    /// Bind the control plane with TLS.
+    pub async fn bind_tls(
+        addr: impl Into<String>,
+        tls: Arc<TlsAcceptor>,
+    ) -> std::io::Result<Self> {
+        Self::bind_on_runtime(addr, Some(tls)).await
+    }
+
+    async fn bind_on_runtime(
+        addr: impl Into<String>,
+        tls: Option<Arc<TlsAcceptor>>,
+    ) -> std::io::Result<Self> {
+        let registry = MeshRegistry::new();
+        let listener = TcpListener::bind(addr.into()).await?;
+        let address = listener.local_addr()?.to_string();
+        let reg = registry.clone();
+        let acceptor = tls;
+        let tls_enabled = acceptor.is_some();
+
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, peer)) => {
+                        let reg = reg.clone();
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            match tls::accept(stream, acceptor.as_deref()).await {
+                                Ok(stream) => {
+                                    if let Err(e) = handle_registry_conn(stream, reg).await {
+                                        tracing::warn!(%peer, error = %e, "mesh registry connection error");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%peer, error = %e, "mesh registry TLS accept failed");
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "mesh registry accept failed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let reg_evict = registry.clone();
+        let eviction = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(EVICTION_INTERVAL);
+            loop {
+                interval.tick().await;
+                reg_evict.evict_expired().await;
+            }
+        });
+
+        tracing::info!(%address, tls = tls_enabled, "mesh registry listening");
+        Ok(Self {
+            address,
+            registry,
+            _task: task,
+            _eviction: eviction,
+        })
+    }
+
+    pub fn registry(&self) -> &MeshRegistry {
+        &self.registry
+    }
+}
+
+async fn handle_registry_conn(
+    mut stream: MaybeTlsStream,
+    registry: MeshRegistry,
+) -> std::io::Result<()> {
+    loop {
+        let msg = match tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control(&mut stream)).await
+        {
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(msg))) => msg,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "control read timed out",
+                ))
+            }
+        };
+
+        match msg {
+            MeshControlMsg::Register(record) => {
+                tracing::info!(
+                    service = %record.service,
+                    instance = %record.instance_id,
+                    address = %record.address,
+                    "mesh register"
+                );
+                registry.register(record).await;
+                write_control(&mut stream, &MeshControlMsg::Pong).await?;
+            }
+            MeshControlMsg::Deregister { service, instance_id } => {
+                registry.deregister(&service, &instance_id).await;
+                write_control(&mut stream, &MeshControlMsg::Pong).await?;
+            }
+            MeshControlMsg::List => {
+                let list = registry.list().await;
+                write_control(&mut stream, &MeshControlMsg::ListReply(list)).await?;
+            }
+            MeshControlMsg::Ping => {
+                write_control(&mut stream, &MeshControlMsg::Pong).await?;
+            }
+            MeshControlMsg::Pong | MeshControlMsg::ListReply(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Client for the TCP mesh registry (discovery) with a persistent connection.
+pub struct MeshRegistryClient {
+    registry_addr: String,
+    stream: Option<MaybeTlsStream>,
+    tls: Option<Arc<TlsConnector>>,
+}
+
+impl MeshRegistryClient {
+    pub fn new(registry_addr: impl Into<String>) -> Self {
+        Self {
+            registry_addr: registry_addr.into(),
+            stream: None,
+            tls: None,
+        }
+    }
+
+    pub fn with_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
+        Self {
+            registry_addr: registry_addr.into(),
+            stream: None,
+            tls: Some(tls),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.stream = None;
+    }
+
+    async fn conn(&mut self) -> std::io::Result<&mut MaybeTlsStream> {
+        if self.stream.is_none() {
+            self.stream = Some(tls::connect(&self.registry_addr, self.tls.as_deref()).await?);
+        }
+        Ok(self.stream.as_mut().unwrap())
+    }
+
+    async fn request(&mut self, msg: &MeshControlMsg) -> std::io::Result<MeshControlMsg> {
+        let result = async {
+            let stream = self.conn().await?;
+            write_control(stream, msg).await?;
+            read_control(stream)
+                .await?
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "registry closed connection",
+                    )
+                })
+        }
+        .await;
+
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    pub async fn register(&mut self, record: ServiceRecord) -> std::io::Result<()> {
+        match self.request(&MeshControlMsg::Register(record)).await? {
+            MeshControlMsg::Pong => Ok(()),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected registry reply",
+            )),
+        }
+    }
+
+    /// Renew a lease by re-registering the same record (resets registry TTL).
+    pub async fn renew(&mut self, record: ServiceRecord) -> std::io::Result<()> {
+        self.register(record).await
+    }
+
+    pub async fn list(&mut self) -> std::io::Result<Vec<ServiceRecord>> {
+        match self.request(&MeshControlMsg::List).await? {
+            MeshControlMsg::ListReply(list) => Ok(list),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unexpected registry reply",
+            )),
+        }
+    }
+
+    pub async fn sync_mesh<M: RemoteMessage>(
+        &mut self,
+        mesh: &mut ServiceMesh<M>,
+    ) -> std::io::Result<()> {
+        mesh.apply_snapshot_diff(self.list().await?);
+        Ok(())
+    }
+}
+
+/// Sidecar router: local mesh view + optional sync from TCP registry.
+pub struct MeshRouter<M: RemoteMessage> {
+    pub mesh: ServiceMesh<M>,
+    client: Option<MeshRegistryClient>,
+}
+
+impl<M: RemoteMessage> MeshRouter<M> {
+    pub fn local() -> Self {
+        Self {
+            mesh: ServiceMesh::new(),
+            client: None,
+        }
+    }
+
+    pub fn with_registry(registry_addr: impl Into<String>) -> Self {
+        Self {
+            mesh: ServiceMesh::new(),
+            client: Some(MeshRegistryClient::new(registry_addr)),
+        }
+    }
+
+    pub fn with_registry_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
+        Self {
+            mesh: ServiceMesh::new(),
+            client: Some(MeshRegistryClient::with_tls(registry_addr, tls)),
+        }
+    }
+
+    pub fn registry_client(&mut self) -> Option<&mut MeshRegistryClient> {
+        self.client.as_mut()
+    }
+
+    pub async fn sync(&mut self) -> std::io::Result<()> {
+        if let Some(client) = &mut self.client {
+            client.sync_mesh(&mut self.mesh).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn invoke<T: Hash>(&self, service: &str, key: &T, msg: M) -> std::io::Result<()> {
+        self.mesh.invoke(service, key, msg).await
+    }
+
+    pub async fn invoke_all(&self, service: &str, msg: M) -> Vec<(String, std::io::Result<()>)>
+    where
+        M: Clone,
+    {
+        self.mesh.invoke_all(service, msg).await
+    }
+}
+
+/// Register instance locally and with the remote TCP registry (if provided).
+pub async fn join_mesh<M: RemoteMessage>(
+    mesh: &mut ServiceMesh<M>,
+    registry_addr: Option<&str>,
+    handle: &MicroserviceHandle<M>,
+) -> std::io::Result<()> {
+    mesh.register(handle.record.clone());
+    if let Some(addr) = registry_addr {
+        MeshRegistryClient::new(addr)
+            .register(handle.record.clone())
+            .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::{Actor, ActorProcessingErr};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct Ping(String);
+
+    struct Echo;
+
+    #[async_trait::async_trait]
+    impl Actor<Ping> for Echo {
+        async fn handle(&mut self, msg: Ping) -> Result<(), ActorProcessingErr> {
+            let _ = msg;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mesh_routes_by_service_name() {
+        let a = serve_microservice("orders", "orders-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("a");
+        let b = serve_microservice("orders", "orders-2", "127.0.0.1:0", Echo)
+            .await
+            .expect("b");
+
+        let mut mesh = ServiceMesh::new();
+        mesh.register(a.record.clone());
+        mesh.register(b.record.clone());
+
+        assert_eq!(mesh.instance_count("orders"), 2);
+        assert_eq!(a.record.target, "orders-1");
+        assert_eq!(b.record.target, "orders-2");
+        mesh.invoke("orders", &42u64, Ping("x".into()))
+            .await
+            .expect("invoke");
+    }
+
+    #[tokio::test]
+    async fn registry_control_plane() {
+        let server = MeshRegistryServer::bind("127.0.0.1:0")
+            .await
+            .expect("registry");
+        let record = ServiceRecord {
+            service: "inventory".into(),
+            instance_id: "inv-1".into(),
+            address: "127.0.0.1:9999".into(),
+            target: "inv-1".into(),
+            registered_at: 0,
+        };
+        let mut client = MeshRegistryClient::new(&server.address);
+        client.register(record.clone()).await.expect("register");
+        let list = client.list().await.expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].service, record.service);
+        assert_eq!(list[0].instance_id, record.instance_id);
+        assert!(list[0].registered_at > 0);
+    }
+
+    #[tokio::test]
+    async fn apply_snapshot_diff_keeps_routes_during_sync() {
+        let a = serve_microservice("orders", "orders-1", "127.0.0.1:0", Echo)
+            .await
+            .expect("a");
+        let mut mesh: ServiceMesh<Ping> = ServiceMesh::new();
+        mesh.register(a.record.clone());
+        assert_eq!(mesh.instance_count("orders"), 1);
+
+        mesh.apply_snapshot_diff(vec![a.record.clone()]);
+        assert_eq!(mesh.instance_count("orders"), 1);
+    }
+}

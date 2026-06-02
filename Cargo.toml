@@ -1,0 +1,125 @@
+[package]
+name = "lane_switchboards"
+version = "0.5.0"
+edition = "2021"
+description = "Telecom-inspired OTP actor runtime for Rust: mailbox routing, supervision trees, let-it-crash fault isolation, and distributed messaging"
+license = "MIT"
+readme = "README.md"
+keywords = ["actor", "otp", "supervision", "concurrency", "erlang"]
+categories = ["asynchronous", "concurrency"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "src/**",
+]
+
+[dependencies]
+tokio = { version = "=1.38.0", features = ["full"] }
+tracing = { version = "=0.1.40", features = ["log", "max_level_info", "release_max_level_warn"] }
+dashmap = "=6.1.0"
+serde = { version = "=1.0.210", features = ["derive", "rc"] }
+async-trait = "=0.1.83"
+once_cell = "=1.20.2"
+futures = "=0.3.31"
+actix = "=0.13.5"
+reqwest = "=0.12.9"
+futures-util = "=0.3.31"
+serde_json = "1"
+murmur3 = "=0.5.2"
+rustls = "=0.23.26"
+tokio-rustls = "=0.26.1"
+rustls-pemfile = "=2.2.0"
+webpki-roots = "=0.26.8"
+rcgen = "0.13"
+
+[dev-dependencies]
+tokio = { version = "=1.38.0", features = ["full"] }
+ractor = { version = "0.14", features = ["async-trait"] }
+ractor-supervisor = "0.1"
+reqwest = { version = "=0.12.9", default-features = false, features = ["json", "rustls-tls"] }
+actix-web = "4"
+actix-test = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+url = "2"
+anyhow = "1"
+futures-util = "=0.3.31"
+tokio-test = "0.4"
+hmac = "0.12"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["std"] }
+blake2 = "0.10"
+base64 = "0.22"
+rcgen = "0.13"
+tempfile = "3"
+
+# --- Core runtime demos ---
+
+[[example]]
+name = "envelope_demo"
+path = "examples/envelope_demo.rs"
+
+[[example]]
+name = "supervisor_strategies"
+path = "examples/supervisor_strategies.rs"
+
+[[example]]
+name = "hot_upgrade"
+path = "examples/hot_upgrade.rs"
+
+[[example]]
+name = "distributed_demo"
+path = "examples/distributed_demo.rs"
+
+[[example]]
+name = "tls_distributed"
+path = "examples/tls_distributed.rs"
+
+[[example]]
+name = "horizontal_scaling"
+path = "examples/horizontal_scaling.rs"
+
+[[example]]
+name = "horizontal_scaling_rest_for_one"
+path = "examples/horizontal_scaling_rest_for_one.rs"
+
+[[example]]
+name = "service_mesh"
+path = "examples/service_mesh.rs"
+
+# --- Calculator & supervision (switchboard routing + fault recovery) ---
+
+[[example]]
+name = "calculator"
+path = "examples/calculator.rs"
+
+[[example]]
+name = "resilient_calculator"
+path = "examples/resilient_calculator.rs"
+
+[[example]]
+name = "resilient_calculator_timer"
+path = "examples/resilient_calculator_timer.rs"
+
+[[example]]
+name = "recoverable_timer_calc"
+path = "examples/recoverable_timer_calc.rs"
+
+[[example]]
+name = "rest_for_one_calculator_timer"
+path = "examples/rest_for_one_calculator_timer.rs"
+
+[[example]]
+name = "rest_for_one_calculator_timer_optimized"
+path = "examples/rest_for_one_calculator_timer_optimized.rs"
+
+[[example]]
+name = "handle_timeout_calculator_timer"
+path = "examples/handle_timeout_calculator_timer.rs"
+
+# --- Additional examples (not listed in README) ---
+
+[[example]]
+name = "gateway"
+path = "examples/gateway/main.rs"
