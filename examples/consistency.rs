@@ -1,9 +1,17 @@
 //! Real-world consistency demo: replicated inventory over TLS + tunable W levels.
 //!
+//! **Production topology (not started by this binary):** every service-to-service hop is
+//! `app → local Envoy sidecar → remote Envoy sidecar → peer app`. Outbound clusters use an
+//! Envoy **circuit breaker** (max connections, pending requests, consecutive 5xx) so a failing
+//! replica is ejected before it absorbs the whole flash-sale load. This example runs the
+//! **lane_switchboards** data plane in-process (TLS + quorum acks); in Kubernetes you point
+//! `ServiceRecord::address` at the sidecar listener (e.g. `127.0.0.1:15001`) rather than the
+//! app port directly.
+//!
 //! Scenario (flash-sale SKU `widget-42`):
 //! 1. **Problem** — `invoke()` routes to one replica; other replicas never see the reservation.
 //! 2. **Solution** — `invoke_consistent` with `QUORUM` fans out and waits for W=2 acks (rf=3).
-//! 3. **Outage** — one replica stops; QUORUM still succeeds; `ALL` fails.
+//! 3. **Outage** — one replica stops; sidecar CB may open; QUORUM still succeeds on survivors; `ALL` fails.
 //!
 //! Run: `cargo run --example consistency`
 //! See: `examples/consistency.md` and `docs/consistency.md`
@@ -139,7 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None::<&str>,
     )?));
 
-    println!("=== Consistency demo: 3 TLS inventory replicas (rf=3) ===\n");
+    println!("=== Consistency demo: 3 TLS inventory replicas (rf=3) ===");
+    println!("Production: each pod = app + Envoy sidecar; every s2s call goes through Envoy.");
+    println!("Envoy cluster circuit breaker ejects unhealthy hosts (see consistency.md).\n");
 
     let r1 = spawn_replica("inv-1", acceptor.clone()).await;
     let r2 = spawn_replica("inv-2", acceptor.clone()).await;
@@ -184,8 +194,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     settle().await;
 
-    // --- Outage: lose one replica; QUORUM still OK ---
-    println!("--- Outage: stop inv-3; QUORUM write should still succeed ---\n");
+    // --- Outage: lose one replica; Envoy CB would eject inv-3; QUORUM still OK ---
+    println!("--- Outage: stop inv-3 (Envoy would open circuit breaker on that host) ---");
+    println!("QUORUM write should still succeed on the two surviving replicas.\n");
     drop(r3);
     mesh.deregister("inventory", "inv-3");
     mesh.invoke_consistent("inventory", &sku, reserve(1))
@@ -218,11 +229,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     println!("=== Takeaways ===");
-    println!("• invoke()      → fast, one replica; risky for replicated state.");
-    println!("• QUORUM write  → W+R>N style durability of *receipt* across replicas.");
-    println!("• ALL write     → fails fast when any replica is missing.");
+    println!("• Envoy sidecar  → all s2s traffic; circuit breaker sheds load to bad replicas.");
+    println!("• invoke()       → fast, one replica; risky for replicated state.");
+    println!("• QUORUM write   → W+R>N style durability of *receipt* across replicas.");
+    println!("• ALL write      → fails fast when any replica is missing (or CB + quorum).");
     println!("• Each replica keeps its own ledger — replicate data in your actor logic.");
-    println!("• See docs/consistency.md for W+R tables and EACH_QUORUM / SERIAL.\n");
+    println!("• See examples/consistency.md (Envoy) and docs/consistency.md (W/R levels).\n");
 
     if std::env::var("KEEP_DEMO_PEM").is_err() {
         match remove_ephemeral_pem(&cert_path, &key_path, &temp) {
