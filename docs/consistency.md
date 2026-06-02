@@ -2,6 +2,8 @@
 
 The mesh routing layer implements Cassandra-style **tunable consistency**: you choose how many replicas must acknowledge a write (W) or read (R) before the call returns. The mesh fans out to the right replica set and waits for acks; **multi-master replication and conflict resolution remain the application's job**.
 
+**Runnable walkthrough:** [`examples/consistency.rs`](../examples/consistency.rs) (TLS inventory replicas, QUORUM vs `invoke`, replica outage). Narrative: [`examples/consistency.md`](../examples/consistency.md).
+
 ## Quick start
 
 ```rust
@@ -145,3 +147,11 @@ config.on_metrics = Some(Arc::new(|m: ConsistencyMetrics| {
 | `ServiceMesh::read_serial_value` | Paxos read returning `Option<Vec<u8>>` |
 | `Cluster::replicas_for_key` | Hash-ring replica selection |
 | `Cluster::dc_replicas_for_key` | Per-DC replica selection for EACH_QUORUM |
+
+## Example
+
+```bash
+cargo run --example consistency
+```
+
+See [`examples/consistency.md`](../examples/consistency.md) for the flash-sale scenario, diagrams, and expected console output.

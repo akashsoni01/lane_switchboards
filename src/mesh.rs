@@ -77,6 +77,7 @@ struct ServiceRoute<M: RemoteMessage> {
 pub struct ServiceMesh<M: RemoteMessage> {
     routes: HashMap<String, ServiceRoute<M>>,
     consistency: ConsistencyConfig,
+    tls_connector: Option<Arc<TlsConnector>>,
 }
 
 impl<M: RemoteMessage> Default for ServiceMesh<M> {
@@ -95,6 +96,15 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         Self {
             routes: HashMap::new(),
             consistency,
+            tls_connector: None,
+        }
+    }
+
+    /// TLS connector for outbound [`RemoteActorRef`] connections (use with [`serve_microservice_tls`]).
+    pub fn set_tls_connector(&mut self, connector: Option<Arc<TlsConnector>>) {
+        self.tls_connector = connector.clone();
+        for route in self.routes.values_mut() {
+            route.cluster.set_tls_connector(connector.clone());
         }
     }
 
@@ -165,12 +175,17 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     /// [`Self::ref_for_key`] after an upsert.
     pub fn register(&mut self, record: ServiceRecord) -> Option<ServiceRecord> {
         let service = record.service.clone();
+        let tls = self.tls_connector.clone();
         let route = self
             .routes
             .entry(service.clone())
-            .or_insert_with(|| ServiceRoute {
-                cluster: Cluster::new(),
-                consistency: None,
+            .or_insert_with(|| {
+                let mut cluster = Cluster::new();
+                cluster.set_tls_connector(tls.clone());
+                ServiceRoute {
+                    cluster,
+                    consistency: None,
+                }
             });
         let displaced = if route
             .cluster
