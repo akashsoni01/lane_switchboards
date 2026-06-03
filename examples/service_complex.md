@@ -4,9 +4,10 @@
 
 ```bash
 cargo run --example service_complex
+cargo run --example service_complex_cluster   # 10 replicas × ServiceA + ServiceB on TCP nodes
 ```
 
-Compare with: [`service.md`](./service.md) (coordinator structs in `main` only).
+Compare with: [`service.md`](./service.md) (coordinator structs in `main` only). Cluster layout follows [`horizontal_scaling.md`](./horizontal_scaling.md).
 
 ---
 
@@ -89,10 +90,61 @@ For actors **without** a `ChildRegistry`, use [`supervise_actor`](../src/supervi
 
 ---
 
+## Multi-node cluster (`service_complex_cluster`)
+
+[`service_complex_cluster.rs`](./service_complex_cluster.rs) runs **`CLUSTER_REPLICAS` (10)** independent copies of each service on separate TCP nodes.
+
+| Piece | Role |
+|-------|------|
+| **`serve_actor`** | One node per replica — binds `127.0.0.1:0`, target name `"service"` |
+| **`Cluster<ServiceACommand>`** | Roster of 10 Service A replicas |
+| **`Cluster<ServiceBCommand>`** | Roster of 10 Service B replicas (isolated from A) |
+| **`ServiceACommand` / `ServiceBCommand`** | `Serialize` remote commands (`PingAll`, `FailDaoB` / `FailDaoC`) |
+
+```mermaid
+flowchart TB
+    Coord["Coordinator main"]
+    CA["Cluster ServiceA × 10"]
+    CB["Cluster ServiceB × 10"]
+
+    Coord --> CA
+    Coord --> CB
+
+    CA --> R0["replica-0 TCP node"]
+    CA --> R9["replica-9 TCP node"]
+    CB --> S0["replica-0 TCP node"]
+    CB --> S9["replica-9 TCP node"]
+```
+
+### What the cluster demo runs
+
+| Step | API | Expected |
+|------|-----|----------|
+| 1 | Launch 10× `serve_actor` per service | 20 nodes online, printed addresses |
+| 2 | `cluster.broadcast(PingAll)` | Every replica pings its local DAOs |
+| 3 | `cluster_a.send_by_key(&3, FailDaoB)` | Only replica 3 restarts its DaoB |
+| 4 | `send_by_key` + `PingAll` on replica 3 | DaoB back after inner restart |
+| 5 | `cluster_b.send_round_robin(PingAll)` | Spreads calls across B replicas |
+| 6 | `send_by_key(&7, FailDaoC)` on B | Only replica 7’s DaoC restarts |
+
+Unlike single-node `service_complex`, there is **no** outer `supervise_actor` on each replica — `serve_actor` owns the service actor mailbox; **inner** `supervise_named_child!` per DAO is unchanged.
+
+### Shared code
+
+| File | Role |
+|------|------|
+| [`service_complex_shared.rs`](./service_complex_shared.rs) | DAO + service actors, commands, helpers |
+| [`service_complex.rs`](./service_complex.rs) | Local supervised demo + generation counters |
+| [`service_complex_cluster.rs`](./service_complex_cluster.rs) | Multi-node 10+10 replicas |
+
+---
+
 ## File map
 
 | File | Role |
 |------|------|
-| [`service_complex.rs`](./service_complex.rs) | Runnable demo |
+| [`service_complex.rs`](./service_complex.rs) | Single-node runnable demo |
+| [`service_complex_cluster.rs`](./service_complex_cluster.rs) | 10 replicas per service on TCP nodes |
+| [`service_complex_shared.rs`](./service_complex_shared.rs) | Shared actors and commands |
 | [`service_complex.md`](./service_complex.md) | This doc |
 | [`service.rs`](./service.rs) | Simpler coordinator version (same macros) |
