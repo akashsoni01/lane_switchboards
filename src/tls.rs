@@ -1,19 +1,22 @@
-//! TLS helpers for distributed and mesh TCP (rustls + tokio-rustls).
+//! TLS certificate loading and rustls config builders.
+//!
+//! Requires the **`tls`** crate feature (`rustls`, `tokio-rustls`, etc.).
+//! For connecting and framing, use [`crate::stream`].
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+#![cfg(feature = "tls")]
+
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader, ErrorKind};
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 use tokio_rustls::rustls;
 pub use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use webpki_roots;
+
+pub use crate::stream::{accept, connect, host_from_addr, MaybeTlsStream};
 
 fn ensure_crypto_provider() {
     use std::sync::Once;
@@ -21,92 +24,6 @@ fn ensure_crypto_provider() {
     INIT.call_once(|| {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
-}
-
-/// Plain TCP or TLS-wrapped stream used by frame/control protocols.
-pub enum MaybeTlsStream {
-    Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
-}
-
-impl AsyncRead for MaybeTlsStream {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            MaybeTlsStream::Tls(TlsStream::Client(s)) => Pin::new(s).poll_read(cx, buf),
-            MaybeTlsStream::Tls(TlsStream::Server(s)) => Pin::new(s).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for MaybeTlsStream {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            MaybeTlsStream::Tls(TlsStream::Client(s)) => Pin::new(s).poll_write(cx, buf),
-            MaybeTlsStream::Tls(TlsStream::Server(s)) => Pin::new(s).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
-            MaybeTlsStream::Tls(TlsStream::Client(s)) => Pin::new(s).poll_flush(cx),
-            MaybeTlsStream::Tls(TlsStream::Server(s)) => Pin::new(s).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            MaybeTlsStream::Tls(TlsStream::Client(s)) => Pin::new(s).poll_shutdown(cx),
-            MaybeTlsStream::Tls(TlsStream::Server(s)) => Pin::new(s).poll_shutdown(cx),
-        }
-    }
-}
-
-/// Host portion of `"host:port"` for TLS SNI / server name validation.
-pub fn host_from_addr(addr: &str) -> io::Result<&str> {
-    addr.rsplit_once(':')
-        .map(|(host, _)| host)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, format!("missing port in {addr:?}")))
-}
-
-/// Connect with optional TLS (client).
-pub async fn connect(
-    addr: &str,
-    connector: Option<&TlsConnector>,
-) -> io::Result<MaybeTlsStream> {
-    let tcp = TcpStream::connect(addr).await?;
-    match connector {
-        None => Ok(MaybeTlsStream::Plain(tcp)),
-        Some(connector) => {
-            let host = host_from_addr(addr)?;
-            let name = ServerName::try_from(host.to_string()).map_err(|e| {
-                io::Error::new(ErrorKind::InvalidInput, format!("invalid TLS server name: {e}"))
-            })?;
-            let tls = connector.connect(name, tcp).await?;
-            Ok(MaybeTlsStream::Tls(TlsStream::Client(tls)))
-        }
-    }
-}
-
-/// Accept with optional TLS (server).
-pub async fn accept(
-    stream: TcpStream,
-    acceptor: Option<&TlsAcceptor>,
-) -> io::Result<MaybeTlsStream> {
-    match acceptor {
-        None => Ok(MaybeTlsStream::Plain(stream)),
-        Some(acceptor) => {
-            let tls = acceptor.accept(stream).await?;
-            Ok(MaybeTlsStream::Tls(TlsStream::Server(tls)))
-        }
-    }
 }
 
 /// Load PEM certificate chain from disk.

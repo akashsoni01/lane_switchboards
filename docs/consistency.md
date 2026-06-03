@@ -151,7 +151,7 @@ config.on_metrics = Some(Arc::new(|m: ConsistencyMetrics| {
 ## Example
 
 ```bash
-cargo run --example consistency
+cargo run --example consistency --features tls
 ```
 
 See [`examples/consistency.md`](../examples/consistency.md) for the flash-sale scenario, diagrams, and expected console output.

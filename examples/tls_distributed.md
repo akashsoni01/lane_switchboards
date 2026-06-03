@@ -3,7 +3,7 @@
 [`tls_distributed.rs`](./tls_distributed.rs) is the TLS counterpart to [`distributed_demo.rs`](./distributed_demo.rs). Same length-prefixed JSON framing — but the TCP byte stream is wrapped in **TLS 1.2+** via **rustls** before any frame is read or written.
 
 ```bash
-cargo run --example tls_distributed
+cargo run --example tls_distributed --features tls
 ```
 
 Expected output:

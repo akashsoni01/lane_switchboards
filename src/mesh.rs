@@ -7,12 +7,14 @@ use crate::consistency::{
 };
 use crate::config::DistributedConfig;
 use crate::distributed::{
-    serve_actor, serve_actor_tls_on_runtime, Cluster, ClusterMember, NodeHandle, RemoteActorRef,
-    RemoteMessage, TlsAcceptor,
+    serve_actor, Cluster, ClusterMember, NodeHandle, RemoteActorRef, RemoteMessage,
 };
+#[cfg(feature = "tls")]
+use crate::distributed::serve_actor_tls_on_runtime;
+use crate::distributed::TlsAcceptor;
 use crate::hash_ring::HashRing;
 use crate::paxos::{PaxosProposer, PaxosReplica};
-use crate::tls::{self, MaybeTlsStream};
+use crate::stream::{self, MaybeTlsStream};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -22,7 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
+use crate::stream::TlsConnector;
 
 /// Max inbound control-plane frame size (registration/list replies are small JSON).
 const MAX_CONTROL_FRAME: u32 = 64 * 1024;
@@ -100,7 +102,8 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         }
     }
 
-    /// TLS connector for outbound [`RemoteActorRef`] connections (use with [`serve_microservice_tls`]).
+    /// TLS connector for outbound [`RemoteActorRef`] connections (`feature = "tls"`).
+    #[cfg(feature = "tls")]
     pub fn set_tls_connector(&mut self, connector: Option<Arc<TlsConnector>>) {
         self.tls_connector = connector.clone();
         for route in self.routes.values_mut() {
@@ -929,7 +932,8 @@ where
     })
 }
 
-/// Bind a microservice with TLS on the data plane.
+/// Bind a microservice with TLS on the data plane (`feature = "tls"`).
+#[cfg(feature = "tls")]
 pub async fn serve_microservice_tls<M, A>(
     service: impl Into<String>,
     instance_id: impl Into<String>,
@@ -1116,6 +1120,7 @@ impl MeshRegistryServer {
     }
 
     /// Bind the control plane with TLS.
+    #[cfg(feature = "tls")]
     pub async fn bind_tls(
         addr: impl Into<String>,
         tls: Arc<TlsAcceptor>,
@@ -1141,7 +1146,7 @@ impl MeshRegistryServer {
                         let reg = reg.clone();
                         let acceptor = acceptor.clone();
                         tokio::spawn(async move {
-                            match tls::accept(stream, acceptor.as_deref()).await {
+                            match stream::accept(stream, acceptor.as_deref()).await {
                                 Ok(stream) => {
                                     if let Err(e) = handle_registry_conn(stream, reg).await {
                                         tracing::warn!(%peer, error = %e, "mesh registry connection error");
@@ -1246,6 +1251,7 @@ impl MeshRegistryClient {
         }
     }
 
+    #[cfg(feature = "tls")]
     pub fn with_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
         Self {
             registry_addr: registry_addr.into(),
@@ -1260,7 +1266,7 @@ impl MeshRegistryClient {
 
     async fn conn(&mut self) -> std::io::Result<&mut MaybeTlsStream> {
         if self.stream.is_none() {
-            self.stream = Some(tls::connect(&self.registry_addr, self.tls.as_deref()).await?);
+            self.stream = Some(stream::connect(&self.registry_addr, self.tls.as_deref()).await?);
         }
         Ok(self.stream.as_mut().unwrap())
     }
@@ -1349,6 +1355,7 @@ impl<M: RemoteMessage> MeshRouter<M> {
         }
     }
 
+    #[cfg(feature = "tls")]
     pub fn with_registry_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
         Self {
             mesh: ServiceMesh::new(),

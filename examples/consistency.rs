@@ -13,7 +13,7 @@
 //! 2. **Solution** — `invoke_consistent` with `QUORUM` fans out and waits for W=2 acks (rf=3).
 //! 3. **Outage** — one replica stops; sidecar CB may open; QUORUM still succeeds on survivors; `ALL` fails.
 //!
-//! Run: `cargo run --example consistency`
+//! Run: `cargo run --example consistency --features tls`
 //! See: `examples/consistency.md` and `docs/consistency.md`
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};

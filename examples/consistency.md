@@ -5,7 +5,7 @@
 In production, **every service-to-service call goes through an Envoy sidecar** with a **configured circuit breaker** on the outbound inventory cluster. This repo example runs the lane_switchboards mesh in-process; the sidecar layer is documented here and called out in the program output.
 
 ```bash
-cargo run --example consistency
+cargo run --example consistency --features tls
 ```
 
 Theory and API tables: [`docs/consistency.md`](../docs/consistency.md).

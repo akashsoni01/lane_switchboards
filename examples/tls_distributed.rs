@@ -3,7 +3,7 @@
 //! Generates ephemeral localhost certificates, binds a TLS listener, and sends
 //! one framed message from a TLS client [`RemoteActorRef`].
 //!
-//! Run: `cargo run --example tls_distributed`
+//! Run: `cargo run --example tls_distributed --features tls`
 //! See: `examples/tls_distributed.md`
 
 use lane_switchboards::actor::{spawn, Actor, ActorProcessingErr};

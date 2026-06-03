@@ -4,7 +4,8 @@ use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr};
 use crate::config::{spawn_on, ActorConfig, DistributedConfig};
 use crate::consistency::ConsistencyError;
 use crate::hash_ring::{HashRing, RingNode};
-use crate::tls::{self, MaybeTlsStream};
+use crate::stream::{self, MaybeTlsStream};
+pub use crate::stream::{TlsAcceptor, TlsConnector};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -17,9 +18,6 @@ use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 use tokio::task::JoinHandle;
-use tokio_rustls::TlsConnector;
-pub use tokio_rustls::TlsAcceptor;
-
 static FRAME_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_frame_id() -> u64 {
@@ -82,7 +80,7 @@ pub async fn paxos_request(
     config: &DistributedConfig,
     tls: Option<&TlsConnector>,
 ) -> Result<serde_json::Value, ConsistencyError> {
-    let mut stream = tokio::time::timeout(timeout, tls::connect(node_addr, tls))
+    let mut stream = tokio::time::timeout(timeout, stream::connect(node_addr, tls))
         .await
         .map_err(|_| ConsistencyError::Timeout { after: timeout })?
         .map_err(|_| ConsistencyError::NotEnoughAcks {
@@ -240,7 +238,7 @@ async fn remote_write_loop<M: RemoteMessage>(
 
     loop {
         let mut stream = loop {
-            match tls::connect(&node_addr, tls.as_deref()).await {
+            match stream::connect(&node_addr, tls.as_deref()).await {
                 Ok(s) => {
                     backoff = RECONNECT_BASE;
                     break s;
@@ -344,6 +342,8 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
         Self::with_config(node_addr, target, &DistributedConfig::default(), None)
     }
 
+    /// Outbound TLS (requires `feature = "tls"` and a real [`TlsConnector`]).
+    #[cfg(feature = "tls")]
     pub fn with_tls(
         node_addr: impl Into<String>,
         target: impl Into<String>,
@@ -472,7 +472,8 @@ impl<M: RemoteMessage> Node<M> {
         Self::bind_on_runtime(&Handle::current(), name, addr, config, None).await
     }
 
-    /// Bind with TLS (server certificate required).
+    /// Bind with TLS (server certificate required; `feature = "tls"`).
+    #[cfg(feature = "tls")]
     pub async fn bind_tls_on_runtime(
         runtime: &Handle,
         name: impl Into<String>,
@@ -522,7 +523,7 @@ impl<M: RemoteMessage> Node<M> {
                             let conn_runtime = runtime.clone();
                             let acceptor = tls_acceptor.clone();
                             spawn_on(Some(&runtime), async move {
-                                match tls::accept(stream, acceptor.as_deref()).await {
+                                match stream::accept(stream, acceptor.as_deref()).await {
                                     Ok(stream) => {
                                         if let Err(e) = handle_conn(
                                             stream,
@@ -1163,7 +1164,8 @@ where
     .await
 }
 
-/// Bind a TCP node with TLS and bridge on a dedicated runtime.
+/// Bind a TCP node with TLS and bridge on a dedicated runtime (`feature = "tls"`).
+#[cfg(feature = "tls")]
 pub async fn serve_actor_tls_on_runtime<M, A>(
     runtime: &Handle,
     node_name: impl Into<String>,
