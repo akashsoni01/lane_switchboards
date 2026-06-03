@@ -514,6 +514,46 @@ async fn restart_child<M: Send + Sync + 'static>(
     }
 }
 
+/// Start a **one-child** supervisor that registers the actor under `name` in `registry`.
+///
+/// Same as `Supervisor::new(config, vec![spawn_child_spec(0, name, registry, build)])`
+/// followed by [`Supervisor::start_settled`]. Prefer [`supervise_named_child!`] in examples
+/// to avoid closure boilerplate.
+pub async fn supervise_named_child<M, K, B, F>(
+    name: impl Into<K>,
+    registry: Arc<ChildRegistry<M, K>>,
+    config: SupervisorConfig,
+    build: F,
+) -> Result<SupervisorHandle<M>, ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    B: Actor<M> + Send + Sync + 'static,
+    F: Fn() -> B + Send + Sync + 'static,
+{
+    supervise_named_child_settled(name, registry, config, Duration::ZERO, build).await
+}
+
+/// Like [`supervise_named_child`] with a post-spawn settle delay before restart signals.
+pub async fn supervise_named_child_settled<M, K, B, F>(
+    name: impl Into<K>,
+    registry: Arc<ChildRegistry<M, K>>,
+    config: SupervisorConfig,
+    settle: Duration,
+    build: F,
+) -> Result<SupervisorHandle<M>, ActorProcessingErr>
+where
+    M: Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + 'static,
+    B: Actor<M> + Send + Sync + 'static,
+    F: Fn() -> B + Send + Sync + 'static,
+{
+    let children = vec![spawn_child_spec(0, name, registry, build)];
+    Supervisor::new(config, children)
+        .start_settled(settle)
+        .await
+}
+
 /// Convenience: supervise a single typed actor with OneForOne.
 pub async fn supervise_actor<M, A>(
     actor: A,

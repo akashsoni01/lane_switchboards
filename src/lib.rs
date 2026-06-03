@@ -71,7 +71,7 @@ pub use tls::{
     TlsStream,
 };
 pub use supervisor::{
-    child_spec, spawn_child_spec, supervise_actor, supervise_actor_with_config, ChildRegistry,
-    ChildSlot, ChildSpec, IntensityAction, RestartStrategy, Supervisor, SupervisorConfig,
-    SupervisorHandle,
+    child_spec, spawn_child_spec, supervise_actor, supervise_actor_with_config,
+    supervise_named_child, supervise_named_child_settled, ChildRegistry, ChildSlot, ChildSpec,
+    IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };

@@ -30,6 +30,30 @@ macro_rules! registry_ask {
     }};
 }
 
+/// Start a one-child supervisor with a [`ChildRegistry`] entry (see [`supervise_named_child`]).
+///
+/// ```ignore
+/// supervise_named_child!("dao-a", registry, config, DaoAActor { ... }).await?;
+/// supervise_named_child!("dao-a", registry, config, Duration::from_millis(50), DaoAActor { ... }).await?;
+/// ```
+#[macro_export]
+macro_rules! supervise_named_child {
+    ($name:expr, $registry:expr, $config:expr, $settle:expr, $actor:expr) => {{
+        let __registry = $registry;
+        $crate::supervisor::supervise_named_child_settled(
+            $name,
+            __registry,
+            $config,
+            $settle,
+            move || $actor,
+        )
+    }};
+    ($name:expr, $registry:expr, $config:expr, $actor:expr) => {{
+        let __registry = $registry;
+        $crate::supervisor::supervise_named_child($name, __registry, $config, move || $actor)
+    }};
+}
+
 /// Build a named child spec for a shared [`ChildRegistry`] with less closure boilerplate.
 ///
 /// Usage:

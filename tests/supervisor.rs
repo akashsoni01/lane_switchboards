@@ -1,7 +1,8 @@
 use lane_switchboards::actor::{spawn, Actor, ActorId, ActorProcessingErr};
 use lane_switchboards::monitor::ActorMonitor;
 use lane_switchboards::supervisor::{
-    child_spec, supervise_actor, ChildRegistry, RestartStrategy, Supervisor, SupervisorConfig,
+    child_spec, supervise_actor, supervise_named_child, ChildRegistry, RestartStrategy,
+    Supervisor, SupervisorConfig,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -228,4 +229,26 @@ async fn bidirectional_link_notifies_when_peer_exits_first() {
 
     assert!(alpha_join.is_finished());
     assert!(beta_join.is_finished());
+}
+
+#[tokio::test]
+async fn supervise_named_child_registers_and_restarts() {
+    let registry: Arc<ChildRegistry<EchoMsg, &'static str>> = Arc::new(ChildRegistry::new());
+    let config = SupervisorConfig {
+        strategy: RestartStrategy::OneForOne,
+        ..Default::default()
+    };
+
+    let sup = supervise_named_child("echo", registry.clone(), config, || Echo)
+        .await
+        .expect("supervise_named_child");
+
+    let child = registry.get("echo").await.expect("registered");
+    assert_eq!(child.id, sup.initial_ref().expect("initial ref").id);
+
+    child
+        .send(EchoMsg::Ping)
+        .await
+        .expect("ping before stop");
+    child.stop().await.expect("stop child");
 }

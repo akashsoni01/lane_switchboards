@@ -74,6 +74,10 @@ name = "service"
 path = "examples/service.rs"
 
 [[example]]
+name = "service_complex"
+path = "examples/service_complex.rs"
+
+[[example]]
 name = "hot_upgrade"
 path = "examples/hot_upgrade.rs"
 
