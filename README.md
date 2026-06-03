@@ -6,7 +6,7 @@ OTP-style primitives in Rust: actors, supervision, linking, monitoring, distribu
 
 Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
 
-**Release notes:** [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [v0.0.3](READMEv0.0.3.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
+**Release notes:** [v0.0.6](READMEv0.0.6.md) · [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [v0.0.3](READMEv0.0.3.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
 
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 
@@ -68,8 +68,11 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
 | `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `SupervisorHandle::stop()` |
 | `registry.rs` | Unified `ACTORS` `DashMap` — control + supervisor channels registered atomically |
-| `distributed.rs` | Persistent TCP per peer, optional TLS, frame limits, `Cluster`, `serve_actor` |
-| `tls.rs` | rustls helpers — `MaybeTlsStream`, PEM loaders, `TlsAcceptor` / `TlsConnector` |
+| `distributed.rs` | Persistent TCP per peer, ack frames, frame limits, `Cluster`, `serve_actor` |
+| `consistency.rs` | Write/read consistency levels, quorum math, `ConsistencyConfig` |
+| `stream.rs` | `MaybeTlsStream`, plain TCP connect/accept |
+| `tls.rs` | rustls PEM loaders (`feature = "tls"`) |
+| `paxos.rs` | Paxos acceptor + linearizable read (`SERIAL` / `LOCAL_SERIAL`) |
 | `hash_ring.rs` | `HashRing` / `RingNode` — MurmurHash3 consistent-hash (stable across builds) |
 | `config.rs` | `ActorConfig` mailbox + timeout tuning; `DistributedConfig` bridge, in-flight, frame limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
