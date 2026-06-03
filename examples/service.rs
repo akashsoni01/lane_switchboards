@@ -6,6 +6,10 @@
 //! - **ServiceASupervisor** → `DaoAActor` (`DaoAMsg`), `DaoBActor` (`DaoBMsg`)
 //! - **ServiceBSupervisor** → `DaoBActor` (`DaoBMsg`), `DaoCActor` (`DaoCMsg`)
 //!
+//! `ServiceASupervisor` / `ServiceBSupervisor` are coordinators in `main`, not supervised
+//! actors. DAO failures restart only that child; Service A vs B are isolated. See
+//! `examples/service.md` — “What happens on crash / panic?”.
+//!
 //! Run: `cargo run --example service`
 //! See: `examples/service.md`
 

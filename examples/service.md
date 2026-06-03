@@ -36,6 +36,39 @@ flowchart TB
 
 ---
 
+## What happens on crash / panic?
+
+`ServiceASupervisor` and `ServiceBSupervisor` in this example are **plain Rust structs in `main`**, not `Actor` implementations and not a single `Supervisor` task. Each one owns **two** inner `SupervisorHandle`s (one per DAO). There is **no parent supervisor** above Service A or Service B in this demo.
+
+| Failure | What restarts | What keeps running |
+|---------|----------------|-------------------|
+| **DAO returns `Err` from `handle`** (e.g. `DaoBMsg::Fail`) | That DAO only, via its inner `OneForOne` supervisor | Sibling DAO under the same service struct; the other service struct entirely |
+| **Panic inside DAO `handle`** | Same as `Err` — caught, reported as `RestartSignal`, child restarted | Same as above |
+| **Restart intensity exceeded** on one inner supervisor (`max_restarts` / `within_secs`, default `IntensityAction::ShutdownSupervisor`) | That inner supervisor **stops its child and exits**; no more automatic restarts for that DAO | The **other** inner supervisor under the same `Service*Supervisor` keeps running |
+| **Inner supervisor task ends** (intensity shutdown, channel closed, or `SupervisorHandle::stop`) | That one DAO is stopped | Other inner supervisor + the other `Service*Supervisor` struct |
+| **`main` panics or process exits** | Nothing is supervised at the process level — **everything** stops (Service A and Service B) | — |
+
+### Service A vs Service B isolation
+
+Crashing or restarting a DAO under **`ServiceASupervisor`** does **not** touch **`ServiceBSupervisor`** (separate registries, separate supervisor tasks, separate `DaoB` instances). The demo’s generation snapshots after `fail_dao_b` / `fail_dao_c` show this.
+
+### There is no “service supervisor” restart
+
+If both inner supervisors under `ServiceASupervisor` died, the `ServiceASupervisor` value in `main` would still exist, but `ping_all` would fail (`child not in registry` or send errors on dead refs). **`main` does not automatically rebuild Service A** — you would call `ServiceASupervisor::start()` again (or wrap the service in a real top-level `Supervisor` / actor in production).
+
+Dropping a `SupervisorHandle` without calling `stop()` still shuts down that inner supervisor task (the oneshot shutdown sender is dropped); the sibling handle is unaffected.
+
+### Production follow-up
+
+To recover when a whole service boundary fails, add an outer layer, for example:
+
+- A top-level `Supervisor` whose children are “service” actors, or
+- `main` / orchestrator logic that detects dead handles and re-runs `ServiceASupervisor::start()`.
+
+See [`supervisor_strategies.md`](./supervisor_strategies.md) for intensity limits (`ShutdownSupervisor` vs `AbandonChild`).
+
+---
+
 ## OneForOne behaviour
 
 ```mermaid
@@ -85,19 +118,11 @@ service_a.ping_all().await?;
 service_a.fail_dao_b().await?; // only dao-b restarts inside ServiceASupervisor
 ```
 
-Inside `ServiceASupervisor::start`:
+Inside `ServiceASupervisor::start` — **two** one-child supervisors (typed messages):
 
 ```rust
-let children = vec![
-    spawn_child_spec(0, "dao-a", registry.clone(), || DaoAActor {
-        supervisor: "ServiceASupervisor",
-        registry: registry.clone(),
-    }),
-    spawn_child_spec(1, "dao-b", registry.clone(), || DaoBActor { /* ... */ }),
-];
-let _handle = Supervisor::new(one_for_one_config(), children)
-    .start_settled(Duration::from_millis(50))
-    .await?;
+let dao_a_sup = start_one_child("dao-a", dao_a_registry.clone(), || DaoAActor { /* DaoAMsg */ }).await?;
+let dao_b_sup = start_one_child("dao-b", dao_b_registry.clone(), || DaoBActor { /* DaoBMsg */ }).await?;
 ```
 
 - **`spawn_child_spec`** — one child per inner supervisor + typed `ChildRegistry`.
