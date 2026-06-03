@@ -2,12 +2,16 @@
 //! [`service_complex_cluster`](./service_complex_cluster.rs).
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
+use lane_switchboards::distributed::{Cluster, NodeHandle, RemoteMessage};
 use lane_switchboards::supervisor::{
     supervise_actor, ChildRegistry, RestartStrategy, SupervisorConfig, SupervisorHandle,
 };
 use lane_switchboards::supervise_named_child;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::hash::Hash;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -16,7 +20,138 @@ pub const SERVICE_A: &str = "ServiceASupervisor";
 pub const SERVICE_B: &str = "ServiceBSupervisor";
 pub const SERVICE_TARGET: &str = "service";
 
+/// Maximum replicas per service (autoscale ceiling).
 pub const CLUSTER_REPLICAS: usize = 10;
+pub const CLUSTER_REPLICAS_MAX: usize = CLUSTER_REPLICAS;
+/// Replicas at cluster boot before load-based scale-out.
+pub const CLUSTER_REPLICAS_INITIAL: usize = 2;
+
+/// Scale up when average dispatches per replica in the current window exceeds this.
+pub const AUTOSCALE_REQUESTS_PER_REPLICA: u64 = 12;
+/// Requests per simulated load wave (drives scale-out in the cluster demo).
+pub const AUTOSCALE_LOAD_WAVE_REQUESTS: usize = 24;
+
+/// Load-aware cluster roster: joins new `serve_actor` nodes when per-replica load rises.
+pub struct AutoscalingCluster<M: RemoteMessage> {
+    pub cluster: Cluster<M>,
+    handles: Vec<NodeHandle<M>>,
+    next_replica: usize,
+    dispatches: AtomicU64,
+    window_base: AtomicU64,
+    pub config: AutoscaleConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoscaleConfig {
+    pub max_replicas: usize,
+    /// Average dispatches per replica since last scale (or boot) that triggers scale-out.
+    pub requests_per_replica_threshold: u64,
+    pub scale_step: usize,
+}
+
+impl Default for AutoscaleConfig {
+    fn default() -> Self {
+        Self {
+            max_replicas: CLUSTER_REPLICAS_MAX,
+            requests_per_replica_threshold: AUTOSCALE_REQUESTS_PER_REPLICA,
+            scale_step: 1,
+        }
+    }
+}
+
+impl<M: RemoteMessage> AutoscalingCluster<M> {
+    pub fn new(config: AutoscaleConfig) -> Self {
+        Self {
+            cluster: Cluster::new(),
+            handles: Vec::new(),
+            next_replica: 0,
+            dispatches: AtomicU64::new(0),
+            window_base: AtomicU64::new(0),
+            config,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cluster.len()
+    }
+
+    pub fn join_node(&mut self, handle: NodeHandle<M>, replica_id: usize) {
+        self.cluster.join(handle.member.clone());
+        self.handles.push(handle);
+        self.next_replica = self.next_replica.max(replica_id + 1);
+    }
+
+    fn record_dispatches(&self, count: u64) {
+        self.dispatches.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn load_per_replica(&self) -> u64 {
+        let total = self.dispatches.load(Ordering::Relaxed);
+        let base = self.window_base.load(Ordering::Relaxed);
+        let delta = total.saturating_sub(base);
+        let n = self.cluster.len().max(1) as u64;
+        delta / n
+    }
+
+    /// Add replicas when load in the current window exceeds [`AutoscaleConfig::requests_per_replica_threshold`].
+    pub async fn maybe_scale_up<F, Fut>(&mut self, service_label: &str, mut launch: F) -> std::io::Result<usize>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: Future<Output = std::io::Result<NodeHandle<M>>>,
+    {
+        let per_replica = self.load_per_replica();
+        if self.cluster.len() >= self.config.max_replicas {
+            return Ok(0);
+        }
+        if per_replica < self.config.requests_per_replica_threshold {
+            return Ok(0);
+        }
+
+        let to_add = self
+            .config
+            .scale_step
+            .min(self.config.max_replicas - self.cluster.len());
+        let before = self.cluster.len();
+
+        for _ in 0..to_add {
+            let id = self.next_replica;
+            let handle = launch(id).await?;
+            println!(
+                "[autoscale {service_label}] load {per_replica} req/replica ≥ {} → +1 replica id={id} @ {} (roster {} → {})",
+                self.config.requests_per_replica_threshold,
+                handle.address(),
+                self.cluster.len(),
+                self.cluster.len() + 1
+            );
+            self.join_node(handle, id);
+        }
+
+        self.window_base
+            .store(self.dispatches.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(self.cluster.len() - before)
+    }
+
+    pub async fn broadcast(&self, msg: M) -> std::io::Result<()>
+    where
+        M: Clone,
+    {
+        let n = self.cluster.len() as u64;
+        if n > 0 {
+            self.record_dispatches(n);
+        }
+        self.cluster.broadcast(msg).await
+    }
+
+    pub async fn send_round_robin(&self, msg: M) -> std::io::Result<()> {
+        self.record_dispatches(1);
+        self.cluster.send_round_robin(msg).await
+    }
+
+    pub async fn send_by_key<T: Hash>(&self, key: &T, msg: M) -> std::io::Result<()> {
+        self.record_dispatches(1);
+        self.cluster.send_by_key(key, msg).await
+    }
+}
 
 pub(crate) enum DaoAMsg {
     Ping,

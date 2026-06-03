@@ -92,40 +92,51 @@ For actors **without** a `ChildRegistry`, use [`supervise_actor`](../src/supervi
 
 ## Multi-node cluster (`service_complex_cluster`)
 
-[`service_complex_cluster.rs`](./service_complex_cluster.rs) runs **`CLUSTER_REPLICAS` (10)** independent copies of each service on separate TCP nodes.
+[`service_complex_cluster.rs`](./service_complex_cluster.rs) starts with **`CLUSTER_REPLICAS_INITIAL` (2)** replicas per service and **autoscales** up to **`CLUSTER_REPLICAS_MAX` (10)** when load per replica exceeds a threshold.
 
 | Piece | Role |
 |-------|------|
 | **`serve_actor`** | One node per replica — binds `127.0.0.1:0`, target name `"service"` |
-| **`Cluster<ServiceACommand>`** | Roster of 10 Service A replicas |
-| **`Cluster<ServiceBCommand>`** | Roster of 10 Service B replicas (isolated from A) |
+| **`AutoscalingCluster<M>`** | Tracks dispatches/replica; calls `serve_actor` + `Cluster::join` on scale-out |
+| **`Cluster<ServiceACommand>`** | Roster inside autoscaling wrapper (grows 2 → up to 10) |
+| **`Cluster<ServiceBCommand>`** | Separate roster for Service B |
 | **`ServiceACommand` / `ServiceBCommand`** | `Serialize` remote commands (`PingAll`, `FailDaoB` / `FailDaoC`) |
 
 ```mermaid
 flowchart TB
     Coord["Coordinator main"]
-    CA["Cluster ServiceA × 10"]
-    CB["Cluster ServiceB × 10"]
+    ASA["AutoscalingCluster ServiceA"]
+    ASB["AutoscalingCluster ServiceB"]
 
-    Coord --> CA
-    Coord --> CB
+    Coord --> ASA
+    Coord --> ASB
 
-    CA --> R0["replica-0 TCP node"]
-    CA --> R9["replica-9 TCP node"]
-    CB --> S0["replica-0 TCP node"]
-    CB --> S9["replica-9 TCP node"]
+    ASA -->|"load high"| ScaleA["serve_actor + join"]
+    ASB -->|"load high"| ScaleB["serve_actor + join"]
 ```
+
+### Autoscaling on load increase
+
+| Constant | Default | Meaning |
+|----------|---------|---------|
+| `CLUSTER_REPLICAS_INITIAL` | 2 | Nodes at boot |
+| `CLUSTER_REPLICAS_MAX` | 10 | Ceiling per service |
+| `AUTOSCALE_REQUESTS_PER_REPLICA` | 12 | Scale out when window avg dispatches/replica ≥ this |
+| `AUTOSCALE_LOAD_WAVE_REQUESTS` | 24 | Synthetic load per wave in the demo |
+
+After each load wave, `maybe_scale_up` compares dispatches since the last scale (or boot) to roster size. If average load per replica is above the threshold and roster &lt; max, it launches another `serve_actor` and `join`s it. Service A and Service B scale **independently**.
+
+Tune in [`service_complex_shared.rs`](./service_complex_shared.rs): `AutoscaleConfig` (`max_replicas`, `requests_per_replica_threshold`, `scale_step`).
 
 ### What the cluster demo runs
 
 | Step | API | Expected |
 |------|-----|----------|
-| 1 | Launch 10× `serve_actor` per service | 20 nodes online, printed addresses |
-| 2 | `cluster.broadcast(PingAll)` | Every replica pings its local DAOs |
-| 3 | `cluster_a.send_by_key(&3, FailDaoB)` | Only replica 3 restarts its DaoB |
-| 4 | `send_by_key` + `PingAll` on replica 3 | DaoB back after inner restart |
-| 5 | `cluster_b.send_round_robin(PingAll)` | Spreads calls across B replicas |
-| 6 | `send_by_key(&7, FailDaoC)` on B | Only replica 7’s DaoC restarts |
+| 1 | Boot `CLUSTER_REPLICAS_INITIAL` per service | 4 nodes total |
+| 2 | Load waves: `send_round_robin(PingAll)` × N, then `maybe_scale_up` | Roster grows toward 10 as load rises |
+| 3 | `broadcast(PingAll)` | All replicas in final roster ping DAOs |
+| 4 | `send_by_key(&3, FailDaoB)` on A (if replica exists) | Only that replica’s DaoB restarts |
+| 5 | `send_by_key(&7, FailDaoC)` on B | Only replica 7’s DaoC restarts |
 
 Unlike single-node `service_complex`, there is **no** outer `supervise_actor` on each replica — `serve_actor` owns the service actor mailbox; **inner** `supervise_named_child!` per DAO is unchanged.
 
