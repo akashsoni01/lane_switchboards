@@ -1,6 +1,6 @@
 [package]
 name = "lane_switchboards"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 description = "Telecom-inspired OTP actor runtime for Rust: mailbox routing, supervision trees, let-it-crash fault isolation, and distributed messaging"
 license = "MIT"
