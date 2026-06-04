@@ -9,13 +9,14 @@
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
 use lane_switchboards::distributed::{serve_actor, Cluster};
-use serde::{Deserialize, Serialize};
+use lane_switchboards::prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum WorkMsg {
-    Process { job_id: u64 },
+#[derive(Clone, PartialEq, Message)]
+struct WorkMsg {
+    #[prost(uint64, tag = "1")]
+    job_id: u64,
 }
 
 struct Worker {
@@ -26,11 +27,10 @@ struct Worker {
 #[async_trait::async_trait]
 impl Actor<WorkMsg> for Worker {
     async fn handle(&mut self, msg: WorkMsg) -> Result<(), ActorProcessingErr> {
-        let WorkMsg::Process { job_id } = msg;
         let count = self.processed.fetch_add(1, Ordering::Relaxed) + 1;
         println!(
-            "[{}] processed job {job_id} (total on this node: {count})",
-            self.node_name
+            "[{}] processed job {} (total on this node: {count})",
+            self.node_name, msg.job_id
         );
         Ok(())
     }
@@ -79,14 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for job_id in 1..=6 {
         cluster
-            .send_by_key(&job_id, WorkMsg::Process { job_id })
+            .send_by_key(&job_id, WorkMsg { job_id })
             .await?;
     }
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     println!("\n=== Phase 2: horizontal scale-out (+2 nodes on new hardware) ===\n");
-    println!("Launch new nodes, bind TCP listeners, register addresses in the roster.\n");
+    println!("Launch new nodes, bind gRPC listeners, register addresses in the roster.\n");
 
     let before = cluster.len();
     let node_c = launch_worker("worker-c").await?;
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for job_id in 7..=14 {
         cluster
-            .send_by_key(&job_id, WorkMsg::Process { job_id })
+            .send_by_key(&job_id, WorkMsg { job_id })
             .await?;
     }
 

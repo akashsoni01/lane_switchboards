@@ -329,6 +329,7 @@ pub struct Node<M: RemoteMessage> {
     name: String,
     bind_addr: String,
     dispatch: Arc<Mutex<HashMap<String, DispatchTarget<M>>>>,
+    active_streams: Arc<AtomicUsize>,
     _listener: JoinHandle<()>,
 }
 
@@ -363,7 +364,8 @@ impl<M: RemoteMessage> Node<M> {
         );
 
         let dispatch = Arc::new(Mutex::new(HashMap::<String, DispatchTarget<M>>::new()));
-        let svc = ActorMessagingService::new(dispatch.clone());
+        let active_streams = Arc::new(AtomicUsize::new(0));
+        let svc = ActorMessagingService::new(dispatch.clone(), active_streams.clone());
         let grpc =
             crate::proto::data::actor_messaging_server::ActorMessagingServer::new(svc);
 
@@ -392,8 +394,14 @@ impl<M: RemoteMessage> Node<M> {
             name,
             bind_addr: actual_addr.to_string(),
             dispatch,
+            active_streams,
             _listener: listener_task,
         })
+    }
+
+    /// Active bidirectional gRPC deliver streams on this node.
+    pub fn connected_channels(&self) -> usize {
+        self.active_streams.load(Ordering::Relaxed)
     }
 
     pub fn address(&self) -> &str {

@@ -55,6 +55,7 @@ pub use distributed::{
     Node, NodeHandle, RemoteActorRef, RemoteMessage, TlsAcceptor, TlsConnector,
 };
 pub use hash_ring::{HashRing, RingNode};
+pub use prost::{self, Oneof};
 pub use proto::control;
 pub use proto::data;
 pub use mesh::{

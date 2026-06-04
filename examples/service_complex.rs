@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n--- Crash DaoB under ServiceASupervisor only ---");
     let before = service_a_generations(&dao_a_reg, &dao_b_reg).await;
     service_a
-        .send(ServiceACommand::FailDaoB)
+        .send(ServiceACommand::fail_dao_b())
         .await
         .map_err(actor_err)?;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     println!("\n--- Crash DaoC under ServiceBSupervisor only ---");
     let before = service_b_generations(&dao_b_reg_b, &dao_c_reg).await;
     service_b
-        .send(ServiceBCommand::FailDaoC)
+        .send(ServiceBCommand::fail_dao_c())
         .await
         .map_err(actor_err)?;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -96,14 +96,14 @@ async fn main() -> anyhow::Result<()> {
 
 async fn ping_service_a(service: &ActorRef<ServiceACommand>) -> anyhow::Result<()> {
     service
-        .send(ServiceACommand::PingAll)
+        .send(ServiceACommand::ping_all())
         .await
         .map_err(actor_err)
 }
 
 async fn ping_service_b(service: &ActorRef<ServiceBCommand>) -> anyhow::Result<()> {
     service
-        .send(ServiceBCommand::PingAll)
+        .send(ServiceBCommand::ping_all())
         .await
         .map_err(actor_err)
 }

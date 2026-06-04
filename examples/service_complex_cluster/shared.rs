@@ -7,7 +7,7 @@ use lane_switchboards::supervisor::{
     supervise_actor, ChildRegistry, RestartStrategy, SupervisorConfig, SupervisorHandle,
 };
 use lane_switchboards::supervise_named_child;
-use serde::{Deserialize, Serialize};
+use lane_switchboards::prost::Message;
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
@@ -168,16 +168,54 @@ pub(crate) enum DaoCMsg {
     Fail,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ServiceACommand {
-    PingAll,
-    FailDaoB,
+#[derive(Clone, PartialEq, Message)]
+pub struct ServiceACommand {
+    #[prost(uint32, tag = "1")]
+    pub op: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ServiceBCommand {
-    PingAll,
-    FailDaoC,
+impl std::fmt::Debug for ServiceACommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceACommand").field("op", &self.op).finish()
+    }
+}
+
+impl ServiceACommand {
+    pub const PING_ALL: u32 = 1;
+    pub const FAIL_DAO_B: u32 = 2;
+
+    pub fn ping_all() -> Self {
+        Self { op: Self::PING_ALL }
+    }
+
+    pub fn fail_dao_b() -> Self {
+        Self { op: Self::FAIL_DAO_B }
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ServiceBCommand {
+    #[prost(uint32, tag = "1")]
+    pub op: u32,
+}
+
+impl std::fmt::Debug for ServiceBCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceBCommand").field("op", &self.op).finish()
+    }
+}
+
+impl ServiceBCommand {
+    pub const PING_ALL: u32 = 1;
+    pub const FAIL_DAO_C: u32 = 2;
+
+    pub fn ping_all() -> Self {
+        Self { op: Self::PING_ALL }
+    }
+
+    pub fn fail_dao_c() -> Self {
+        Self { op: Self::FAIL_DAO_C }
+    }
 }
 
 struct DaoAActor {
@@ -377,13 +415,13 @@ impl Actor<ServiceACommand> for ServiceASupervisorActor {
     }
 
     async fn handle(&mut self, msg: ServiceACommand) -> Result<(), ActorProcessingErr> {
-        match msg {
-            ServiceACommand::PingAll => {
+        match msg.op {
+            ServiceACommand::PING_ALL => {
                 send_dao(&self.dao_a_registry, "dao-a", DaoAMsg::Ping).await?;
                 send_dao(&self.dao_b_registry, "dao-b", DaoBMsg::Ping).await?;
                 Ok(())
             }
-            ServiceACommand::FailDaoB => {
+            ServiceACommand::FAIL_DAO_B => {
                 send_dao(&self.dao_b_registry, "dao-b", DaoBMsg::Fail).await?;
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 Ok(())
@@ -493,13 +531,13 @@ impl Actor<ServiceBCommand> for ServiceBSupervisorActor {
     }
 
     async fn handle(&mut self, msg: ServiceBCommand) -> Result<(), ActorProcessingErr> {
-        match msg {
-            ServiceBCommand::PingAll => {
+        match msg.op {
+            ServiceBCommand::PING_ALL => {
                 send_dao(&self.dao_b_registry, "dao-b", DaoBMsg::Ping).await?;
                 send_dao(&self.dao_c_registry, "dao-c", DaoCMsg::Ping).await?;
                 Ok(())
             }
-            ServiceBCommand::FailDaoC => {
+            ServiceBCommand::FAIL_DAO_C => {
                 send_dao(&self.dao_c_registry, "dao-c", DaoCMsg::Fail).await?;
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 Ok(())

@@ -62,9 +62,13 @@ pub fn apply_server_tls(
     #[cfg(feature = "tls")]
     if let Some(t) = tls {
         if let Ok(cfg) = server_tls_config(t) {
-            if let Ok(b) = builder.tls_config(cfg) {
-                return b;
-            }
+            return match builder.tls_config(cfg) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, "gRPC server TLS config failed; serving plain");
+                    tonic::transport::Server::builder()
+                }
+            };
         }
     }
     builder

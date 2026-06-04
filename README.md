@@ -21,7 +21,7 @@ Erlang was built for telephone exchanges — physical **switchboards** where ope
 | **One bad line must not kill the exchange** | “Let it crash” + supervision | Supervisors restart failed children |
 | **Replace a failed circuit automatically** | `OneForOne` / `RestForOne` restart | `supervisor.rs` strategies + intensity limits |
 | **Know who’s up across the floor** | Process registry | `registry.rs` unified `ACTORS` index |
-| **Calls between exchanges** | Distributed Erlang | `distributed.rs` persistent TCP + framed remote actors |
+| **Calls between exchanges** | Distributed Erlang | `distributed.rs` gRPC/protobuf remote actors |
 
 Telecom switches had to stay up under massive concurrent load — faults contained, components replaced in place. That heritage is why Erlang powers high-concurrency systems (messaging backends, IoT routing, soft real-time services). **lane_switchboards** brings the same *shape* — mailboxes, supervision trees, fault isolation — to Rust on top of Tokio, in a small readable core you can extend.
 
@@ -38,7 +38,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | **Supervision trees** | OneForOne / OneForAll / RestForOne + intensity limits | None — manual restart loops | None | Via `ractor-supervisor` |
 | **Link / monitor / trap_exit** | Yes — OTP semantics | None | None | Partial (monitoring exists) |
 | **Hot code upgrade** | In-process `DynActor` swap | None | None | Not built-in |
-| **Distributed actors** | TCP JSON frames, persistent peer connections, cluster roster | Bring your own | Not included | Cluster features vary |
+| **Distributed actors** | gRPC/protobuf, bidi streams, cluster roster | Bring your own | Not included | Cluster features vary |
 | **Global actor registry** | `DashMap` index for cross-actor routing | None | None | Registry patterns available |
 | **Panic → supervisor path** | `catch_unwind` in `handle` | Task dies silently unless you wrap | Request fails; no actor tree | Framework-dependent |
 | **Learning curve** | Small codebase (~1k LOC core) | Low-level, you design everything | Web-focused API | Medium, ecosystem docs |
@@ -68,7 +68,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `actor.rs` | Actors, linking, monitoring, hot upgrade |
 | `supervisor.rs` | OneForOne / OneForAll / RestForOne, `ChildRegistry`, `ChildSlot`, `spawn_child_spec`, `SupervisorHandle::stop()` |
 | `registry.rs` | Unified `ACTORS` `DashMap` — control + supervisor channels registered atomically |
-| `distributed.rs` | Persistent TCP per peer, ack frames, frame limits, `Cluster`, `serve_actor` |
+| `distributed.rs` | gRPC data plane (`ActorMessaging`), acked deliver, `Cluster`, `serve_actor` |
 | `consistency.rs` | Write/read consistency levels, quorum math, `ConsistencyConfig` |
 | `stream.rs` | `MaybeTlsStream`, plain TCP connect/accept |
 | `tls.rs` | rustls PEM loaders (`feature = "tls"`) |
@@ -76,7 +76,7 @@ Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTT
 | `hash_ring.rs` | `HashRing` / `RingNode` — MurmurHash3 consistent-hash (stable across builds) |
 | `config.rs` | `ActorConfig` mailbox + timeout tuning; `DistributedConfig` bridge, in-flight, frame limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
-| `mesh.rs` | TCP service mesh — TTL registry, persistent client, diff sync, `serve_microservice` |
+| `mesh.rs` | gRPC service mesh — TTL registry, tonic client, diff sync, `serve_microservice` |
 
 ### When to use `supervisor.rs`
 
@@ -203,67 +203,31 @@ cluster.send_by_key(&job_id, WorkMsg::Process { job_id }).await?;
 
 See [`horizontal_scaling.md`](examples/horizontal_scaling.md) (`cargo run --example horizontal_scaling`) and [`horizontal_scaling_rest_for_one.md`](examples/horizontal_scaling_rest_for_one.md) (RestForOne processor + reporter per site, multi-send APIs).
 
-## TLS on distributed and mesh TCP (v0.0.5)
+## TLS on gRPC (`feature = "tls"`)
 
-Optional **rustls** encryption wraps the same length-prefixed JSON frames. Plain TCP is still the default when no TLS config is passed.
+Optional **rustls** via [`TlsConfig`](src/config.rs) PEM fields. Plain HTTP/2 is the default when `tls` is `None`.
 
 | Layer | Server | Client |
 |-------|--------|--------|
-| Distributed | `Node::bind_tls_on_runtime`, `serve_actor_tls_on_runtime` | `RemoteActorRef::with_tls`, `Cluster::set_tls_connector` |
-| Service mesh | `MeshRegistryServer::bind_tls`, `serve_microservice_tls` | `MeshRegistryClient::with_tls`, `MeshRouter::with_registry_tls` |
+| Distributed data plane | `DistributedConfig.tls` on `Node::bind_on_current_runtime` | `RemoteActorRef::connect` with same config |
+| Mesh registry | `MeshRegistryHandle::bind_with_tls` | `MeshRegistryClient::connect_with_tls` |
+| Microservice | `serve_microservice_tls` | `ServiceMesh::set_tls` for fan-out |
 
-```rust
-use lane_switchboards::tls::{build_acceptor, build_connector, client_config_from_pem, server_config_from_pem};
-use std::sync::Arc;
+See [`tls_distributed.md`](examples/tls_distributed.md) (`cargo run --example tls_distributed --features tls`) and [`docs/wire_protocol.md`](docs/wire_protocol.md).
 
-let acceptor = Arc::new(build_acceptor(server_config_from_pem("server.crt", "server.key", None)?));
-let connector = Arc::new(build_connector(client_config_from_pem(Some("ca.crt"), None, None)?));
-```
+## gRPC service mesh
 
-See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes and [`tls_distributed.md`](examples/tls_distributed.md) (`cargo run --example tls_distributed`) for mermaid architecture diagrams.
-
-## TCP service mesh
-
-Microservices over TCP with a **control plane** (register / discover) and **data plane** (route frames by service name).
+Microservices over gRPC with a **control plane** (`MeshRegistry`) and **data plane** (`ActorMessaging` bidi `Deliver` streams).
 
 | Component | Role |
 |-----------|------|
-| **`MeshRegistryServer`** | TCP registry with lease TTL (`DEFAULT_RECORD_TTL`, 30s) and background eviction |
-| **`MeshRegistryClient`** | Persistent registry connection; `register`, `renew`, `list`, `sync_mesh` |
-| **`serve_microservice`** | Bind one instance — frame `target` is the unique `instance_id` |
+| **`MeshRegistryHandle`** | gRPC registry with lease TTL (`DEFAULT_RECORD_TTL`, 30s) and background eviction |
+| **`MeshRegistryClient`** | tonic client; `register`, `list`, `watch` |
+| **`serve_microservice`** | Bind one instance — deliver `target` is the unique `instance_id` |
 | **`ServiceMesh` / `MeshRouter`** | Route `invoke(service, key, msg)` via hash ring per service |
-| **`join_mesh`** | Register locally + with TCP registry |
+| **`join_mesh`** | Register locally + with gRPC registry |
 
-Instances must **renew** periodically (`client.renew(record)`) or the registry evicts stale records. `MeshRouter::sync()` applies a **diff** snapshot — the mesh never goes fully empty mid-sync.
-
-```rust
-use lane_switchboards::mesh::{
-    join_mesh, serve_microservice, MeshRegistryClient, MeshRegistryServer, MeshRouter,
-    ServiceMesh, DEFAULT_RECORD_TTL,
-};
-
-let registry = MeshRegistryServer::bind("127.0.0.1:9050").await?;
-let handle = serve_microservice("orders", "orders-1", "127.0.0.1:0", OrdersActor).await?;
-// handle.record.target == "orders-1" (unique dispatch slot per instance)
-
-let mut mesh = ServiceMesh::new();
-join_mesh(&mut mesh, Some(&registry.address), &handle).await?;
-
-let mut router = MeshRouter::with_registry(&registry.address);
-router.sync().await?;
-router.invoke("orders", &order_id, msg).await?;           // one instance (sticky)
-router.invoke_all("orders", health_msg).await;            // every replica
-
-// Renew lease before DEFAULT_RECORD_TTL (e.g. every 15s)
-if let Some(client) = router.registry_client() {
-    client.renew(handle.record.clone()).await?;
-}
-let _ = DEFAULT_RECORD_TTL; // 30 seconds
-```
-
-Control-plane frames are capped at 64 KiB with 30s read timeouts on both registry server and client connections.
-
-See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`) and [`serve_microservice.md`](examples/serve_microservice.md) (bind addresses, ports, calling from other processes).
+Wire types must implement [`RemoteMessage`](src/distributed.rs) (`prost::Message` + `Default`). See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`).
 
 ## Deadlock / slow-handle prevention
 
@@ -357,11 +321,14 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | RestForOne calculator + timer | `cargo run --example rest_for_one_calculator_timer` — see [rest_for_one_calculator_timer.md](examples/rest_for_one_calculator_timer.md) (includes `max_restarts` / `within_secs` intensity breach) |
 | RestForOne calculator + timer (optimized macros) | `cargo run --example rest_for_one_calculator_timer_optimized` — see [rest_for_one_calculator_timer_optimized.md](examples/rest_for_one_calculator_timer_optimized.md) |
 | Latency + deadlock recovery benchmark | `cargo run --example handle_timeout_calculator_timer_latency` — typed child keys (`ChildRegistry<M, K>`) + success-path latency probes |
-| Distributed messaging | `cargo run --example distributed_demo` |
-| Distributed messaging (TLS) | `cargo run --example tls_distributed` — see [tls_distributed.md](examples/tls_distributed.md) |
+| Distributed messaging (gRPC) | `cargo run --example distributed_demo` |
+| gRPC cluster (hash ring + round-robin) | `cargo run --example grpc_cluster` |
+| Distributed messaging (TLS gRPC) | `cargo run --example tls_distributed --features tls` — see [tls_distributed.md](examples/tls_distributed.md) |
+| Write consistency / quorum (`--features tls`) | `cargo run --example consistency --features tls` — see [consistency.md](examples/consistency.md) |
 | Horizontal scaling (add cluster nodes) | `cargo run --example horizontal_scaling` — see [horizontal_scaling.md](examples/horizontal_scaling.md) |
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
-| TCP service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md), [serve_microservice.md](examples/serve_microservice.md) |
+| gRPC service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md) |
+| Supervised services + autoscale cluster | `cargo run --example service_complex_cluster` |
 
 ## Tests
 

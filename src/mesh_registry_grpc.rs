@@ -43,12 +43,13 @@ impl MeshRegistryGrpc for MeshRegistryService {
     ) -> Result<Response<Ack>, Status> {
         let record = ServiceRecord::try_from(request.into_inner())
             .map_err(Status::invalid_argument)?;
-        tracing::info!(
+        let span = tracing::info_span!(
+            "grpc.register",
             service = %record.service,
-            instance = %record.instance_id,
+            instance_id = %record.instance_id,
             address = %record.address,
-            "mesh register (grpc)"
         );
+        let _guard = span.enter();
         self.registry.register(record).await;
         Ok(Response::new(ack_ok()))
     }
@@ -58,6 +59,12 @@ impl MeshRegistryGrpc for MeshRegistryService {
         request: Request<DeregisterRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
+        let span = tracing::info_span!(
+            "grpc.deregister",
+            service = %req.service,
+            instance_id = %req.instance_id,
+        );
+        let _guard = span.enter();
         self.registry
             .deregister(&req.service, &req.instance_id)
             .await;
@@ -68,6 +75,8 @@ impl MeshRegistryGrpc for MeshRegistryService {
         &self,
         _request: Request<ListRequest>,
     ) -> Result<Response<ListReply>, Status> {
+        let span = tracing::info_span!("grpc.list");
+        let _guard = span.enter();
         let records = self.registry.list().await;
         Ok(Response::new(ListReply {
             records: records.into_iter().map(Into::into).collect(),
@@ -75,6 +84,8 @@ impl MeshRegistryGrpc for MeshRegistryService {
     }
 
     async fn ping(&self, _request: Request<PingRequest>) -> Result<Response<Ack>, Status> {
+        let span = tracing::info_span!("grpc.ping");
+        let _guard = span.enter();
         Ok(Response::new(ack_ok()))
     }
 
@@ -82,6 +93,8 @@ impl MeshRegistryGrpc for MeshRegistryService {
         &self,
         _request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
+        let span = tracing::info_span!("grpc.watch");
+        let _guard = span.enter();
         let rx = self.registry.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(|result| result.ok().map(Ok));
         Ok(Response::new(Box::pin(stream)))

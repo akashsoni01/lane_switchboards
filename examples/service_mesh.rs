@@ -1,7 +1,7 @@
-//! TCP service mesh demo: orders, inventory, and billing microservices.
+//! gRPC service mesh demo: orders, inventory, and billing microservices.
 //!
-//! - **Control plane**: `MeshRegistryServer` (TCP register / list)
-//! - **Data plane**: length-prefixed JSON frames to each service instance
+//! - **Control plane**: `MeshRegistryHandle` (register / list / watch)
+//! - **Data plane**: protobuf payloads over `ActorMessaging` bidi streams
 //! - **Router**: `MeshRouter` syncs from registry and invokes by service name + hash key
 //!
 //! Run: `cargo run --example service_mesh`
@@ -9,9 +9,9 @@
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
 use lane_switchboards::mesh::{
-    join_mesh, serve_microservice, MeshRegistryClient, MeshRegistryServer, MeshRouter,
+    join_mesh, serve_microservice, MeshRegistryClient, MeshRegistryHandle, MeshRouter,
 };
-use serde::{Deserialize, Serialize};
+use lane_switchboards::prost::Message;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,27 +35,95 @@ impl Service {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum MeshMsg {
-    Orders(OrdersMsg),
-    Inventory(InventoryMsg),
-    Billing(BillingMsg),
-    HealthCheck,
+#[derive(Clone, PartialEq, Message)]
+struct MeshMsg {
+    #[prost(oneof = "mesh_msg::Kind", tags = "1, 2, 3, 4")]
+    kind: Option<mesh_msg::Kind>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum OrdersMsg {
-    Create { order_id: u64, sku: String, qty: u32 },
+mod mesh_msg {
+    use super::{BillingWire, HealthCheck, InventoryWire, OrdersWire};
+    use lane_switchboards::prost::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Orders(OrdersWire),
+        #[prost(message, tag = "2")]
+        Inventory(InventoryWire),
+        #[prost(message, tag = "3")]
+        Billing(BillingWire),
+        #[prost(message, tag = "4")]
+        HealthCheck(HealthCheck),
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum InventoryMsg {
-    Reserve { order_id: u64, sku: String, qty: u32 },
+#[derive(Clone, PartialEq, Message)]
+struct HealthCheck {}
+
+#[derive(Clone, PartialEq, Message)]
+struct OrdersWire {
+    #[prost(uint64, tag = "1")]
+    order_id: u64,
+    #[prost(string, tag = "2")]
+    sku: String,
+    #[prost(uint32, tag = "3")]
+    qty: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum BillingMsg {
-    Charge { order_id: u64, amount_cents: u64 },
+#[derive(Clone, PartialEq, Message)]
+struct InventoryWire {
+    #[prost(uint64, tag = "1")]
+    order_id: u64,
+    #[prost(string, tag = "2")]
+    sku: String,
+    #[prost(uint32, tag = "3")]
+    qty: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct BillingWire {
+    #[prost(uint64, tag = "1")]
+    order_id: u64,
+    #[prost(uint64, tag = "2")]
+    amount_cents: u64,
+}
+
+impl MeshMsg {
+    fn orders(order_id: u64, sku: String, qty: u32) -> Self {
+        Self {
+            kind: Some(mesh_msg::Kind::Orders(OrdersWire {
+                order_id,
+                sku,
+                qty,
+            })),
+        }
+    }
+
+    fn inventory(order_id: u64, sku: String, qty: u32) -> Self {
+        Self {
+            kind: Some(mesh_msg::Kind::Inventory(InventoryWire {
+                order_id,
+                sku,
+                qty,
+            })),
+        }
+    }
+
+    fn billing(order_id: u64, amount_cents: u64) -> Self {
+        Self {
+            kind: Some(mesh_msg::Kind::Billing(BillingWire {
+                order_id,
+                amount_cents,
+            })),
+        }
+    }
+
+    fn health_check() -> Self {
+        Self {
+            kind: Some(mesh_msg::Kind::HealthCheck(HealthCheck {})),
+        }
+    }
 }
 
 struct OrdersService {
@@ -66,15 +134,19 @@ struct OrdersService {
 #[async_trait::async_trait]
 impl Actor<MeshMsg> for OrdersService {
     async fn handle(&mut self, msg: MeshMsg) -> Result<(), ActorProcessingErr> {
-        match msg {
-            MeshMsg::Orders(OrdersMsg::Create { order_id, sku, qty }) => {
+        match msg.kind {
+            Some(mesh_msg::Kind::Orders(OrdersWire {
+                order_id,
+                sku,
+                qty,
+            })) => {
                 let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
                 println!(
                     "[orders:{}] create order {order_id} sku={sku} qty={qty} (total={n})",
                     self.instance
                 );
             }
-            MeshMsg::HealthCheck => {
+            Some(mesh_msg::Kind::HealthCheck(_)) => {
                 println!("[orders:{}] health ok", self.instance);
             }
             _ => {}
@@ -90,14 +162,18 @@ struct InventoryService {
 #[async_trait::async_trait]
 impl Actor<MeshMsg> for InventoryService {
     async fn handle(&mut self, msg: MeshMsg) -> Result<(), ActorProcessingErr> {
-        match msg {
-            MeshMsg::Inventory(InventoryMsg::Reserve { order_id, sku, qty }) => {
+        match msg.kind {
+            Some(mesh_msg::Kind::Inventory(InventoryWire {
+                order_id,
+                sku,
+                qty,
+            })) => {
                 println!(
                     "[inventory:{}] reserve order {order_id} sku={sku} qty={qty}",
                     self.instance
                 );
             }
-            MeshMsg::HealthCheck => {
+            Some(mesh_msg::Kind::HealthCheck(_)) => {
                 println!("[inventory:{}] health ok", self.instance);
             }
             _ => {}
@@ -113,14 +189,17 @@ struct BillingService {
 #[async_trait::async_trait]
 impl Actor<MeshMsg> for BillingService {
     async fn handle(&mut self, msg: MeshMsg) -> Result<(), ActorProcessingErr> {
-        match msg {
-            MeshMsg::Billing(BillingMsg::Charge { order_id, amount_cents }) => {
+        match msg.kind {
+            Some(mesh_msg::Kind::Billing(BillingWire {
+                order_id,
+                amount_cents,
+            })) => {
                 println!(
                     "[billing:{}] charge order {order_id} amount={amount_cents}c",
                     self.instance
                 );
             }
-            MeshMsg::HealthCheck => {
+            Some(mesh_msg::Kind::HealthCheck(_)) => {
                 println!("[billing:{}] health ok", self.instance);
             }
             _ => {}
@@ -185,16 +264,14 @@ async fn launch(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    println!("=== TCP service mesh ===\n");
+    println!("=== gRPC service mesh ===\n");
 
-    // Control plane
-    let registry = MeshRegistryServer::bind("127.0.0.1:9050").await?;
+    let registry = MeshRegistryHandle::bind("127.0.0.1:0").await?;
     println!("[control] registry @ {}\n", registry.address);
 
     let mut local_mesh = lane_switchboards::mesh::ServiceMesh::new();
     let mut registry_client = MeshRegistryClient::connect(&registry.address).await?;
 
-    // Data plane: microservice instances register locally + via gRPC registry
     let _orders1 = launch(Service::Orders, "orders-1", &mut registry_client, &mut local_mesh).await?;
     let _orders2 = launch(Service::Orders, "orders-2", &mut registry_client, &mut local_mesh).await?;
     let _inv1 = launch(Service::Inventory, "inv-1", &mut registry_client, &mut local_mesh).await?;
@@ -203,7 +280,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Router syncs routing table from control plane
     let mut router = MeshRouter::with_registry(&registry.address);
     router.sync().await?;
 
@@ -221,11 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke(
             Service::Orders.name(),
             &order_id,
-            MeshMsg::Orders(OrdersMsg::Create {
-                order_id,
-                sku: sku.clone(),
-                qty: 2,
-            }),
+            MeshMsg::orders(order_id, sku.clone(), 2),
         )
         .await?;
 
@@ -233,11 +305,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke(
             Service::Inventory.name(),
             &order_id,
-            MeshMsg::Inventory(InventoryMsg::Reserve {
-                order_id,
-                sku,
-                qty: 2,
-            }),
+            MeshMsg::inventory(order_id, sku, 2),
         )
         .await?;
 
@@ -245,10 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .invoke(
             Service::Billing.name(),
             &order_id,
-            MeshMsg::Billing(BillingMsg::Charge {
-                order_id,
-                amount_cents: 4999,
-            }),
+            MeshMsg::billing(order_id, 4999),
         )
         .await?;
 
@@ -258,7 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for service in Service::ALL {
         let results = router
-            .invoke_all(service.name(), MeshMsg::HealthCheck)
+            .invoke_all(service.name(), MeshMsg::health_check())
             .await;
         for (instance, result) in results {
             println!("[router] health {}/{}: {result:?}", service.name(), instance);

@@ -46,6 +46,12 @@ impl PaxosAcceptor for PaxosGrpcService {
         request: Request<PrepareRequest>,
     ) -> Result<Response<PromiseReply>, Status> {
         let req = request.into_inner();
+        let span = tracing::info_span!(
+            "grpc.paxos.prepare",
+            ballot = req.ballot,
+            key = %req.key,
+        );
+        let _guard = span.enter();
         let wire = PaxosWireMsg::Prepare(Prepare {
             ballot: req.ballot,
             key: req.key,
@@ -79,6 +85,13 @@ impl PaxosAcceptor for PaxosGrpcService {
         request: Request<ProposeRequest>,
     ) -> Result<Response<AcceptReply>, Status> {
         let req = request.into_inner();
+        let span = tracing::info_span!(
+            "grpc.paxos.propose",
+            ballot = req.ballot,
+            key = %req.key,
+            value_bytes = req.value.len(),
+        );
+        let _guard = span.enter();
         let wire = PaxosWireMsg::Propose(Propose {
             ballot: req.ballot,
             key: req.key,
@@ -103,6 +116,13 @@ impl PaxosAcceptor for PaxosGrpcService {
         request: Request<CommitRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
+        let span = tracing::info_span!(
+            "grpc.paxos.commit",
+            ballot = req.ballot,
+            key = %req.key,
+            value_bytes = req.value.len(),
+        );
+        let _guard = span.enter();
         let (done_tx, done_rx) = oneshot::channel();
         self.actor
             .send(PaxosMsg::Inject {

@@ -11,18 +11,65 @@ use lane_switchboards::distributed::{serve_actor, Cluster};
 use lane_switchboards::supervisor::{
     spawn_child_spec, ChildRegistry, RestartStrategy, Supervisor, SupervisorConfig,
 };
-use serde::{Deserialize, Serialize};
+use lane_switchboards::prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
 
 // --- Remote wire message (one type per cluster) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum WorkMsg {
-    Process { job_id: u64, value: f64 },
-    Ping,
-    /// Trigger processor failure → RestForOne restarts processor + reporter on that node.
-    FailProcessor,
+#[derive(Clone, PartialEq, Message)]
+struct WorkMsg {
+    #[prost(oneof = "work_msg::Kind", tags = "1, 2, 3")]
+    kind: Option<work_msg::Kind>,
+}
+
+mod work_msg {
+    use super::{WorkFail, WorkPing, WorkProcess};
+    use lane_switchboards::prost::Oneof;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum Kind {
+        #[prost(message, tag = "1")]
+        Process(WorkProcess),
+        #[prost(message, tag = "2")]
+        Ping(WorkPing),
+        #[prost(message, tag = "3")]
+        FailProcessor(WorkFail),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct WorkPing {}
+
+#[derive(Clone, PartialEq, Message)]
+struct WorkFail {}
+
+#[derive(Clone, PartialEq, Message)]
+struct WorkProcess {
+    #[prost(uint64, tag = "1")]
+    job_id: u64,
+    #[prost(double, tag = "2")]
+    value: f64,
+}
+
+impl WorkMsg {
+    fn process(job_id: u64, value: f64) -> Self {
+        Self {
+            kind: Some(work_msg::Kind::Process(WorkProcess { job_id, value })),
+        }
+    }
+
+    fn ping() -> Self {
+        Self {
+            kind: Some(work_msg::Kind::Ping(WorkPing {})),
+        }
+    }
+
+    fn fail_processor() -> Self {
+        Self {
+            kind: Some(work_msg::Kind::FailProcessor(WorkFail {})),
+        }
+    }
 }
 
 // --- Local roles (RestForOne order + registry key) ---
@@ -181,24 +228,25 @@ struct Gateway {
 #[async_trait::async_trait]
 impl Actor<WorkMsg> for Gateway {
     async fn handle(&mut self, msg: WorkMsg) -> Result<(), ActorProcessingErr> {
-        match msg {
-            WorkMsg::Process { job_id, value } => {
+        match msg.kind {
+            Some(work_msg::Kind::Process(WorkProcess { job_id, value })) => {
                 if let Some(processor) = role_ref(&self.registry, LocalRole::Processor).await {
                     processor
                         .send(LocalMsg::Processor(ProcessorMsg::Compute { job_id, value }))
                         .await?;
                 }
             }
-            WorkMsg::Ping => {
+            Some(work_msg::Kind::Ping(_)) => {
                 println!("[{}] gateway ping", self.site);
             }
-            WorkMsg::FailProcessor => {
+            Some(work_msg::Kind::FailProcessor(_)) => {
                 if let Some(processor) = role_ref(&self.registry, LocalRole::Processor).await {
                     let _ = processor
                         .send(LocalMsg::Processor(ProcessorMsg::Fail))
                         .await;
                 }
             }
+            None => {}
         }
         Ok(())
     }
@@ -259,21 +307,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     join(&mut cluster, &site_b);
 
     cluster
-        .send_by_key(&42u64, WorkMsg::Process { job_id: 42, value: 10.0 })
+        .send_by_key(&42u64, WorkMsg::process(42, 10.0))
         .await?;
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     println!("\n=== Send to multiple nodes at once ===\n");
 
-    cluster.broadcast(WorkMsg::Ping).await?;
+    cluster.broadcast(WorkMsg::ping()).await?;
     println!("[coordinator] broadcast Ping → all nodes\n");
 
     let results = cluster
-        .send_all(WorkMsg::Process {
-            job_id: 100,
-            value: 3.0,
-        })
+        .send_all(WorkMsg::process(100, 3.0))
         .await;
     for (name, result) in &results {
         println!("[coordinator] send_all → {name}: {result:?}");
@@ -282,16 +327,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subset = cluster
         .send_to(
             &["site-a"],
-            WorkMsg::Process {
-                job_id: 101,
-                value: 5.0,
-            },
+            WorkMsg::process(101, 5.0),
         )
         .await;
     println!("[coordinator] send_to [site-a]: {:?}\n", subset);
 
     let replicas = cluster
-        .send_replicas(&7u64, 2, WorkMsg::Process { job_id: 7, value: 1.0 })
+        .send_replicas(&7u64, 2, WorkMsg::process(7, 1.0))
         .await;
     println!("[coordinator] send_replicas(key=7, n=2): {:?}\n", replicas);
 
@@ -305,7 +347,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     join(&mut cluster, &site_d);
 
     cluster
-        .send_all(WorkMsg::Ping)
+        .send_all(WorkMsg::ping())
         .await
         .into_iter()
         .for_each(|(name, _)| println!("[coordinator] ping after scale-out → {name}"));
@@ -314,7 +356,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let before_p = site_a.pair.generation(LocalRole::Processor).await;
     let before_r = site_a.pair.generation(LocalRole::Reporter).await;
 
-    cluster.send_to(&["site-a"], WorkMsg::FailProcessor).await;
+    cluster.send_to(&["site-a"], WorkMsg::fail_processor()).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let after_p = site_a.pair.generation(LocalRole::Processor).await;
@@ -326,7 +368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     cluster
-        .send_by_key(&99u64, WorkMsg::Process { job_id: 99, value: 2.0 })
+        .send_by_key(&99u64, WorkMsg::process(99, 2.0))
         .await?;
 
     tokio::time::sleep(Duration::from_millis(100)).await;

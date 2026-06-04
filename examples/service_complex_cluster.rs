@@ -1,5 +1,5 @@
 //! Multi-node deployment with **autoscaling**: start with a small replica count, then add
-//! TCP nodes when per-replica load rises ([`AutoscalingCluster`] in shared module).
+//! gRPC nodes when per-replica load rises ([`AutoscalingCluster`] in shared module).
 //!
 //! Same supervised service actors and inner DAO trees as [`service_complex`](./service_complex.rs).
 //!
@@ -87,10 +87,10 @@ async fn main() -> anyhow::Result<()> {
     for wave in 0..MAX_WAVES {
         for _ in 0..AUTOSCALE_LOAD_WAVE_REQUESTS {
             cluster_a
-                .send_round_robin(ServiceACommand::PingAll)
+                .send_round_robin(ServiceACommand::ping_all())
                 .await?;
             cluster_b
-                .send_round_robin(ServiceBCommand::PingAll)
+                .send_round_robin(ServiceBCommand::ping_all())
                 .await?;
         }
 
@@ -125,8 +125,8 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     println!("\n--- Broadcast PingAll to full rosters ---");
-    cluster_a.broadcast(ServiceACommand::PingAll).await?;
-    cluster_b.broadcast(ServiceBCommand::PingAll).await?;
+    cluster_a.broadcast(ServiceACommand::ping_all()).await?;
+    cluster_b.broadcast(ServiceBCommand::ping_all()).await?;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -134,18 +134,18 @@ async fn main() -> anyhow::Result<()> {
     if cluster_a.len() > FAIL_REPLICA {
         println!("\n--- Fail DaoB on Service A replica {FAIL_REPLICA} (hash key) ---");
         cluster_a
-            .send_by_key(&FAIL_REPLICA, ServiceACommand::FailDaoB)
+            .send_by_key(&FAIL_REPLICA, ServiceACommand::fail_dao_b())
             .await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
         cluster_a
-            .send_by_key(&FAIL_REPLICA, ServiceACommand::PingAll)
+            .send_by_key(&FAIL_REPLICA, ServiceACommand::ping_all())
             .await?;
     }
 
     if cluster_b.len() > 7 {
         println!("\n--- Fail DaoC on Service B replica 7 ---");
         cluster_b
-            .send_by_key(&7, ServiceBCommand::FailDaoC)
+            .send_by_key(&7, ServiceBCommand::fail_dao_c())
             .await?;
         tokio::time::sleep(Duration::from_millis(200)).await;
     }

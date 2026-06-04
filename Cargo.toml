@@ -73,6 +73,11 @@ ed25519-dalek = { version = "2", features = ["std"] }
 blake2 = "0.10"
 base64 = "0.22"
 tempfile = "3"
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "wire"
+harness = false
 
 [build-dependencies]
 tonic-build = "0.12"
@@ -160,8 +165,6 @@ path = "examples/rest_for_one_calculator_timer_optimized.rs"
 name = "handle_timeout_calculator_timer"
 path = "examples/handle_timeout_calculator_timer.rs"
 
-# --- Additional examples (not listed in README) ---
-
 [[example]]
-name = "gateway"
-path = "examples/gateway/main.rs"
+name = "grpc_cluster"
+path = "examples/grpc_cluster.rs"

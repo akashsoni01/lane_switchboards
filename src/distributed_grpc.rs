@@ -6,6 +6,7 @@ use crate::proto::data::actor_messaging_server::ActorMessaging;
 use crate::proto::data::{DeliverReply, DeliverRequest};
 use std::collections::HashMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
@@ -23,11 +24,18 @@ pub enum DispatchTarget<M: RemoteMessage> {
 #[derive(Clone)]
 pub struct ActorMessagingService<M: RemoteMessage> {
     dispatch: Arc<Mutex<HashMap<String, DispatchTarget<M>>>>,
+    active_streams: Arc<AtomicUsize>,
 }
 
 impl<M: RemoteMessage> ActorMessagingService<M> {
-    pub fn new(dispatch: Arc<Mutex<HashMap<String, DispatchTarget<M>>>>) -> Self {
-        Self { dispatch }
+    pub fn new(
+        dispatch: Arc<Mutex<HashMap<String, DispatchTarget<M>>>>,
+        active_streams: Arc<AtomicUsize>,
+    ) -> Self {
+        Self {
+            dispatch,
+            active_streams,
+        }
     }
 }
 
@@ -43,8 +51,18 @@ impl<M: RemoteMessage> ActorMessaging for ActorMessagingService<M> {
         let mut inbound = request.into_inner();
         let (reply_tx, reply_rx) = mpsc::channel(64);
         let dispatch = self.dispatch.clone();
+        let active_streams = self.active_streams.clone();
+        active_streams.fetch_add(1, Ordering::Relaxed);
 
         tokio::spawn(async move {
+            struct StreamGuard(Arc<AtomicUsize>);
+            impl Drop for StreamGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let _guard = StreamGuard(active_streams);
+
             while let Some(item) = inbound.next().await {
                 let req = match item {
                     Ok(r) => r,
