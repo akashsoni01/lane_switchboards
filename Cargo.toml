@@ -79,6 +79,14 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 name = "wire"
 harness = false
 
+[[bench]]
+name = "ecommerce"
+harness = false
+
+[[example]]
+name = "ecommerce_flash_sale"
+path = "examples/ecommerce_flash_sale.rs"
+
 [build-dependencies]
 tonic-build = "0.12"
 prost-build = "0.13"

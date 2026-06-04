@@ -329,6 +329,7 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | Horizontal scaling + RestForOne multi-actor sites | `cargo run --example horizontal_scaling_rest_for_one` — see [horizontal_scaling_rest_for_one.md](examples/horizontal_scaling_rest_for_one.md) |
 | gRPC service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md) |
 | Supervised services + autoscale cluster | `cargo run --example service_complex_cluster` |
+| **E-commerce flash sale** (mesh + supervision + autoscale + QUORUM) | `cargo run --example ecommerce_flash_sale` — see [ecommerce_flash_sale.md](examples/ecommerce_flash_sale.md) |
 
 ## Benchmarks
 
@@ -336,6 +337,7 @@ gRPC wire benchmarks live in [`benches/wire.rs`](benches/wire.rs) (Criterion). T
 
 ```bash
 cargo bench --bench wire
+cargo bench --bench ecommerce   # full checkout saga
 ```
 
 Results below are from one run on **macOS (Apple Silicon), release profile, Tokio multi-thread runtime, all peers on `127.0.0.1`**. Your numbers will vary with CPU load and OS; use these as relative comparisons between operations, not SLA guarantees.
@@ -345,16 +347,18 @@ Results below are from one run on **macOS (Apple Silicon), release profile, Toki
 | `remote_actor_ref_send` | **~1.8 µs** | One fire-and-forget `RemoteActorRef::send` on a warm bidi `Deliver` stream |
 | `mesh_registry_list_32` | **~187 µs** | `MeshRegistryClient::list` with 32 registered instances |
 | `invoke_consistent_quorum_rf3` | **~139 µs** | `ServiceMesh::invoke_consistent` (QUORUM, W=2 of rf=3) across three local replicas |
+| `ecommerce_checkout_pipeline` | **~84 µs** | Order send + QUORUM inventory reserve + billing invoke ([`ecommerce_flash_sale`](examples/ecommerce_flash_sale.rs)) |
 
 Criterion output (same run):
 
 ```
-remote_actor_ref_send     [1.68 µs … 2.02 µs]  median ≈ 1.80 µs
-mesh_registry_list_32     [180.8 µs … 193.2 µs] median ≈ 187 µs
-invoke_consistent_quorum  [135.3 µs … 142.6 µs] median ≈ 139 µs
+remote_actor_ref_send        [1.68 µs … 2.02 µs]   median ≈ 1.80 µs
+mesh_registry_list_32        [180.8 µs … 193.2 µs] median ≈ 187 µs
+invoke_consistent_quorum     [135.3 µs … 142.6 µs] median ≈ 139 µs
+ecommerce_checkout_pipeline  [83.0 µs … 85.6 µs]   median ≈ 84 µs
 ```
 
-See [`docs/wire_protocol.md`](docs/wire_protocol.md) for control/data plane layout.
+See [`docs/wire_protocol.md`](docs/wire_protocol.md) and [`examples/ecommerce_flash_sale.md`](examples/ecommerce_flash_sale.md) for architecture.
 
 ## Tests
 

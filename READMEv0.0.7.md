@@ -316,6 +316,42 @@ Measured on **macOS (Apple Silicon), release profile, peers on 127.0.0.1** — u
 | `remote_actor_ref_send` | **~1.8 µs** | Warm bidi stream, fire-and-forget send |
 | `mesh_registry_list_32` | **~187 µs** | `List` with 32 registered instances |
 | `invoke_consistent_quorum_rf3` | **~139 µs** | QUORUM write, rf=3, three local replicas |
+| `ecommerce_checkout_pipeline` | **~84 µs** | Order + inventory QUORUM + billing ([`ecommerce_flash_sale`](examples/ecommerce_flash_sale.rs)) |
+
+---
+
+## E-commerce flash sale example (v0.7.0)
+
+End-to-end demo combining **supervision**, **autoscaling**, and **mesh QUORUM**:
+
+```bash
+cargo run --example ecommerce_flash_sale
+cargo bench --bench ecommerce
+```
+
+```mermaid
+flowchart TB
+    subgraph sale ["Flash-sale coordinator"]
+        W["checkout waves"]
+    end
+    subgraph orders ["Orders — AutoscalingCluster"]
+        G["OrderGatewayActor"]
+        SUP["Supervisor OneForOne"]
+        PAY["PaymentActor"]
+        FRD["FraudActor"]
+        G --> SUP --> PAY
+        SUP --> FRD
+    end
+    subgraph mesh ["Mesh — gRPC"]
+        INV["inventory ×3 QUORUM"]
+        BILL["billing ×2 invoke"]
+    end
+    W --> orders
+    W -->|"invoke_consistent"| INV
+    W -->|"invoke"| BILL
+```
+
+Details: [`examples/ecommerce_flash_sale.md`](examples/ecommerce_flash_sale.md).
 
 ---
 
@@ -444,4 +480,5 @@ router.invoke("orders", &order_id, OrderMsg { order_id }).await?;
 | `benches/wire.rs` | Criterion wire benchmarks |
 | `docs/wire_protocol.md` | Wire protocol reference |
 | `docs/GRPC_MIGRATION_TODO.md` | Completed migration checklist |
-| `examples/*` | Protobuf wire types; `grpc_cluster` added |
+| `examples/*` | Protobuf wire types; `grpc_cluster`, `ecommerce_flash_sale` added |
+| `benches/ecommerce.rs` | Full checkout pipeline benchmark |
