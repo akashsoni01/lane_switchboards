@@ -1,6 +1,6 @@
 //! OTP-style supervisor with OneForOne, OneForAll, and RestForOne strategies.
 
-use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef};
+use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef, ExitReason};
 use crate::config::ActorConfig;
 use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone)]
 pub struct RestartSignal {
     pub child_id: ActorId,
-    pub reason: String,
+    pub reason: ExitReason,
 }
 
 /// Restart strategy (mirrors Erlang).

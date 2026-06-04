@@ -266,7 +266,10 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
             .map_err(|e| Box::new(e) as ActorProcessingErr)
     }
 
-    pub async fn upgrade(&self, new_impl: impl Actor<M> + 'static) -> Result<(), ActorProcessingErr> {
+    pub async fn upgrade(
+        &self,
+        new_impl: impl Actor<M> + Send + Sync + 'static,
+    ) -> Result<(), ActorProcessingErr> {
         let boxed = into_dyn_actor(new_impl);
         self.tx
             .send(Envelope::Upgrade(boxed))
@@ -320,7 +323,7 @@ where
 }
 
 /// Spawn an actor on the current Tokio runtime.
-pub async fn spawn_on_current_runtime<M, A>(
+pub(crate) async fn spawn_on_current_runtime<M, A>(
     actor: A,
     supervisor_tx: Option<mpsc::Sender<RestartSignal>>,
     config: &ActorConfig,
@@ -371,9 +374,12 @@ async fn run_actor<M: Send + Sync + 'static>(
     let mut links: HashSet<ActorId> = HashSet::new();
     let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
     let mut exit_reason = ExitReason::Normal;
+    let mut actor_version: u32 = 0;
 
     if let Err(e) = actor.dyn_pre_start().await {
         tracing::error!(%id, error = %e, "pre_start failed");
+        let reason = ExitReason::Error(e.to_string());
+        notify_supervisor(id, &reason).await;
         unregister_actor(id);
         ActorMonitor::global().mark_inactive(id);
         return;
@@ -383,7 +389,10 @@ async fn run_actor<M: Send + Sync + 'static>(
         tokio::select! {
             biased;
             ctrl = control_rx.recv() => {
-                let Some(ctrl) = ctrl else { break 'actor_loop };
+                let Some(ctrl) = ctrl else {
+                    exit_reason = ExitReason::Error("control channel closed unexpectedly".into());
+                    break 'actor_loop;
+                };
                 match ctrl {
                     ControlMsg::Link(peer) => {
                         if links.insert(peer) {
@@ -419,15 +428,16 @@ async fn run_actor<M: Send + Sync + 'static>(
                         monitors.push((observer, notify));
                     }
                     Envelope::Demonitor(observer_id) => {
-                        monitors.retain(|(id, _)| *id != observer_id);
+                        monitors.retain(|(mid, _)| *mid != observer_id);
                     }
                     Envelope::Upgrade(new_impl) => {
                         actor = new_impl;
-                        if let Err(e) = actor.dyn_on_upgrade(0).await {
+                        if let Err(e) = actor.dyn_on_upgrade(actor_version).await {
                             exit_reason = ExitReason::Error(e.to_string());
                             break 'actor_loop;
                         }
-                        tracing::info!(%id, "hot code upgrade applied");
+                        actor_version += 1;
+                        tracing::info!(%id, version = actor_version, "hot code upgrade applied");
                     }
                     Envelope::Stop => {
                         exit_reason = ExitReason::Shutdown;
@@ -455,6 +465,8 @@ async fn handle_message<M: Send + Sync + 'static>(
     let started = Instant::now();
     monitor.begin_handle(id);
 
+    // NOTE: on_handle_begin failure is fatal — it terminates the actor.
+    // If you want non-fatal journaling, return Ok(()) and log internally.
     if let Err(e) = actor.dyn_on_handle_begin(&msg).await {
         monitor.record_error(id);
         let reason = ExitReason::Error(e.to_string());
@@ -482,8 +494,8 @@ async fn handle_message<M: Send + Sync + 'static>(
                     tracing::warn!(%id, error = %e, "on_handle_stuck failed");
                 }
                 let reason = ExitReason::HandleTimeout {
-                    elapsed_ms: elapsed.as_millis().min(u64::MAX as u128) as u64,
-                    limit_ms: limit.as_millis().min(u64::MAX as u128) as u64,
+                    elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+                    limit_ms: u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
                 };
                 notify_supervisor(id, &reason).await;
                 return Some(reason);
@@ -560,7 +572,7 @@ async fn notify_supervisor(id: ActorId, reason: &ExitReason) {
         let _ = tx
             .send(RestartSignal {
                 child_id: id,
-                reason: format!("{:?}", reason),
+                reason: reason.clone(),
             })
             .await;
     }

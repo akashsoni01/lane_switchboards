@@ -35,7 +35,7 @@ pub mod supervisor;
 pub mod tls;
 
 pub use actor::{
-    spawn, spawn_on_current_runtime, spawn_on_runtime, spawn_with_config, Actor, ActorId,
+    spawn, spawn_on_runtime, spawn_with_config, Actor, ActorId,
     ActorProcessingErr, ActorRef, DynActor, Envelope, ExitReason, HandleStuckContext,
 };
 pub use config::{
@@ -85,5 +85,5 @@ pub use tls::{
 pub use supervisor::{
     child_spec, spawn_child_spec, supervise_actor, supervise_actor_with_config,
     supervise_named_child, supervise_named_child_settled, ChildRegistry, ChildSlot, ChildSpec,
-    IntensityAction, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
+    IntensityAction, RestartSignal, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
