@@ -91,6 +91,10 @@ path = "examples/ecommerce_flash_sale.rs"
 name = "calculator_mesh"
 path = "examples/calculator_mesh.rs"
 
+[[example]]
+name = "calculator_mesh_simplified"
+path = "examples/calculator_mesh_simplified.rs"
+
 [build-dependencies]
 tonic-build = "0.12"
 prost-build = "0.13"

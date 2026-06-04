@@ -331,6 +331,7 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | Supervised services + autoscale cluster | `cargo run --example service_complex_cluster` |
 | **E-commerce flash sale** (mesh + supervision + autoscale + QUORUM) | `cargo run --example ecommerce_flash_sale` — see [ecommerce_flash_sale.md](examples/ecommerce_flash_sale.md) |
 | Calculator on service mesh (RestForOne + prost) | `cargo run --example calculator_mesh` — see [calculator_mesh.md](examples/calculator_mesh.md) |
+| Calculator mesh (minimal) | `cargo run --example calculator_mesh_simplified` — see [calculator_mesh_simplified.md](examples/calculator_mesh_simplified.md) |
 
 ## Benchmarks
 

@@ -156,6 +156,7 @@ This example does not add a separate bench target; mesh calculator latency is do
 
 | Example | Focus |
 |---------|--------|
+| [`calculator_mesh_simplified.md`](./calculator_mesh_simplified.md) | Same mesh pattern, 1 replica, no timer |
 | [`rest_for_one_calculator_timer_optimized.rs`](./rest_for_one_calculator_timer_optimized.rs) | Macros + RestForOne (local only) |
 | [`service_mesh.rs`](./service_mesh.rs) | Mesh without supervision |
 | [`ecommerce_flash_sale.rs`](./ecommerce_flash_sale.rs) | Mesh + autoscale + QUORUM |
