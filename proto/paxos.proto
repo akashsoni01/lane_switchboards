@@ -1,0 +1,42 @@
+syntax = "proto3";
+package lane_switchboard.paxos;
+
+service PaxosAcceptor {
+  rpc Prepare(PrepareRequest) returns (PromiseReply);
+  rpc Propose(ProposeRequest) returns (AcceptReply);
+  rpc Commit(CommitRequest) returns (Ack);
+}
+
+message PrepareRequest {
+  uint64 ballot = 1;
+  string key = 2;
+}
+
+message PromiseReply {
+  uint64 ballot = 1;
+  bool promised = 2;
+  uint64 accepted_ballot = 3; // 0 if nothing accepted yet
+  bytes accepted_value = 4;
+}
+
+message ProposeRequest {
+  uint64 ballot = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message AcceptReply {
+  bool accepted = 1;
+  uint64 higher_ballot = 2;
+}
+
+message CommitRequest {
+  uint64 ballot = 1;
+  string key = 2;
+  bytes value = 3;
+}
+
+message Ack {
+  bool ok = 1;
+  string error = 2;
+}

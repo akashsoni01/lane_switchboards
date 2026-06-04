@@ -1194,6 +1194,7 @@ where
 }
 
 /// Bind a TCP node and bridge on a dedicated runtime with load limits.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_actor_on_runtime<M, A>(
     runtime: &Handle,
     node_name: impl Into<String>,
@@ -1215,10 +1216,7 @@ where
     let (actor_ref, _actor_join) = spawn_on_runtime(runtime, actor, None, &actor_config)
         .await
         .map_err(|e: ActorProcessingErr| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to spawn bridged actor: {e}"),
-            )
+            std::io::Error::other(format!("failed to spawn bridged actor: {e}"))
         })?;
 
     let node =

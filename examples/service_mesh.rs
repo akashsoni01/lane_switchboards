@@ -132,7 +132,7 @@ impl Actor<MeshMsg> for BillingService {
 async fn launch(
     service: Service,
     instance: &str,
-    registry_addr: &str,
+    registry_client: &mut MeshRegistryClient,
     mesh: &mut lane_switchboards::mesh::ServiceMesh<MeshMsg>,
 ) -> Result<lane_switchboards::mesh::MicroserviceHandle<MeshMsg>, Box<dyn std::error::Error>> {
     let handle = match service {
@@ -171,7 +171,7 @@ async fn launch(
             .await?
         }
     };
-    join_mesh(mesh, Some(registry_addr), &handle).await?;
+    join_mesh(mesh, Some(registry_client), &handle).await?;
     println!(
         "[mesh] registered {} {} @ {}",
         service.name(),
@@ -192,13 +192,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[control] registry @ {}\n", registry.address);
 
     let mut local_mesh = lane_switchboards::mesh::ServiceMesh::new();
+    let mut registry_client = MeshRegistryClient::connect(&registry.address).await?;
 
-    // Data plane: microservice instances register over TCP
-    let _orders1 = launch(Service::Orders, "orders-1", &registry.address, &mut local_mesh).await?;
-    let _orders2 = launch(Service::Orders, "orders-2", &registry.address, &mut local_mesh).await?;
-    let _inv1 = launch(Service::Inventory, "inv-1", &registry.address, &mut local_mesh).await?;
-    let _inv2 = launch(Service::Inventory, "inv-2", &registry.address, &mut local_mesh).await?;
-    let _bill1 = launch(Service::Billing, "bill-1", &registry.address, &mut local_mesh).await?;
+    // Data plane: microservice instances register locally + via gRPC registry
+    let _orders1 = launch(Service::Orders, "orders-1", &mut registry_client, &mut local_mesh).await?;
+    let _orders2 = launch(Service::Orders, "orders-2", &mut registry_client, &mut local_mesh).await?;
+    let _inv1 = launch(Service::Inventory, "inv-1", &mut registry_client, &mut local_mesh).await?;
+    let _inv2 = launch(Service::Inventory, "inv-2", &mut registry_client, &mut local_mesh).await?;
+    let _bill1 = launch(Service::Billing, "bill-1", &mut registry_client, &mut local_mesh).await?;
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -269,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _orders3 = launch(
         Service::Orders,
         "orders-3",
-        &registry.address,
+        &mut registry_client,
         &mut local_mesh,
     )
     .await?;
@@ -279,10 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         router.mesh.instance_count(Service::Orders.name())
     );
 
-    let list = {
-        let mut client = MeshRegistryClient::new(&registry.address);
-        client.list().await?
-    };
+    let list = registry_client.list().await?;
     println!("\n[control] registry records: {}", list.len());
 
     Ok(())

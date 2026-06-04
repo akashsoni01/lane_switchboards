@@ -1,0 +1,56 @@
+syntax = "proto3";
+package lane_switchboard.control;
+
+// Registry control plane — replaces MeshControlMsg JSON enum.
+
+service MeshRegistry {
+  rpc Register(RegisterRequest) returns (Ack);
+  rpc Deregister(DeregisterRequest) returns (Ack);
+  rpc List(ListRequest) returns (ListReply);
+  rpc Ping(PingRequest) returns (Ack);
+  // Streaming: server pushes registry updates to subscribers.
+  rpc Watch(WatchRequest) returns (stream ServiceEvent);
+}
+
+message RegisterRequest {
+  string service = 1;
+  string instance_id = 2;
+  string address = 3;
+  string target = 4;
+  string dc = 5; // empty = local DC
+}
+
+message DeregisterRequest {
+  string service = 1;
+  string instance_id = 2;
+}
+
+message ListRequest {}
+message WatchRequest {}
+message PingRequest {}
+
+message Ack {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ServiceRecord {
+  string service = 1;
+  string instance_id = 2;
+  string address = 3;
+  string target = 4;
+  string dc = 5;
+}
+
+message ListReply {
+  repeated ServiceRecord records = 1;
+}
+
+message ServiceEvent {
+  enum Kind {
+    REGISTERED = 0;
+    DEREGISTERED = 1;
+  }
+  Kind kind = 1;
+  ServiceRecord record = 2;
+}

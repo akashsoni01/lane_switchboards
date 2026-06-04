@@ -17,6 +17,8 @@ pub mod distributed;
 pub mod hash_ring;
 pub mod macros;
 pub mod mesh;
+pub mod mesh_registry_grpc;
+pub mod proto;
 pub mod monitor;
 pub mod paxos;
 pub mod registry;
@@ -49,6 +51,8 @@ pub use distributed::{
 #[cfg(feature = "tls")]
 pub use distributed::serve_actor_tls_on_runtime;
 pub use hash_ring::{HashRing, RingNode};
+pub use proto::control;
+pub use proto::data;
 pub use mesh::{
     join_mesh, serve_microservice, MeshControlMsg, MeshRegistry, MeshRegistryClient,
     MeshRegistryServer, MeshRouter, MicroserviceHandle, ServiceMesh, ServiceRecord,

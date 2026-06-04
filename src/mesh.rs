@@ -11,27 +11,20 @@ use crate::distributed::{
 };
 #[cfg(feature = "tls")]
 use crate::distributed::serve_actor_tls_on_runtime;
-use crate::distributed::TlsAcceptor;
 use crate::hash_ring::HashRing;
 use crate::paxos::{PaxosProposer, PaxosReplica};
-use crate::stream::{self, MaybeTlsStream};
+use crate::stream::TlsConnector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
-use crate::stream::TlsConnector;
+use tokio::sync::{broadcast, RwLock};
 
-/// Max inbound control-plane frame size (registration/list replies are small JSON).
-const MAX_CONTROL_FRAME: u32 = 64 * 1024;
-const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// Records must be renewed via `Register` within this window or the registry evicts them.
 pub const DEFAULT_RECORD_TTL: Duration = Duration::from_secs(30);
-const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const EVICTION_INTERVAL: Duration = Duration::from_secs(5);
+const WATCH_BROADCAST_CAPACITY: usize = 256;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -667,6 +660,7 @@ fn quorum_stats_from_error(err: &ConsistencyError) -> QuorumOutcome {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_consistency_op(
     config: &ConsistencyConfig,
     service: &str,
@@ -975,7 +969,21 @@ where
     })
 }
 
-// --- TCP control plane (discovery) ---
+fn registered_event(record: ServiceRecord) -> crate::proto::control::ServiceEvent {
+    crate::proto::control::ServiceEvent {
+        kind: crate::proto::control::service_event::Kind::Registered as i32,
+        record: Some(record.into()),
+    }
+}
+
+fn deregistered_event(record: ServiceRecord) -> crate::proto::control::ServiceEvent {
+    crate::proto::control::ServiceEvent {
+        kind: crate::proto::control::service_event::Kind::Deregistered as i32,
+        record: Some(record.into()),
+    }
+}
+
+// --- Legacy TCP control types (removed from wire in Phase 6; kept for test fixtures) ---
 
 /// Control-plane message (length-prefixed JSON over TCP).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -988,67 +996,12 @@ pub enum MeshControlMsg {
     Pong,
 }
 
-async fn write_control<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    msg: &MeshControlMsg,
-) -> std::io::Result<()> {
-    let body = serde_json::to_vec(msg).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
-    if body.len() > MAX_CONTROL_FRAME as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("control frame too large: {} bytes", body.len()),
-        ));
-    }
-    stream.write_u32_le(body.len() as u32).await?;
-    stream.write_all(&body).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-async fn read_control_len<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<u32>> {
-    match tokio::time::timeout(CONTROL_READ_TIMEOUT, stream.read_u32_le()).await {
-        Ok(Ok(0)) => Ok(None),
-        Ok(Ok(n)) => {
-            if n > MAX_CONTROL_FRAME {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("control frame too large: {n} bytes"),
-                ));
-            }
-            Ok(Some(n))
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "control read timed out",
-        )),
-    }
-}
-
-async fn read_control<S: AsyncRead + Unpin>(stream: &mut S) -> std::io::Result<Option<MeshControlMsg>> {
-    let Some(len) = read_control_len(stream).await? else {
-        return Ok(None);
-    };
-    let mut buf = vec![0u8; len as usize];
-    tokio::time::timeout(CONTROL_READ_TIMEOUT, stream.read_exact(&mut buf))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "control body read timed out")
-        })??;
-    let msg = serde_json::from_slice(&buf).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
-    Ok(Some(msg))
-}
-
-/// Shared mesh registry backing the TCP control plane.
+/// Shared mesh registry backing the gRPC control plane.
 #[derive(Clone)]
 pub struct MeshRegistry {
     records: Arc<RwLock<HashMap<(String, String), ServiceRecord>>>,
     ttl: Duration,
+    events: broadcast::Sender<crate::proto::control::ServiceEvent>,
 }
 
 impl Default for MeshRegistry {
@@ -1063,23 +1016,39 @@ impl MeshRegistry {
     }
 
     pub fn with_ttl(ttl: Duration) -> Self {
+        let (events, _) = broadcast::channel(WATCH_BROADCAST_CAPACITY);
         Self {
             records: Arc::new(RwLock::new(HashMap::new())),
             ttl,
+            events,
         }
+    }
+
+    pub fn subscribe(&self) -> broadcast::Receiver<crate::proto::control::ServiceEvent> {
+        self.events.subscribe()
+    }
+
+    fn emit(&self, event: crate::proto::control::ServiceEvent) {
+        let _ = self.events.send(event);
     }
 
     pub async fn register(&self, mut record: ServiceRecord) {
         record.registered_at = unix_now();
         let key = (record.service.clone(), record.instance_id.clone());
-        self.records.write().await.insert(key, record);
+        self.records.write().await.insert(key, record.clone());
+        self.emit(registered_event(record));
     }
 
     pub async fn deregister(&self, service: &str, instance_id: &str) -> Option<ServiceRecord> {
-        self.records
+        let removed = self
+            .records
             .write()
             .await
-            .remove(&(service.to_string(), instance_id.to_string()))
+            .remove(&(service.to_string(), instance_id.to_string()));
+        if let Some(record) = &removed {
+            self.emit(deregistered_event(record.clone()));
+        }
+        removed
     }
 
     pub async fn list(&self) -> Vec<ServiceRecord> {
@@ -1106,230 +1075,14 @@ impl MeshRegistry {
     }
 }
 
-/// TCP mesh registry (control plane). Microservices register here for discovery.
-pub struct MeshRegistryServer {
-    pub address: String,
-    registry: MeshRegistry,
-    _task: JoinHandle<()>,
-    _eviction: JoinHandle<()>,
-}
+pub use crate::mesh_registry_grpc::{
+    MeshRegistryClient, MeshRegistryHandle, MeshRegistryServer, PendingMeshRegistryClient,
+};
 
-impl MeshRegistryServer {
-    pub async fn bind(addr: impl Into<String>) -> std::io::Result<Self> {
-        Self::bind_on_runtime(addr, None).await
-    }
-
-    /// Bind the control plane with TLS.
-    #[cfg(feature = "tls")]
-    pub async fn bind_tls(
-        addr: impl Into<String>,
-        tls: Arc<TlsAcceptor>,
-    ) -> std::io::Result<Self> {
-        Self::bind_on_runtime(addr, Some(tls)).await
-    }
-
-    async fn bind_on_runtime(
-        addr: impl Into<String>,
-        tls: Option<Arc<TlsAcceptor>>,
-    ) -> std::io::Result<Self> {
-        let registry = MeshRegistry::new();
-        let listener = TcpListener::bind(addr.into()).await?;
-        let address = listener.local_addr()?.to_string();
-        let reg = registry.clone();
-        let acceptor = tls;
-        let tls_enabled = acceptor.is_some();
-
-        let task = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok((stream, peer)) => {
-                        let reg = reg.clone();
-                        let acceptor = acceptor.clone();
-                        tokio::spawn(async move {
-                            match stream::accept(stream, acceptor.as_deref()).await {
-                                Ok(stream) => {
-                                    if let Err(e) = handle_registry_conn(stream, reg).await {
-                                        tracing::warn!(%peer, error = %e, "mesh registry connection error");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(%peer, error = %e, "mesh registry TLS accept failed");
-                                }
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "mesh registry accept failed");
-                        break;
-                    }
-                }
-            }
-        });
-
-        let reg_evict = registry.clone();
-        let eviction = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(EVICTION_INTERVAL);
-            loop {
-                interval.tick().await;
-                reg_evict.evict_expired().await;
-            }
-        });
-
-        tracing::info!(%address, tls = tls_enabled, "mesh registry listening");
-        Ok(Self {
-            address,
-            registry,
-            _task: task,
-            _eviction: eviction,
-        })
-    }
-
-    pub fn registry(&self) -> &MeshRegistry {
-        &self.registry
-    }
-}
-
-async fn handle_registry_conn(
-    mut stream: MaybeTlsStream,
-    registry: MeshRegistry,
-) -> std::io::Result<()> {
-    loop {
-        let msg = match tokio::time::timeout(CONTROL_READ_TIMEOUT, read_control(&mut stream)).await
-        {
-            Ok(Ok(None)) => break,
-            Ok(Ok(Some(msg))) => msg,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "control read timed out",
-                ))
-            }
-        };
-
-        match msg {
-            MeshControlMsg::Register(record) => {
-                tracing::info!(
-                    service = %record.service,
-                    instance = %record.instance_id,
-                    address = %record.address,
-                    "mesh register"
-                );
-                registry.register(record).await;
-                write_control(&mut stream, &MeshControlMsg::Pong).await?;
-            }
-            MeshControlMsg::Deregister { service, instance_id } => {
-                registry.deregister(&service, &instance_id).await;
-                write_control(&mut stream, &MeshControlMsg::Pong).await?;
-            }
-            MeshControlMsg::List => {
-                let list = registry.list().await;
-                write_control(&mut stream, &MeshControlMsg::ListReply(list)).await?;
-            }
-            MeshControlMsg::Ping => {
-                write_control(&mut stream, &MeshControlMsg::Pong).await?;
-            }
-            MeshControlMsg::Pong | MeshControlMsg::ListReply(_) => {}
-        }
-    }
-    Ok(())
-}
-
-/// Client for the TCP mesh registry (discovery) with a persistent connection.
-pub struct MeshRegistryClient {
-    registry_addr: String,
-    stream: Option<MaybeTlsStream>,
-    tls: Option<Arc<TlsConnector>>,
-}
-
-impl MeshRegistryClient {
-    pub fn new(registry_addr: impl Into<String>) -> Self {
-        Self {
-            registry_addr: registry_addr.into(),
-            stream: None,
-            tls: None,
-        }
-    }
-
-    #[cfg(feature = "tls")]
-    pub fn with_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
-        Self {
-            registry_addr: registry_addr.into(),
-            stream: None,
-            tls: Some(tls),
-        }
-    }
-
-    fn invalidate(&mut self) {
-        self.stream = None;
-    }
-
-    async fn conn(&mut self) -> std::io::Result<&mut MaybeTlsStream> {
-        if self.stream.is_none() {
-            self.stream = Some(stream::connect(&self.registry_addr, self.tls.as_deref()).await?);
-        }
-        Ok(self.stream.as_mut().unwrap())
-    }
-
-    async fn request(&mut self, msg: &MeshControlMsg) -> std::io::Result<MeshControlMsg> {
-        let result = async {
-            let stream = self.conn().await?;
-            write_control(stream, msg).await?;
-            read_control(stream)
-                .await?
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::UnexpectedEof,
-                        "registry closed connection",
-                    )
-                })
-        }
-        .await;
-
-        if result.is_err() {
-            self.invalidate();
-        }
-        result
-    }
-
-    pub async fn register(&mut self, record: ServiceRecord) -> std::io::Result<()> {
-        match self.request(&MeshControlMsg::Register(record)).await? {
-            MeshControlMsg::Pong => Ok(()),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected registry reply",
-            )),
-        }
-    }
-
-    /// Renew a lease by re-registering the same record (resets registry TTL).
-    pub async fn renew(&mut self, record: ServiceRecord) -> std::io::Result<()> {
-        self.register(record).await
-    }
-
-    pub async fn list(&mut self) -> std::io::Result<Vec<ServiceRecord>> {
-        match self.request(&MeshControlMsg::List).await? {
-            MeshControlMsg::ListReply(list) => Ok(list),
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unexpected registry reply",
-            )),
-        }
-    }
-
-    pub async fn sync_mesh<M: RemoteMessage>(
-        &mut self,
-        mesh: &mut ServiceMesh<M>,
-    ) -> std::io::Result<()> {
-        mesh.apply_snapshot_diff(self.list().await?);
-        Ok(())
-    }
-}
-
-/// Sidecar router: local mesh view + optional sync from TCP registry.
+/// Sidecar router: local mesh view + optional sync from gRPC registry.
 pub struct MeshRouter<M: RemoteMessage> {
     pub mesh: ServiceMesh<M>,
-    client: Option<MeshRegistryClient>,
+    client: Option<PendingMeshRegistryClient>,
 }
 
 impl<M: RemoteMessage> MeshRouter<M> {
@@ -1351,15 +1104,14 @@ impl<M: RemoteMessage> MeshRouter<M> {
     pub fn with_registry(registry_addr: impl Into<String>) -> Self {
         Self {
             mesh: ServiceMesh::new(),
-            client: Some(MeshRegistryClient::new(registry_addr)),
+            client: Some(PendingMeshRegistryClient::new(registry_addr)),
         }
     }
 
-    #[cfg(feature = "tls")]
-    pub fn with_registry_tls(registry_addr: impl Into<String>, tls: Arc<TlsConnector>) -> Self {
+    pub fn with_registry_client(client: MeshRegistryClient) -> Self {
         Self {
             mesh: ServiceMesh::new(),
-            client: Some(MeshRegistryClient::with_tls(registry_addr, tls)),
+            client: Some(PendingMeshRegistryClient::from_connected(client)),
         }
     }
 
@@ -1369,15 +1121,15 @@ impl<M: RemoteMessage> MeshRouter<M> {
     ) -> Self {
         Self {
             mesh: ServiceMesh::with_consistency(config),
-            client: Some(MeshRegistryClient::new(registry_addr)),
+            client: Some(PendingMeshRegistryClient::new(registry_addr)),
         }
     }
 
-    pub fn registry_client(&mut self) -> Option<&mut MeshRegistryClient> {
+    pub fn registry_client(&mut self) -> Option<&mut PendingMeshRegistryClient> {
         self.client.as_mut()
     }
 
-    pub async fn sync(&mut self) -> std::io::Result<()> {
+    pub async fn sync(&mut self) -> Result<(), tonic::Status> {
         if let Some(client) = &mut self.client {
             client.sync_mesh(&mut self.mesh).await?;
         }
@@ -1429,17 +1181,15 @@ impl<M: RemoteMessage> MeshRouter<M> {
     }
 }
 
-/// Register instance locally and with the remote TCP registry (if provided).
+/// Register instance locally and with the remote gRPC registry (if provided).
 pub async fn join_mesh<M: RemoteMessage>(
     mesh: &mut ServiceMesh<M>,
-    registry_addr: Option<&str>,
+    registry_client: Option<&mut MeshRegistryClient>,
     handle: &MicroserviceHandle<M>,
-) -> std::io::Result<()> {
+) -> Result<(), tonic::Status> {
     mesh.register(handle.record.clone());
-    if let Some(addr) = registry_addr {
-        MeshRegistryClient::new(addr)
-            .register(handle.record.clone())
-            .await?;
+    if let Some(client) = registry_client {
+        client.register(handle.record.clone()).await?;
     }
     Ok(())
 }
@@ -1484,8 +1234,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registry_grpc_watch_stream() {
+        use crate::proto::control::service_event::Kind;
+        use futures_util::StreamExt;
+
+        let server = MeshRegistryHandle::bind("127.0.0.1:0")
+            .await
+            .expect("registry");
+        let mut client = MeshRegistryClient::connect(&server.address)
+            .await
+            .expect("connect");
+        let mut watch = client.watch().await.expect("watch");
+
+        let record = ServiceRecord {
+            service: "watch-svc".into(),
+            instance_id: "w-1".into(),
+            address: "127.0.0.1:1".into(),
+            target: "w-1".into(),
+            dc: None,
+            registered_at: 0,
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            client.register(record).await.expect("register");
+        });
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), watch.next())
+            .await
+            .expect("timeout")
+            .expect("stream")
+            .expect("event");
+        assert_eq!(event.kind, Kind::Registered as i32);
+        assert_eq!(
+            event.record.as_ref().expect("record").instance_id,
+            "w-1"
+        );
+    }
+
+    #[tokio::test]
     async fn registry_control_plane() {
-        let server = MeshRegistryServer::bind("127.0.0.1:0")
+        let server = MeshRegistryHandle::bind("127.0.0.1:0")
             .await
             .expect("registry");
         let record = ServiceRecord {
@@ -1496,7 +1285,9 @@ mod tests {
             dc: None,
             registered_at: 0,
         };
-        let mut client = MeshRegistryClient::new(&server.address);
+        let mut client = MeshRegistryClient::connect(&server.address)
+            .await
+            .expect("connect");
         client.register(record.clone()).await.expect("register");
         let list = client.list().await.expect("list");
         assert_eq!(list.len(), 1);

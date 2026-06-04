@@ -1,0 +1,22 @@
+syntax = "proto3";
+package lane_switchboard.data;
+
+// Data plane — replaces raw Frame JSON + handle_conn loop.
+
+service ActorMessaging {
+  // Bidirectional stream: client sends frames, server acks.
+  rpc Deliver(stream DeliverRequest) returns (stream DeliverReply);
+}
+
+message DeliverRequest {
+  uint64 frame_id = 1; // unique per frame, for ack matching
+  string target = 2; // actor name on the remote node
+  bytes payload = 3; // protobuf-encoded M (opaque bytes)
+  bool expect_ack = 4;
+}
+
+message DeliverReply {
+  uint64 frame_id = 1;
+  bool ok = 2;
+  string error = 3;
+}

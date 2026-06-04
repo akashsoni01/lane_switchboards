@@ -11,11 +11,18 @@ include = [
     "Cargo.toml",
     "README.md",
     "LICENSE",
+    "build.rs",
+    "proto/**",
     "src/**",
     "docs/**",
 ]
 
 [dependencies]
+prost = "0.13"
+prost-types = "0.13"
+tonic = { version = "0.12", features = ["transport", "codegen"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+bytes = "1"
 tokio = { version = "1.38", features = ["full"] }
 tracing = { version = "0.1", features = ["log", "max_level_info", "release_max_level_warn"] }
 dashmap = "6.1"
@@ -59,6 +66,10 @@ blake2 = "0.10"
 base64 = "0.22"
 rcgen = "0.13"
 tempfile = "3"
+
+[build-dependencies]
+tonic-build = "0.12"
+prost-build = "0.13"
 
 # --- Core runtime demos ---
 
