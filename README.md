@@ -330,6 +330,32 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | gRPC service mesh (orders / inventory / billing) | `cargo run --example service_mesh` — see [service_mesh.md](examples/service_mesh.md) |
 | Supervised services + autoscale cluster | `cargo run --example service_complex_cluster` |
 
+## Benchmarks
+
+gRPC wire benchmarks live in [`benches/wire.rs`](benches/wire.rs) (Criterion). They measure localhost paths on a single machine (release build, no TLS):
+
+```bash
+cargo bench --bench wire
+```
+
+Results below are from one run on **macOS (Apple Silicon), release profile, Tokio multi-thread runtime, all peers on `127.0.0.1`**. Your numbers will vary with CPU load and OS; use these as relative comparisons between operations, not SLA guarantees.
+
+| Benchmark | Typical time (median) | What it measures |
+|-----------|----------------------|------------------|
+| `remote_actor_ref_send` | **~1.8 µs** | One fire-and-forget `RemoteActorRef::send` on a warm bidi `Deliver` stream |
+| `mesh_registry_list_32` | **~187 µs** | `MeshRegistryClient::list` with 32 registered instances |
+| `invoke_consistent_quorum_rf3` | **~139 µs** | `ServiceMesh::invoke_consistent` (QUORUM, W=2 of rf=3) across three local replicas |
+
+Criterion output (same run):
+
+```
+remote_actor_ref_send     [1.68 µs … 2.02 µs]  median ≈ 1.80 µs
+mesh_registry_list_32     [180.8 µs … 193.2 µs] median ≈ 187 µs
+invoke_consistent_quorum  [135.3 µs … 142.6 µs] median ≈ 139 µs
+```
+
+See [`docs/wire_protocol.md`](docs/wire_protocol.md) for control/data plane layout.
+
 ## Tests
 
 ```bash

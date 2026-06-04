@@ -6,8 +6,10 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use lane_switchboards::distributed::{serve_actor, RemoteActorRef};
 use lane_switchboards::mesh::{MeshRegistryClient, MeshRegistryHandle, ServiceRecord};
 use lane_switchboards::prost::Message;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
+use tokio::sync::Mutex;
 
 #[derive(Clone, PartialEq, Message)]
 struct BenchPing {
@@ -33,27 +35,29 @@ fn rt() -> Runtime {
 
 fn bench_remote_send(c: &mut Criterion) {
     let runtime = rt();
-    let addr = runtime.block_on(async {
+    let remote = runtime.block_on(async {
         let node = serve_actor("bench", "127.0.0.1:0", "t", BenchActor)
             .await
             .expect("bind");
-        node.address().to_string()
+        let addr = node.address().to_string();
+        RemoteActorRef::<BenchPing>::new(&addr, "t")
     });
-    let remote = RemoteActorRef::<BenchPing>::new(&addr, "t");
 
     c.bench_function("remote_actor_ref_send", |b| {
-        b.to_async(&runtime).iter(|| async {
-            remote
-                .send(black_box(BenchPing { n: 1 }))
-                .await
-                .expect("send");
+        b.iter(|| {
+            runtime.block_on(async {
+                remote
+                    .send(black_box(BenchPing { n: 1 }))
+                    .await
+                    .expect("send");
+            });
         });
     });
 }
 
 fn bench_mesh_registry_list(c: &mut Criterion) {
     let runtime = rt();
-    let (registry_addr, mut client) = runtime.block_on(async {
+    let client = runtime.block_on(async {
         let handle = MeshRegistryHandle::bind("127.0.0.1:0")
             .await
             .expect("registry bind");
@@ -73,20 +77,24 @@ fn bench_mesh_registry_list(c: &mut Criterion) {
                 .await
                 .expect("register");
         }
-        (handle.address, client)
+        Arc::new(Mutex::new(client))
     });
 
     c.bench_function("mesh_registry_list_32", |b| {
-        b.to_async(&runtime).iter(|| async {
-            let _ = black_box(
-                client
-                    .list()
-                    .await
-                    .expect("list"),
-            );
+        b.iter(|| {
+            let client = client.clone();
+            runtime.block_on(async {
+                let _ = black_box(
+                    client
+                        .lock()
+                        .await
+                        .list()
+                        .await
+                        .expect("list"),
+                );
+            });
         });
     });
-    let _ = registry_addr;
 }
 
 fn bench_invoke_consistent_quorum(c: &mut Criterion) {
@@ -125,14 +133,16 @@ fn bench_invoke_consistent_quorum(c: &mut Criterion) {
     });
 
     c.bench_function("invoke_consistent_quorum_rf3", |b| {
-        b.to_async(&runtime).iter(|| async {
-            mesh.invoke_consistent(
-                "inventory",
-                &"sku",
-                black_box(BenchPing { n: 42 }),
-            )
-            .await
-            .expect("quorum");
+        b.iter(|| {
+            runtime.block_on(async {
+                mesh.invoke_consistent(
+                    "inventory",
+                    &"sku",
+                    black_box(BenchPing { n: 42 }),
+                )
+                .await
+                .expect("quorum");
+            });
         });
     });
 }
