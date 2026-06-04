@@ -98,6 +98,15 @@ pub struct MeshRegistryHandle {
 
 impl MeshRegistryHandle {
     pub async fn bind(addr: impl Into<String>) -> std::io::Result<Self> {
+        Self::bind_with_tls(addr, None).await
+    }
+
+    pub async fn bind_with_tls(
+        addr: impl Into<String>,
+        tls: Option<crate::config::TlsConfig>,
+    ) -> std::io::Result<Self> {
+        #[cfg(not(feature = "tls"))]
+        let _ = tls;
         let addr_str = addr.into();
         let socket_addr: SocketAddr = addr_str.parse().map_err(|e| {
             std::io::Error::new(
@@ -112,14 +121,22 @@ impl MeshRegistryHandle {
 
         let listener = tokio::net::TcpListener::bind(socket_addr).await?;
         let address = listener.local_addr()?.to_string();
+        #[cfg(feature = "tls")]
+        let server_tls = tls;
 
         let task = tokio::spawn(async move {
-            let incoming =
-                tokio_stream::wrappers::TcpListenerStream::new(listener);
-            if let Err(e) = tonic::transport::Server::builder()
-                .add_service(grpc)
-                .serve_with_incoming(incoming)
-                .await
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            #[cfg(feature = "tls")]
+            let tls_ref = server_tls.as_ref();
+            #[cfg(not(feature = "tls"))]
+            let tls_ref: Option<&crate::config::TlsConfig> = None;
+            if let Err(e) = crate::grpc_tls::apply_server_tls(
+                tonic::transport::Server::builder(),
+                tls_ref,
+            )
+            .add_service(grpc)
+            .serve_with_incoming(incoming)
+            .await
             {
                 tracing::error!(error = %e, "mesh registry gRPC server exited");
             }
@@ -159,11 +176,24 @@ pub struct MeshRegistryClient {
 }
 
 impl MeshRegistryClient {
-    pub async fn connect(addr: &str) -> Result<Self, tonic::transport::Error> {
-        let uri = grpc_endpoint(addr);
-        let inner =
-            crate::proto::control::mesh_registry_client::MeshRegistryClient::connect(uri)
-                .await?;
+    pub async fn connect(addr: &str) -> Result<Self, std::io::Error> {
+        Self::connect_with_tls(addr, None).await
+    }
+
+    pub async fn connect_with_tls(
+        addr: &str,
+        tls: Option<&crate::config::TlsConfig>,
+    ) -> Result<Self, std::io::Error> {
+        let uri = grpc_endpoint(addr, tls.is_some());
+        let endpoint = tonic::transport::Endpoint::from_shared(uri)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let domain = crate::grpc_tls::tls_domain_from_addr(addr);
+        let endpoint = crate::grpc_tls::apply_client_tls(endpoint, tls, domain)?;
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(std::io::Error::other)?;
+        let inner = crate::proto::control::mesh_registry_client::MeshRegistryClient::new(channel);
         Ok(Self { inner })
     }
 
@@ -244,7 +274,7 @@ impl PendingMeshRegistryClient {
         }
     }
 
-    pub async fn connect(&mut self) -> Result<&mut MeshRegistryClient, tonic::transport::Error> {
+    pub async fn connect(&mut self) -> Result<&mut MeshRegistryClient, std::io::Error> {
         if self.inner.is_none() {
             self.inner = Some(MeshRegistryClient::connect(&self.addr).await?);
         }
@@ -252,12 +282,12 @@ impl PendingMeshRegistryClient {
     }
 
     pub async fn register(&mut self, record: ServiceRecord) -> Result<(), tonic::Status> {
-        self.connect().await.map_err(tonic_status_from_transport)?;
+        self.connect().await.map_err(tonic_status_from_io)?;
         self.inner.as_mut().unwrap().register(record).await
     }
 
     pub async fn list(&mut self) -> Result<Vec<ServiceRecord>, tonic::Status> {
-        self.connect().await.map_err(tonic_status_from_transport)?;
+        self.connect().await.map_err(tonic_status_from_io)?;
         self.inner.as_mut().unwrap().list().await
     }
 
@@ -265,17 +295,13 @@ impl PendingMeshRegistryClient {
         &mut self,
         mesh: &mut crate::mesh::ServiceMesh<M>,
     ) -> Result<(), tonic::Status> {
-        self.connect().await.map_err(tonic_status_from_transport)?;
+        self.connect().await.map_err(tonic_status_from_io)?;
         self.inner.as_mut().unwrap().sync_mesh(mesh).await
     }
 }
 
-fn grpc_endpoint(addr: &str) -> String {
-    if addr.starts_with("http://") || addr.starts_with("https://") {
-        addr.to_string()
-    } else {
-        format!("http://{addr}")
-    }
+fn grpc_endpoint(addr: &str, tls: bool) -> String {
+    crate::distributed::grpc_data_endpoint(addr, tls)
 }
 
 #[allow(clippy::result_large_err)]
@@ -291,7 +317,7 @@ fn ack_ok_or_status(ack: Ack) -> Result<(), tonic::Status> {
     }
 }
 
-fn tonic_status_from_transport(e: tonic::transport::Error) -> tonic::Status {
+fn tonic_status_from_io(e: std::io::Error) -> tonic::Status {
     Status::unavailable(e.to_string())
 }
 

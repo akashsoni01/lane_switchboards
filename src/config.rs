@@ -35,28 +35,44 @@ impl ActorConfig {
     }
 }
 
-/// Distributed TCP bridge sizing and per-node load limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// PEM material for gRPC TLS (`feature = "tls"`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsConfig {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    /// Trusted CA for clients; when set on servers, enables client certificate auth.
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+/// Distributed node / remote-ref tuning.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DistributedConfig {
+    /// Legacy field (unused; HTTP/2 flow control replaces TCP `max_in_flight`).
     pub bridge_capacity: usize,
-    /// Max in-flight frame dispatches per TCP node (semaphore backpressure).
+    /// Default timeout for [`crate::distributed::RemoteActorRef::send_with_ack`] when not overridden.
+    pub ack_timeout: Duration,
+    /// Legacy field (unused on gRPC wire).
     pub max_in_flight: usize,
-    /// Reject inbound frames larger than this (bytes).
+    /// Legacy field (unused on gRPC wire).
     pub max_frame_bytes: u32,
-    /// Per-read timeout on inbound TCP connections.
+    /// Legacy field (unused on gRPC wire).
     pub read_timeout: Duration,
-    /// Outbound remote send queue depth per [`crate::distributed::RemoteActorRef`].
+    /// Legacy field (unused; bidi stream buffers deliveries).
     pub remote_send_capacity: usize,
+    /// gRPC server/client TLS (`feature = "tls"`).
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for DistributedConfig {
     fn default() -> Self {
         Self {
             bridge_capacity: 32,
+            ack_timeout: Duration::from_secs(30),
             max_in_flight: 32,
             max_frame_bytes: 4 * 1024 * 1024,
             read_timeout: Duration::from_secs(30),
             remote_send_capacity: 32,
+            tls: None,
         }
     }
 }

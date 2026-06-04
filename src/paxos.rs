@@ -3,18 +3,15 @@
 //! Implements Prepare → Promise (read path). Propose → Accept → Commit (CAS writes) are
 //! defined on the wire but client-side conditional writes are not implemented yet.
 
-use crate::actor::{spawn, Actor, ActorProcessingErr, ActorRef};
+use crate::actor::{Actor, ActorProcessingErr, ActorRef};
 use crate::config::DistributedConfig;
 use crate::consistency::ConsistencyError;
-use crate::distributed::{
-    paxos_request, Node, PaxosRpc,
-};
-use serde::{Deserialize, Serialize};
+use crate::paxos_grpc::{bind_paxos_acceptor_on_runtime, PaxosAcceptorHandle};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 
 static BALLOT_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -22,53 +19,52 @@ fn next_ballot() -> u64 {
     BALLOT_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// TCP dispatch target for a service Paxos acceptor: `__paxos__{service}`.
+/// Legacy dispatch label for a service Paxos acceptor: `__paxos__{service}` (gRPC uses dedicated acceptor servers).
 pub fn paxos_target(service: &str) -> String {
     format!("__paxos__{service}")
 }
 
 /// Prepare phase message for Paxos reads ([`ReadConsistency::Serial`]).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prepare {
     pub ballot: u64,
     pub key: String,
 }
 
 /// Acceptor response to [`Prepare`] carrying the highest accepted value, if any.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Promise {
     pub ballot: u64,
     pub accepted: Option<(u64, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Propose {
     pub ballot: u64,
     pub key: String,
     pub value: Vec<u8>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accept {
     pub ballot: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reject {
     pub ballot: u64,
     pub higher: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub ballot: u64,
     pub key: String,
     pub value: Vec<u8>,
 }
 
-/// Length-prefixed JSON Paxos wire messages (same framing as data-plane frames).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+/// In-process Paxos messages handled by [`PaxosNode`] (gRPC uses `proto::paxos` on the wire).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaxosWireMsg {
     Prepare(Prepare),
     Promise(Promise),
@@ -176,17 +172,13 @@ impl Actor<PaxosMsg> for PaxosNode {
     }
 }
 
-/// Handle returned when a Paxos acceptor is bound to TCP.
+/// Handle returned when a Paxos acceptor is bound (gRPC).
 pub struct PaxosHandle {
     pub target: String,
     pub address: String,
     pub actor: ActorRef<PaxosMsg>,
-    _bridge: tokio::task::JoinHandle<()>,
-    _node: Node<PaxosPlaceholder>,
+    _inner: PaxosAcceptorHandle,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PaxosPlaceholder;
 
 /// A remote or local Paxos replica endpoint.
 #[derive(Clone)]
@@ -256,7 +248,7 @@ impl PaxosProposer {
             for replica in replicas {
                 let rep = replica.clone();
                 let prep = prepare.clone();
-                let config = self.config;
+                let config = self.config.clone();
                 join_set.spawn(async move { send_prepare(&rep, &prep, timeout, &config).await });
             }
 
@@ -312,30 +304,58 @@ async fn send_prepare(
     replica: &PaxosReplica,
     prepare: &PaxosWireMsg,
     timeout: Duration,
-    config: &DistributedConfig,
+    _config: &DistributedConfig,
 ) -> Result<PaxosWireMsg, ConsistencyError> {
-    let payload = serde_json::to_value(prepare).map_err(|_| ConsistencyError::NotEnoughAcks {
-        required: 1,
-        received: 0,
-        dc: None,
-    })?;
-    let data = paxos_request(
-        &replica.node_addr,
-        &replica.target,
-        payload,
+    let PaxosWireMsg::Prepare(p) = prepare else {
+        return Err(ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        });
+    };
+    let uri = crate::distributed::grpc_data_endpoint(&replica.node_addr, false);
+    let mut client =
+        crate::proto::paxos::paxos_acceptor_client::PaxosAcceptorClient::connect(uri)
+            .await
+            .map_err(|_| ConsistencyError::NotEnoughAcks {
+                required: 1,
+                received: 0,
+                dc: None,
+            })?;
+    let reply = tokio::time::timeout(
         timeout,
-        config,
-        None,
+        client.prepare(crate::proto::paxos::PrepareRequest {
+            ballot: p.ballot,
+            key: p.key.clone(),
+        }),
     )
-    .await?;
-    serde_json::from_value(data).map_err(|_| ConsistencyError::NotEnoughAcks {
+    .await
+    .map_err(|_| ConsistencyError::Timeout { after: timeout })?
+    .map_err(|_| ConsistencyError::NotEnoughAcks {
         required: 1,
         received: 0,
         dc: None,
-    })
+    })?
+    .into_inner();
+    if reply.promised {
+        let accepted = if reply.accepted_ballot > 0 {
+            Some((reply.accepted_ballot, reply.accepted_value))
+        } else {
+            None
+        };
+        Ok(PaxosWireMsg::Promise(Promise {
+            ballot: reply.ballot,
+            accepted,
+        }))
+    } else {
+        Ok(PaxosWireMsg::Reject(Reject {
+            ballot: p.ballot,
+            higher: reply.accepted_ballot,
+        }))
+    }
 }
 
-/// Spawn a Paxos acceptor on TCP and register it under [`paxos_target`].
+/// Spawn a Paxos acceptor (gRPC) for a service.
 pub async fn serve_paxos_acceptor(
     service: impl Into<String>,
     bind_addr: impl Into<String>,
@@ -349,57 +369,12 @@ pub async fn serve_paxos_acceptor_on_runtime(
     service: impl Into<String>,
     bind_addr: impl Into<String>,
 ) -> std::io::Result<PaxosHandle> {
-    let service = service.into();
-    let target = paxos_target(&service);
-    let distributed = DistributedConfig::default();
-
-    let (actor, _join) = spawn(PaxosNode::default(), None).await.map_err(|e| {
-        std::io::Error::other(format!("spawn paxos node: {e}"))
-    })?;
-
-    let node = Node::<PaxosPlaceholder>::bind_on_runtime(
-        runtime,
-        format!("paxos-{service}"),
-        bind_addr,
-        &distributed,
-        None,
-    )
-    .await?;
-
-    let address = node.address().to_string();
-    let (rpc_tx, mut rpc_rx) = mpsc::channel(distributed.bridge_capacity);
-    node.register_paxos(&target, rpc_tx).await;
-
-    let actor_ref = actor.clone();
-    let paxos_table = node.paxos_dispatch();
-    let target_for_bridge = target.clone();
-    let bridge = tokio::spawn(async move {
-        while let Some(PaxosRpc { payload, reply }) = rpc_rx.recv().await {
-            let result = async {
-                let wire: PaxosWireMsg = serde_json::from_value(payload)
-                    .map_err(|e| format!("invalid paxos payload: {e}"))?;
-                let (resp_tx, resp_rx) = oneshot::channel();
-                actor_ref
-                    .send(PaxosMsg::Rpc(wire, resp_tx))
-                    .await
-                    .map_err(|_| "paxos actor mailbox closed".to_string())?;
-                let resp = resp_rx
-                    .await
-                    .map_err(|_| "paxos actor dropped reply".to_string())?;
-                serde_json::to_value(resp).map_err(|e| format!("encode paxos reply: {e}"))
-            }
-            .await;
-            let _ = reply.send(result);
-        }
-        paxos_table.lock().await.remove(&target_for_bridge);
-    });
-
+    let inner = bind_paxos_acceptor_on_runtime(runtime, service, bind_addr).await?;
     Ok(PaxosHandle {
-        target,
-        address,
-        actor,
-        _bridge: bridge,
-        _node: node,
+        target: inner.target.clone(),
+        address: inner.address.clone(),
+        actor: inner.actor.clone(),
+        _inner: inner,
     })
 }
 
@@ -419,24 +394,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paxos_rpc_roundtrip() {
+    async fn paxos_grpc_prepare_roundtrip() {
         let h = serve_paxos_acceptor("kv", "127.0.0.1:0").await.expect("serve");
         let prepare = PaxosWireMsg::Prepare(Prepare {
             ballot: 1,
             key: "k".into(),
         });
-        let payload = serde_json::to_value(&prepare).unwrap();
-        let resp = crate::distributed::paxos_request(
-            &h.address,
-            &h.target,
-            payload,
+        let wire = send_prepare(
+            &PaxosReplica::from_member("kv", &h.address),
+            &prepare,
             Duration::from_secs(2),
             &DistributedConfig::default(),
-            None,
         )
         .await
-        .expect("rpc");
-        let wire: PaxosWireMsg = serde_json::from_value(resp).expect("parse");
+        .expect("grpc prepare");
         assert!(matches!(wire, PaxosWireMsg::Promise(_)));
     }
 

@@ -1,4 +1,4 @@
-//! TCP service mesh: register microservice instances, discover by name, route via hash ring.
+//! gRPC service mesh: register microservice instances, discover by name, route via hash ring.
 
 use crate::consistency::{
     each_quorum_acks_required, is_local_only, is_local_only_read, is_paxos_read,
@@ -9,11 +9,9 @@ use crate::config::DistributedConfig;
 use crate::distributed::{
     serve_actor, Cluster, ClusterMember, NodeHandle, RemoteActorRef, RemoteMessage,
 };
-#[cfg(feature = "tls")]
-use crate::distributed::serve_actor_tls_on_runtime;
+use crate::config::TlsConfig;
 use crate::hash_ring::HashRing;
 use crate::paxos::{PaxosProposer, PaxosReplica};
-use crate::stream::TlsConnector;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -44,7 +42,7 @@ pub struct ServiceRecord {
     pub service: String,
     pub instance_id: String,
     pub address: String,
-    /// TCP frame target on the remote node — unique per instance (typically `instance_id`).
+    /// gRPC deliver target on the remote node — unique per instance (typically `instance_id`).
     pub target: String,
     /// Datacenter tag; `None` is treated as local everywhere.
     #[serde(default)]
@@ -72,7 +70,7 @@ struct ServiceRoute<M: RemoteMessage> {
 pub struct ServiceMesh<M: RemoteMessage> {
     routes: HashMap<String, ServiceRoute<M>>,
     consistency: ConsistencyConfig,
-    tls_connector: Option<Arc<TlsConnector>>,
+    tls: Option<TlsConfig>,
 }
 
 impl<M: RemoteMessage> Default for ServiceMesh<M> {
@@ -91,16 +89,18 @@ impl<M: RemoteMessage> ServiceMesh<M> {
         Self {
             routes: HashMap::new(),
             consistency,
-            tls_connector: None,
+            tls: None,
         }
     }
 
     /// TLS connector for outbound [`RemoteActorRef`] connections (`feature = "tls"`).
     #[cfg(feature = "tls")]
-    pub fn set_tls_connector(&mut self, connector: Option<Arc<TlsConnector>>) {
-        self.tls_connector = connector.clone();
+    pub fn set_tls(&mut self, tls: Option<TlsConfig>) {
+        self.tls = tls.clone();
         for route in self.routes.values_mut() {
-            route.cluster.set_tls_connector(connector.clone());
+            let mut cfg = route.cluster.distributed_config.clone();
+            cfg.tls = tls.clone();
+            route.cluster.set_distributed_config(cfg);
         }
     }
 
@@ -171,13 +171,15 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     /// [`Self::ref_for_key`] after an upsert.
     pub fn register(&mut self, record: ServiceRecord) -> Option<ServiceRecord> {
         let service = record.service.clone();
-        let tls = self.tls_connector.clone();
+        let tls = self.tls.clone();
         let route = self
             .routes
             .entry(service.clone())
             .or_insert_with(|| {
                 let mut cluster = Cluster::new();
-                cluster.set_tls_connector(tls.clone());
+                let mut cfg = cluster.distributed_config.clone();
+                cfg.tls = tls.clone();
+                cluster.set_distributed_config(cfg);
                 ServiceRoute {
                     cluster,
                     consistency: None,
@@ -878,7 +880,7 @@ where
     (result, stats, total_required)
 }
 
-/// Handle returned when a microservice instance is bound to TCP.
+/// Handle returned when a microservice instance is bound (gRPC data plane).
 pub struct MicroserviceHandle<M: RemoteMessage> {
     pub record: ServiceRecord,
     _node: NodeHandle<M>,
@@ -898,7 +900,7 @@ impl<M: RemoteMessage> MicroserviceHandle<M> {
     }
 }
 
-/// Bind a microservice actor on TCP. Frame `target` is the unique `instance_id`.
+/// Bind a microservice actor on gRPC. Deliver `target` is the unique `instance_id`.
 pub async fn serve_microservice<M, A>(
     service: impl Into<String>,
     instance_id: impl Into<String>,
@@ -933,27 +935,27 @@ pub async fn serve_microservice_tls<M, A>(
     instance_id: impl Into<String>,
     bind_addr: impl Into<String>,
     actor: A,
-    tls: Arc<TlsAcceptor>,
+    tls: TlsConfig,
 ) -> std::io::Result<MicroserviceHandle<M>>
 where
     M: RemoteMessage,
     A: crate::actor::Actor<M> + Send + Sync + 'static,
 {
     use crate::config::{ActorConfig, DistributedConfig};
-    use tokio::runtime::Handle;
 
     let service = service.into();
     let instance_id = instance_id.into();
     let target = instance_id.clone();
-    let node = serve_actor_tls_on_runtime(
-        &Handle::current(),
+    let mut distributed = DistributedConfig::default();
+    distributed.tls = Some(tls);
+    let node = crate::distributed::serve_actor_on_runtime(
+        &tokio::runtime::Handle::current(),
         &instance_id,
         bind_addr,
         &target,
         actor,
-        &DistributedConfig::default(),
+        &distributed,
         &ActorConfig::default(),
-        tls,
     )
     .await?;
     Ok(MicroserviceHandle {
@@ -981,19 +983,6 @@ fn deregistered_event(record: ServiceRecord) -> crate::proto::control::ServiceEv
         kind: crate::proto::control::service_event::Kind::Deregistered as i32,
         record: Some(record.into()),
     }
-}
-
-// --- Legacy TCP control types (removed from wire in Phase 6; kept for test fixtures) ---
-
-/// Control-plane message (length-prefixed JSON over TCP).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum MeshControlMsg {
-    Register(ServiceRecord),
-    Deregister { service: String, instance_id: String },
-    List,
-    ListReply(Vec<ServiceRecord>),
-    Ping,
-    Pong,
 }
 
 /// Shared mesh registry backing the gRPC control plane.
@@ -1081,8 +1070,32 @@ pub use crate::mesh_registry_grpc::{
 
 /// Sidecar router: local mesh view + optional sync from gRPC registry.
 pub struct MeshRouter<M: RemoteMessage> {
+    #[cfg(feature = "watch_sync")]
+    pub mesh: std::sync::Arc<tokio::sync::Mutex<ServiceMesh<M>>>,
+    #[cfg(not(feature = "watch_sync"))]
     pub mesh: ServiceMesh<M>,
     client: Option<PendingMeshRegistryClient>,
+    #[cfg(feature = "watch_sync")]
+    _watch_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "watch_sync")]
+fn apply_service_event<M: RemoteMessage>(
+    mesh: &mut ServiceMesh<M>,
+    event: crate::proto::control::ServiceEvent,
+) {
+    use crate::proto::control::service_event::Kind;
+    let Some(record) = event.record.and_then(|p| ServiceRecord::try_from(p).ok()) else {
+        return;
+    };
+    match Kind::try_from(event.kind).unwrap_or(Kind::Registered) {
+        Kind::Registered => {
+            mesh.register(record);
+        }
+        Kind::Deregistered => {
+            mesh.deregister(&record.service, &record.instance_id);
+        }
+    }
 }
 
 impl<M: RemoteMessage> MeshRouter<M> {
@@ -1090,6 +1103,8 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::new(),
             client: None,
+            #[cfg(feature = "watch_sync")]
+            _watch_task: None,
         }
     }
 
@@ -1098,6 +1113,8 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::with_consistency(config),
             client: None,
+            #[cfg(feature = "watch_sync")]
+            _watch_task: None,
         }
     }
 
@@ -1105,6 +1122,8 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::new(),
             client: Some(PendingMeshRegistryClient::new(registry_addr)),
+            #[cfg(feature = "watch_sync")]
+            _watch_task: None,
         }
     }
 
@@ -1112,6 +1131,32 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::new(),
             client: Some(PendingMeshRegistryClient::from_connected(client)),
+            #[cfg(feature = "watch_sync")]
+            _watch_task: None,
+        }
+    }
+
+    /// Registry client with a background task applying [`MeshRegistryClient::watch`] events.
+    #[cfg(feature = "watch_sync")]
+    pub fn with_watch_sync(client: MeshRegistryClient) -> Self {
+        use futures_util::StreamExt;
+        let mesh = std::sync::Arc::new(tokio::sync::Mutex::new(ServiceMesh::new()));
+        let mesh_w = mesh.clone();
+        let mut client = client;
+        let watch_task = tokio::spawn(async move {
+            if let Ok(mut stream) = client.watch().await {
+                while let Some(item) = stream.next().await {
+                    if let Ok(event) = item {
+                        let mut m = mesh_w.lock().await;
+                        apply_service_event(&mut m, event);
+                    }
+                }
+            }
+        });
+        Self {
+            mesh,
+            client: None,
+            _watch_task: Some(watch_task),
         }
     }
 
@@ -1122,6 +1167,8 @@ impl<M: RemoteMessage> MeshRouter<M> {
         Self {
             mesh: ServiceMesh::with_consistency(config),
             client: Some(PendingMeshRegistryClient::new(registry_addr)),
+            #[cfg(feature = "watch_sync")]
+            _watch_task: None,
         }
     }
 
@@ -1131,12 +1178,22 @@ impl<M: RemoteMessage> MeshRouter<M> {
 
     pub async fn sync(&mut self) -> Result<(), tonic::Status> {
         if let Some(client) = &mut self.client {
-            client.sync_mesh(&mut self.mesh).await?;
+            #[cfg(feature = "watch_sync")]
+            {
+                client.sync_mesh(&mut *self.mesh.lock().await).await?;
+            }
+            #[cfg(not(feature = "watch_sync"))]
+            {
+                client.sync_mesh(&mut self.mesh).await?;
+            }
         }
         Ok(())
     }
 
     pub async fn invoke<T: Hash>(&self, service: &str, key: &T, msg: M) -> std::io::Result<()> {
+        #[cfg(feature = "watch_sync")]
+        return self.mesh.lock().await.invoke(service, key, msg).await;
+        #[cfg(not(feature = "watch_sync"))]
         self.mesh.invoke(service, key, msg).await
     }
 
@@ -1149,6 +1206,9 @@ impl<M: RemoteMessage> MeshRouter<M> {
     where
         M: Clone,
     {
+        #[cfg(feature = "watch_sync")]
+        return self.mesh.lock().await.invoke_consistent(service, key, msg).await;
+        #[cfg(not(feature = "watch_sync"))]
         self.mesh.invoke_consistent(service, key, msg).await
     }
 
@@ -1162,6 +1222,9 @@ impl<M: RemoteMessage> MeshRouter<M> {
     where
         M: Clone,
     {
+        #[cfg(feature = "watch_sync")]
+        return self.mesh.lock().await.read_consistent(service, key, msg).await;
+        #[cfg(not(feature = "watch_sync"))]
         self.mesh.read_consistent(service, key, msg).await
     }
 
@@ -1170,6 +1233,9 @@ impl<M: RemoteMessage> MeshRouter<M> {
         service: &str,
         key: &T,
     ) -> Result<Option<Vec<u8>>, ConsistencyError> {
+        #[cfg(feature = "watch_sync")]
+        return self.mesh.lock().await.read_serial_value(service, key).await;
+        #[cfg(not(feature = "watch_sync"))]
         self.mesh.read_serial_value(service, key).await
     }
 
@@ -1177,6 +1243,9 @@ impl<M: RemoteMessage> MeshRouter<M> {
     where
         M: Clone,
     {
+        #[cfg(feature = "watch_sync")]
+        return self.mesh.lock().await.invoke_all(service, msg).await;
+        #[cfg(not(feature = "watch_sync"))]
         self.mesh.invoke_all(service, msg).await
     }
 }
@@ -1199,8 +1268,11 @@ mod tests {
     use super::*;
     use crate::actor::{Actor, ActorProcessingErr};
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    struct Ping(String);
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct Ping {
+        #[prost(string, tag = "1")]
+        text: String,
+    }
 
     struct Echo;
 
@@ -1228,7 +1300,7 @@ mod tests {
         assert_eq!(mesh.instance_count("orders"), 2);
         assert_eq!(a.record.target, "orders-1");
         assert_eq!(b.record.target, "orders-2");
-        mesh.invoke("orders", &42u64, Ping("x".into()))
+        mesh.invoke("orders", &42u64, Ping { text: "x".into() })
             .await
             .expect("invoke");
     }
@@ -1334,20 +1406,20 @@ mod tests {
         mesh.register(h3.record.clone());
 
         let key = "k";
-        mesh.invoke_consistent("echo", &key, Ping("all".into()))
+        mesh.invoke_consistent("echo", &key, Ping { text: "all".into() })
             .await
             .expect("quorum with 3 nodes");
 
         drop(h3);
         mesh.deregister("echo", "echo-3");
-        mesh.invoke_consistent("echo", &key, Ping("two".into()))
+        mesh.invoke_consistent("echo", &key, Ping { text: "two".into() })
             .await
             .expect("quorum with 2 of 3");
 
         drop(h2);
         mesh.deregister("echo", "echo-2");
         let err = mesh
-            .invoke_consistent("echo", &key, Ping("one".into()))
+            .invoke_consistent("echo", &key, Ping { text: "one".into() })
             .await
             .expect_err("only one replica left");
         assert!(matches!(
@@ -1393,7 +1465,7 @@ mod tests {
         mesh.register(record_with_dc(west2.record.clone(), "west"));
 
         let key = "order-99";
-        mesh.invoke_consistent("orders", &key, Ping("write".into()))
+        mesh.invoke_consistent("orders", &key, Ping { text: "write".into() })
             .await
             .expect("each quorum all alive");
 
@@ -1405,7 +1477,7 @@ mod tests {
         mesh.register(dead_east);
 
         let err = mesh
-            .invoke_consistent("orders", &key, Ping("degraded".into()))
+            .invoke_consistent("orders", &key, Ping { text: "degraded".into() })
             .await
             .expect_err("east lost a replica");
         match err {
@@ -1445,7 +1517,7 @@ mod tests {
         let mut mesh = ServiceMesh::with_consistency(config);
         mesh.register(h.record.clone());
 
-        mesh.invoke_consistent("metrics-echo", &"k", Ping("x".into()))
+        mesh.invoke_consistent("metrics-echo", &"k", Ping { text: "x".into() })
             .await
             .expect("invoke");
 

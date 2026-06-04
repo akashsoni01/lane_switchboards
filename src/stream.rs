@@ -1,4 +1,4 @@
-//! TCP stream abstraction for distributed and mesh framing.
+//! TCP stream abstraction for gRPC listeners and optional TLS wrapping.
 //!
 //! With the `tls` feature, connections may be wrapped in TLS via rustls.
 //! Without it, only plain [`TcpStream`] is supported and TLS connectors must be `None`.

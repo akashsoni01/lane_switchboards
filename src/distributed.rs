@@ -1,461 +1,334 @@
-//! Distributed actors over TCP with length-prefixed JSON frames.
+//! Distributed actors over gRPC with protobuf payloads.
 
-use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr};
+use crate::actor::{spawn_on_runtime, Actor, ActorProcessingErr, ActorRef};
 use crate::config::{spawn_on, ActorConfig, DistributedConfig};
 use crate::consistency::ConsistencyError;
+use crate::distributed_grpc::{ActorMessagingService, DispatchTarget};
 use crate::hash_ring::{HashRing, RingNode};
-use crate::stream::{self, MaybeTlsStream};
+use crate::proto::data::{DeliverReply, DeliverRequest};
 pub use crate::stream::{TlsAcceptor, TlsConnector};
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use futures_util::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-static FRAME_ID: AtomicU64 = AtomicU64::new(1);
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Channel;
 
-fn next_frame_id() -> u64 {
-    FRAME_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Messages that can traverse the network layer.
+/// Messages that can traverse the gRPC data plane (protobuf-encoded).
 pub trait RemoteMessage:
-    Serialize + DeserializeOwned + Send + Sync + Clone + std::fmt::Debug + 'static
+    prost::Message + Default + Send + Sync + Clone + std::fmt::Debug + 'static
 {
 }
 
 impl<T> RemoteMessage for T where
-    T: Serialize + DeserializeOwned + Send + Sync + Clone + std::fmt::Debug + 'static
+    T: prost::Message + Default + Send + Sync + Clone + std::fmt::Debug + 'static
 {
 }
 
-/// Wire frame: route by actor name on the remote node.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Frame {
-    pub target: String,
-    pub payload: serde_json::Value,
-    /// Unique id for correlating [`AckFrame`] responses.
-    #[serde(default)]
-    pub frame_id: u64,
-    /// When true, the receiver writes an [`AckFrame`] after dispatch.
-    #[serde(default)]
-    pub expect_ack: bool,
-}
-
-/// Acknowledgement sent back when [`Frame::expect_ack`] is true.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct AckFrame {
-    pub frame_id: u64,
-    pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// Optional RPC payload (used by Paxos acceptors).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
-}
-
-/// Inbound Paxos RPC dispatched outside the typed actor mailbox.
-pub struct PaxosRpc {
-    pub payload: serde_json::Value,
-    pub reply: oneshot::Sender<Result<serde_json::Value, String>>,
-}
-
-/// Returns true when `target` is a Paxos acceptor route (`__paxos__*`).
-pub fn is_paxos_target(target: &str) -> bool {
-    target.starts_with("__paxos__")
-}
-
-/// Length-prefixed JSON request/response for Paxos (same framing as data-plane frames).
-pub async fn paxos_request(
-    node_addr: &str,
-    target: &str,
-    payload: serde_json::Value,
-    timeout: Duration,
-    config: &DistributedConfig,
-    tls: Option<&TlsConnector>,
-) -> Result<serde_json::Value, ConsistencyError> {
-    let mut stream = tokio::time::timeout(timeout, stream::connect(node_addr, tls))
-        .await
-        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
-        .map_err(|_| ConsistencyError::NotEnoughAcks {
-            required: 1,
-            received: 0,
-            dc: None,
-        })?;
-
-    let frame_id = next_frame_id();
-    let frame = Frame {
-        target: target.to_string(),
-        payload,
-        frame_id,
-        expect_ack: true,
-    };
-    let body = serde_json::to_vec(&frame).map_err(|_| ConsistencyError::NotEnoughAcks {
-        required: 1,
-        received: 0,
-        dc: None,
-    })?;
-    tokio::time::timeout(timeout, write_length_prefixed_json(&mut stream, &body, config.max_frame_bytes))
-        .await
-        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
-        .map_err(|_| ConsistencyError::NotEnoughAcks {
-            required: 1,
-            received: 0,
-            dc: None,
-        })?;
-
-    let ack = tokio::time::timeout(timeout, read_ack_frame(&mut stream, config))
-        .await
-        .map_err(|_| ConsistencyError::Timeout { after: timeout })?
-        .map_err(|_| ConsistencyError::NotEnoughAcks {
-            required: 1,
-            received: 0,
-            dc: None,
-        })?;
-
-    if ack.frame_id != frame_id || !ack.ok {
-        return Err(ConsistencyError::NotEnoughAcks {
-            required: 1,
-            received: 0,
-            dc: None,
-        });
+/// HTTP(S) endpoint for [`RemoteActorRef`] / tonic.
+pub fn grpc_data_endpoint(addr: &str, tls: bool) -> String {
+    if addr.starts_with("http://") || addr.starts_with("https://") {
+        addr.to_string()
+    } else if tls {
+        format!("https://{addr}")
+    } else {
+        format!("http://{addr}")
     }
-    ack.data.ok_or(ConsistencyError::NotEnoughAcks {
-        required: 1,
-        received: 0,
-        dc: None,
-    })
 }
 
-#[derive(Serialize)]
-struct FrameOut<'a, M>
-where
-    M: Serialize,
-{
-    target: &'a str,
-    payload: &'a M,
-    frame_id: u64,
-    expect_ack: bool,
+fn transport_to_io(e: tonic::transport::Error) -> std::io::Error {
+    std::io::Error::other(e)
 }
 
-async fn write_length_prefixed_json<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    body: &[u8],
-    max_frame_bytes: u32,
-) -> std::io::Result<()> {
-    if body.len() > max_frame_bytes as usize {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame too large: {} bytes", body.len()),
-        ));
-    }
-    stream.write_u32_le(body.len() as u32).await?;
-    stream.write_all(body).await?;
-    stream.flush().await?;
-    Ok(())
+fn actor_messaging_channel(
+    addr: &str,
+    tls: Option<&crate::config::TlsConfig>,
+) -> Result<Channel, std::io::Error> {
+    let use_tls = tls.is_some();
+    let uri = grpc_data_endpoint(addr, use_tls);
+    let endpoint = tonic::transport::Endpoint::from_shared(uri).map_err(transport_to_io)?;
+    let domain = crate::grpc_tls::tls_domain_from_addr(addr);
+    let endpoint = crate::grpc_tls::apply_client_tls(endpoint, tls, domain)?;
+    Ok(endpoint.connect_lazy())
 }
 
-async fn read_length_prefixed_json<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    config: &DistributedConfig,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let Some(len) = read_u32_le_timeout(stream, config).await? else {
-        return Ok(None);
-    };
-    let mut buf = vec![0u8; len as usize];
-    tokio::time::timeout(config.read_timeout, stream.read_exact(&mut buf))
-        .await
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::TimedOut, "frame body read timed out")
-        })??;
-    Ok(Some(buf))
+type PendingAckMap = HashMap<u64, oneshot::Sender<Result<(), ConsistencyError>>>;
+
+struct BidiStreamState {
+    request_tx: mpsc::Sender<DeliverRequest>,
+    pending_acks: Arc<Mutex<PendingAckMap>>,
+    _reply_task: JoinHandle<()>,
 }
 
-async fn write_frame<M, S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    target: &str,
-    msg: &M,
-    frame_id: u64,
-    expect_ack: bool,
-    max_frame_bytes: u32,
-) -> std::io::Result<()>
-where
-    M: RemoteMessage,
-{
-    let body = serde_json::to_vec(&FrameOut {
-        target,
-        payload: msg,
-        frame_id,
-        expect_ack,
-    })
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_length_prefixed_json(stream, &body, max_frame_bytes).await
-}
-
-async fn write_ack_frame<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    ack: &AckFrame,
-    max_frame_bytes: u32,
-) -> std::io::Result<()> {
-    let body = serde_json::to_vec(ack)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_length_prefixed_json(stream, &body, max_frame_bytes).await
-}
-
-async fn read_ack_frame<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    config: &DistributedConfig,
-) -> std::io::Result<AckFrame> {
-    let body = read_length_prefixed_json(stream, config)
-        .await?
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "missing ack"))?;
-    serde_json::from_slice(&body).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-struct OutboundMsg<M: RemoteMessage> {
-    msg: M,
-    frame_id: u64,
-    expect_ack: bool,
-    ack_tx: Option<oneshot::Sender<Result<(), ConsistencyError>>>,
-}
-
-async fn remote_write_loop<M: RemoteMessage>(
-    node_addr: String,
+/// Reference to an actor on a remote node (persistent gRPC channel + bidi stream).
+pub struct RemoteActorRef<M: RemoteMessage> {
+    pub node_addr: String,
     target: String,
-    mut rx: mpsc::Receiver<OutboundMsg<M>>,
-    config: DistributedConfig,
-    tls: Option<Arc<TlsConnector>>,
-) {
-    const RECONNECT_BASE: Duration = Duration::from_millis(100);
-    const RECONNECT_MAX: Duration = Duration::from_secs(30);
-    let mut backoff = RECONNECT_BASE;
+    client: Arc<
+        Mutex<
+            crate::proto::data::actor_messaging_client::ActorMessagingClient<Channel>,
+        >,
+    >,
+    stream: Arc<Mutex<Option<BidiStreamState>>>,
+    frame_counter: Arc<AtomicU64>,
+    ack_timeout: Duration,
+    _marker: PhantomData<M>,
+}
 
-    loop {
-        let mut stream = loop {
-            match stream::connect(&node_addr, tls.as_deref()).await {
-                Ok(s) => {
-                    backoff = RECONNECT_BASE;
-                    break s;
-                }
-                Err(e) => {
-                    tracing::warn!(%node_addr, error = %e, "remote write reconnect failed");
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(RECONNECT_MAX);
-                    if rx.is_closed() {
-                        return;
-                    }
-                }
-            }
-        };
-
-        loop {
-            let outbound = match rx.recv().await {
-                Some(m) => m,
-                None => return,
-            };
-
-            let write_result = write_frame(
-                &mut stream,
-                &target,
-                &outbound.msg,
-                outbound.frame_id,
-                outbound.expect_ack,
-                config.max_frame_bytes,
-            )
-            .await;
-
-            if write_result.is_err() {
-                tracing::warn!(%node_addr, "remote write failed — reconnecting");
-                if let Some(ack_tx) = outbound.ack_tx {
-                    let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
-                        required: 1,
-                        received: 0,
-                        dc: None,
-                    }));
-                }
-                break;
-            }
-
-            if outbound.expect_ack {
-                match read_ack_frame(&mut stream, &config).await {
-                    Ok(ack) if ack.frame_id == outbound.frame_id && ack.ok => {
-                        if let Some(ack_tx) = outbound.ack_tx {
-                            let _ = ack_tx.send(Ok(()));
-                        }
-                    }
-                    Ok(ack) if ack.frame_id == outbound.frame_id => {
-                        if let Some(ack_tx) = outbound.ack_tx {
-                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
-                                required: 1,
-                                received: 0,
-                                dc: None,
-                            }));
-                        }
-                    }
-                    Ok(_) => {
-                        if let Some(ack_tx) = outbound.ack_tx {
-                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
-                                required: 1,
-                                received: 0,
-                                dc: None,
-                            }));
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(%node_addr, error = %e, "remote ack read failed");
-                        if let Some(ack_tx) = outbound.ack_tx {
-                            let _ = ack_tx.send(Err(ConsistencyError::NotEnoughAcks {
-                                required: 1,
-                                received: 0,
-                                dc: None,
-                            }));
-                        }
-                        break;
-                    }
-                }
-            }
+impl<M: RemoteMessage> Clone for RemoteActorRef<M> {
+    fn clone(&self) -> Self {
+        Self {
+            node_addr: self.node_addr.clone(),
+            target: self.target.clone(),
+            client: self.client.clone(),
+            stream: self.stream.clone(),
+            frame_counter: self.frame_counter.clone(),
+            ack_timeout: self.ack_timeout,
+            _marker: PhantomData,
         }
     }
 }
 
-struct PeerWriter<M: RemoteMessage> {
-    tx: mpsc::Sender<OutboundMsg<M>>,
-    _task: JoinHandle<()>,
-}
-
-/// Reference to an actor on a remote node (persistent write channel per ref).
-#[derive(Clone)]
-pub struct RemoteActorRef<M: RemoteMessage> {
-    pub node_addr: String,
-    target: String,
-    writer: Arc<PeerWriter<M>>,
-}
-
 impl<M: RemoteMessage> RemoteActorRef<M> {
     pub fn new(node_addr: impl Into<String>, target: impl Into<String>) -> Self {
-        Self::with_config(node_addr, target, &DistributedConfig::default(), None)
+        Self::connect(node_addr, target, &DistributedConfig::default())
     }
 
-    /// Outbound TLS (requires `feature = "tls"` and a real [`TlsConnector`]).
-    #[cfg(feature = "tls")]
-    pub fn with_tls(
+    pub fn connect(
         node_addr: impl Into<String>,
         target: impl Into<String>,
         config: &DistributedConfig,
-        tls: Arc<TlsConnector>,
     ) -> Self {
-        Self::with_config(node_addr, target, config, Some(tls))
+        let node_addr = node_addr.into();
+        let target = target.into();
+        let channel = actor_messaging_channel(&node_addr, config.tls.as_ref())
+            .expect("valid grpc data endpoint");
+        let client =
+            crate::proto::data::actor_messaging_client::ActorMessagingClient::new(channel);
+        Self {
+            node_addr,
+            target,
+            client: Arc::new(Mutex::new(client)),
+            stream: Arc::new(Mutex::new(None)),
+            frame_counter: Arc::new(AtomicU64::new(1)),
+            ack_timeout: config.ack_timeout,
+            _marker: PhantomData,
+        }
     }
 
     pub fn with_config(
         node_addr: impl Into<String>,
         target: impl Into<String>,
         config: &DistributedConfig,
-        tls: Option<Arc<TlsConnector>>,
     ) -> Self {
-        let node_addr = node_addr.into();
-        let target = target.into();
-        let (tx, rx) = mpsc::channel(config.remote_send_capacity.max(1));
-        let loop_addr = node_addr.clone();
-        let loop_target = target.clone();
-        let loop_config = *config;
-        let loop_tls = tls.clone();
-        let task = tokio::spawn(remote_write_loop(
-            loop_addr,
-            loop_target,
-            rx,
-            loop_config,
-            loop_tls,
-        ));
-        Self {
-            node_addr,
-            target,
-            writer: Arc::new(PeerWriter { tx, _task: task }),
-        }
+        Self::connect(node_addr, target, config)
     }
 
     pub fn target(&self) -> &str {
         &self.target
     }
 
-    pub async fn send(&self, msg: M) -> std::io::Result<()> {
-        self.writer
-            .tx
-            .send(OutboundMsg {
-                msg,
-                frame_id: 0,
-                expect_ack: false,
-                ack_tx: None,
-            })
+    async fn ensure_stream(&self) -> Result<(), std::io::Error> {
+        let mut guard = self.stream.lock().await;
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let mut client = self.client.lock().await;
+        let (req_tx, req_rx) = mpsc::channel(64);
+        let outbound = ReceiverStream::new(req_rx);
+        let response = client
+            .deliver(outbound)
             .await
-            .map_err(|_| {
-                std::io::Error::new(
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotConnected, e))?;
+        let mut reply_stream = response.into_inner();
+        let pending = Arc::new(Mutex::new(HashMap::<
+            u64,
+            oneshot::Sender<Result<(), ConsistencyError>>,
+        >::new()));
+
+        let pending_c = pending.clone();
+        let reply_task = tokio::spawn(async move {
+            while let Some(item) = reply_stream.next().await {
+                let reply: DeliverReply = match item {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                let mut map = pending_c.lock().await;
+                if let Some(tx) = map.remove(&reply.frame_id) {
+                    let result = if reply.ok {
+                        Ok(())
+                    } else {
+                        Err(ConsistencyError::NotEnoughAcks {
+                            required: 1,
+                            received: 0,
+                            dc: None,
+                        })
+                    };
+                    let _ = tx.send(result);
+                }
+            }
+        });
+
+        *guard = Some(BidiStreamState {
+            request_tx: req_tx,
+            pending_acks: pending,
+            _reply_task: reply_task,
+        });
+        Ok(())
+    }
+
+    async fn invalidate_stream(&self) {
+        self.stream.lock().await.take();
+    }
+
+    fn encode_payload(&self, msg: &M) -> Result<Vec<u8>, std::io::Error> {
+        let mut buf = Vec::new();
+        msg.encode(&mut buf)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(buf)
+    }
+
+    pub async fn send(&self, msg: M) -> std::io::Result<()> {
+        let frame_id = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let payload = self.encode_payload(&msg)?;
+        let request = DeliverRequest {
+            frame_id,
+            target: self.target.clone(),
+            payload,
+            expect_ack: false,
+        };
+
+        for attempt in 0..2 {
+            if self.ensure_stream().await.is_err() && attempt == 0 {
+                self.invalidate_stream().await;
+                continue;
+            }
+            let tx = {
+                let guard = self.stream.lock().await;
+                guard.as_ref().map(|s| s.request_tx.clone())
+            };
+            let Some(tx) = tx else {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
-                    "remote peer write channel closed",
-                )
-            })
+                    "deliver stream unavailable",
+                ));
+            };
+            match tx.send(request.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(_) if attempt == 0 => {
+                    self.invalidate_stream().await;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "deliver stream closed",
+                    ));
+                }
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "deliver send failed",
+        ))
     }
 
     /// Send with acknowledgement; waits up to `timeout` for the remote node to confirm dispatch.
-    ///
-    /// Used by quorum write/read paths ([`WriteConsistency::Quorum`], etc.).
-    /// Fire-and-forget callers should use [`Self::send`] instead.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// # use lane_switchboards::RemoteActorRef;
-    /// # use std::time::Duration;
-    /// # async fn example(r: RemoteActorRef<()>) -> Result<(), lane_switchboards::ConsistencyError> {
-    /// r.send_with_ack((), Duration::from_secs(1)).await
-    /// # }
-    /// ```
     pub async fn send_with_ack(
         &self,
         msg: M,
         timeout: Duration,
     ) -> Result<(), ConsistencyError> {
-        let frame_id = next_frame_id();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        self.writer
-            .tx
-            .send(OutboundMsg {
-                msg,
-                frame_id,
-                expect_ack: true,
-                ack_tx: Some(ack_tx),
-            })
-            .await
+        let frame_id = self.frame_counter.fetch_add(1, Ordering::Relaxed);
+        let payload = self
+            .encode_payload(&msg)
             .map_err(|_| ConsistencyError::NotEnoughAcks {
                 required: 1,
                 received: 0,
                 dc: None,
             })?;
+        let request = DeliverRequest {
+            frame_id,
+            target: self.target.clone(),
+            payload,
+            expect_ack: true,
+        };
 
-        match tokio::time::timeout(timeout, ack_rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ConsistencyError::NotEnoughAcks {
-                required: 1,
-                received: 0,
-                dc: None,
-            }),
-            Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
+        for attempt in 0..2 {
+            self.ensure_stream().await.map_err(|_| {
+                ConsistencyError::NotEnoughAcks {
+                    required: 1,
+                    received: 0,
+                    dc: None,
+                }
+            })?;
+
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let sent = {
+                let guard = self.stream.lock().await;
+                let Some(state) = guard.as_ref() else {
+                    self.invalidate_stream().await;
+                    if attempt == 0 {
+                        continue;
+                    }
+                    return Err(ConsistencyError::NotEnoughAcks {
+                        required: 1,
+                        received: 0,
+                        dc: None,
+                    });
+                };
+                state
+                    .pending_acks
+                    .lock()
+                    .await
+                    .insert(frame_id, ack_tx);
+                state.request_tx.send(request.clone()).await.is_ok()
+            };
+
+            if !sent {
+                self.invalidate_stream().await;
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(ConsistencyError::NotEnoughAcks {
+                    required: 1,
+                    received: 0,
+                    dc: None,
+                });
+            }
+
+            return match tokio::time::timeout(timeout, ack_rx).await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(ConsistencyError::NotEnoughAcks {
+                    required: 1,
+                    received: 0,
+                    dc: None,
+                }),
+                Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
+            };
         }
+
+        Err(ConsistencyError::NotEnoughAcks {
+            required: 1,
+            received: 0,
+            dc: None,
+        })
     }
 }
 
-/// Local node: binds TCP and dispatches incoming frames to registered actors.
+/// Local node: binds gRPC and dispatches incoming deliveries to registered actors.
 pub struct Node<M: RemoteMessage> {
     name: String,
     bind_addr: String,
-    dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
-    paxos: Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>>,
+    dispatch: Arc<Mutex<HashMap<String, DispatchTarget<M>>>>,
     _listener: JoinHandle<()>,
 }
 
@@ -469,19 +342,7 @@ impl<M: RemoteMessage> Node<M> {
         addr: impl Into<String>,
         config: &DistributedConfig,
     ) -> std::io::Result<Self> {
-        Self::bind_on_runtime(&Handle::current(), name, addr, config, None).await
-    }
-
-    /// Bind with TLS (server certificate required; `feature = "tls"`).
-    #[cfg(feature = "tls")]
-    pub async fn bind_tls_on_runtime(
-        runtime: &Handle,
-        name: impl Into<String>,
-        addr: impl Into<String>,
-        config: &DistributedConfig,
-        tls: Arc<TlsAcceptor>,
-    ) -> std::io::Result<Self> {
-        Self::bind_on_runtime(runtime, name, addr, config, Some(tls)).await
+        Self::bind_on_runtime(&Handle::current(), name, addr, config).await
     }
 
     pub async fn bind_on_runtime(
@@ -489,7 +350,6 @@ impl<M: RemoteMessage> Node<M> {
         name: impl Into<String>,
         addr: impl Into<String>,
         config: &DistributedConfig,
-        tls: Option<Arc<TlsAcceptor>>,
     ) -> std::io::Result<Self> {
         let name = name.into();
         let bind_addr = addr.into();
@@ -498,58 +358,33 @@ impl<M: RemoteMessage> Node<M> {
         tracing::info!(
             node = %name,
             %actual_addr,
-            tls = tls.is_some(),
+            tls = config.tls.is_some(),
             "distributed node listening"
         );
 
-        let dispatch = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<M>>::new()));
-        let paxos = Arc::new(Mutex::new(HashMap::<String, mpsc::Sender<PaxosRpc>>::new()));
-        let dispatch_c = dispatch.clone();
-        let paxos_c = paxos.clone();
-        let in_flight = Arc::new(Semaphore::new(config.max_in_flight.max(1)));
-        let conn_config = *config;
-        let runtime = runtime.clone();
-        let tls_acceptor = tls;
+        let dispatch = Arc::new(Mutex::new(HashMap::<String, DispatchTarget<M>>::new()));
+        let svc = ActorMessagingService::new(dispatch.clone());
+        let grpc =
+            crate::proto::data::actor_messaging_server::ActorMessagingServer::new(svc);
 
-        let listener_task = spawn_on(Some(&runtime), {
-            let runtime = runtime.clone();
-            async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, peer)) => {
-                            let table = dispatch_c.clone();
-                            let paxos_table = paxos_c.clone();
-                            let in_flight = in_flight.clone();
-                            let conn_runtime = runtime.clone();
-                            let acceptor = tls_acceptor.clone();
-                            spawn_on(Some(&runtime), async move {
-                                match stream::accept(stream, acceptor.as_deref()).await {
-                                    Ok(stream) => {
-                                        if let Err(e) = handle_conn(
-                                            stream,
-                                            table,
-                                            paxos_table,
-                                            in_flight,
-                                            conn_runtime,
-                                            conn_config,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(%peer, error = %e, "connection handler error");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(%peer, error = %e, "TLS accept failed");
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            tracing::error!(error = %e, "accept failed");
-                            break;
-                        }
-                    }
-                }
+        #[cfg(feature = "tls")]
+        let server_tls = config.tls.clone();
+        let listener_task = spawn_on(Some(runtime), async move {
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            // TODO: expose concurrency_limit_per_connection
+            #[cfg(feature = "tls")]
+            let tls_ref = server_tls.as_ref();
+            #[cfg(not(feature = "tls"))]
+            let tls_ref: Option<&crate::config::TlsConfig> = None;
+            if let Err(e) = crate::grpc_tls::apply_server_tls(
+                tonic::transport::Server::builder(),
+                tls_ref,
+            )
+            .add_service(grpc)
+            .serve_with_incoming(incoming)
+            .await
+            {
+                tracing::error!(error = %e, "gRPC node server exited");
             }
         });
 
@@ -557,21 +392,8 @@ impl<M: RemoteMessage> Node<M> {
             name,
             bind_addr: actual_addr.to_string(),
             dispatch,
-            paxos,
             _listener: listener_task,
         })
-    }
-
-    pub async fn register_paxos(&self, target: impl Into<String>, tx: mpsc::Sender<PaxosRpc>) {
-        self.paxos.lock().await.insert(target.into(), tx);
-    }
-
-    pub async fn unregister_paxos(&self, target: &str) {
-        self.paxos.lock().await.remove(target);
-    }
-
-    pub(crate) fn paxos_dispatch(&self) -> Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>> {
-        self.paxos.clone()
     }
 
     pub fn address(&self) -> &str {
@@ -582,8 +404,19 @@ impl<M: RemoteMessage> Node<M> {
         &self.name
     }
 
+    pub async fn register_actor(&self, target: impl Into<String>, actor: ActorRef<M>) {
+        self.dispatch
+            .lock()
+            .await
+            .insert(target.into(), DispatchTarget::Actor(actor));
+    }
+
+    /// Register a raw mailbox sender (tests / custom wiring).
     pub async fn register(&self, target: impl Into<String>, tx: mpsc::Sender<M>) {
-        self.dispatch.lock().await.insert(target.into(), tx);
+        self.dispatch
+            .lock()
+            .await
+            .insert(target.into(), DispatchTarget::Mailbox(tx));
     }
 
     pub async fn unregister(&self, target: &str) {
@@ -591,150 +424,7 @@ impl<M: RemoteMessage> Node<M> {
     }
 }
 
-async fn read_u32_le_timeout<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    config: &DistributedConfig,
-) -> std::io::Result<Option<u32>> {
-    match tokio::time::timeout(config.read_timeout, stream.read_u32_le()).await {
-        Ok(Ok(0)) => Ok(None),
-        Ok(Ok(n)) => {
-            if n > config.max_frame_bytes {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame too large: {n} bytes"),
-                ));
-            }
-            Ok(Some(n))
-        }
-        Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            "frame read timed out",
-        )),
-    }
-}
-
-async fn handle_conn<M: RemoteMessage>(
-    stream: MaybeTlsStream,
-    dispatch: Arc<Mutex<HashMap<String, mpsc::Sender<M>>>>,
-    paxos: Arc<Mutex<HashMap<String, mpsc::Sender<PaxosRpc>>>>,
-    in_flight: Arc<Semaphore>,
-    runtime: Handle,
-    config: DistributedConfig,
-) -> std::io::Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-
-    loop {
-        let Some(body) = read_length_prefixed_json(&mut reader, &config).await? else {
-            break;
-        };
-
-        let frame: Frame = serde_json::from_slice(&body).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-
-        if frame.expect_ack && is_paxos_target(&frame.target) {
-            let target = frame.target.clone();
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let rpc = PaxosRpc {
-                payload: frame.payload,
-                reply: reply_tx,
-            };
-            let send_result = {
-                let tx = paxos.lock().await.get(&target).cloned();
-                if let Some(tx) = tx {
-                    tx.send(rpc).await.map_err(|_| "paxos handler closed".to_string())
-                } else {
-                    Err(format!("no paxos handler for target {target}"))
-                }
-            };
-
-            let ack = if send_result.is_ok() {
-                match tokio::time::timeout(config.read_timeout, reply_rx).await {
-                    Ok(Ok(Ok(data))) => AckFrame {
-                        frame_id: frame.frame_id,
-                        ok: true,
-                        error: None,
-                        data: Some(data),
-                    },
-                    Ok(Ok(Err(e))) => AckFrame {
-                        frame_id: frame.frame_id,
-                        ok: false,
-                        error: Some(e),
-                        data: None,
-                    },
-                    Ok(Err(_)) | Err(_) => AckFrame {
-                        frame_id: frame.frame_id,
-                        ok: false,
-                        error: Some("paxos handler dropped reply".into()),
-                        data: None,
-                    },
-                }
-            } else {
-                AckFrame {
-                    frame_id: frame.frame_id,
-                    ok: false,
-                    error: send_result.err(),
-                    data: None,
-                }
-            };
-            write_ack_frame(&mut writer, &ack, config.max_frame_bytes).await?;
-            continue;
-        }
-
-        let msg: M = serde_json::from_value(frame.payload).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
-
-        if frame.expect_ack {
-            let target = frame.target.clone();
-            let tx = {
-                let table = dispatch.lock().await;
-                table.get(&target).cloned()
-            };
-            let send_result = if let Some(tx) = tx {
-                tx.send(msg).await.map(|_| ()).map_err(|_| {
-                    "actor mailbox closed".to_string()
-                })
-            } else {
-                tracing::warn!(%target, "no local actor for frame target");
-                Err(format!("no local actor for frame target {target}"))
-            };
-
-            let ack = AckFrame {
-                frame_id: frame.frame_id,
-                ok: send_result.is_ok(),
-                error: send_result.err(),
-                data: None,
-            };
-            write_ack_frame(&mut writer, &ack, config.max_frame_bytes).await?;
-        } else {
-            let permit = match in_flight.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
-            };
-
-            let table = dispatch.clone();
-            let target = frame.target;
-            spawn_on(Some(&runtime), async move {
-                let _permit = permit;
-                let tx = {
-                    let table = table.lock().await;
-                    table.get(&target).cloned()
-                };
-                if let Some(tx) = tx {
-                    let _ = tx.send(msg).await;
-                } else {
-                    tracing::warn!(%target, "no local actor for frame target");
-                }
-            });
-        }
-    }
-    Ok(())
-}
-
-/// A node in a cluster roster (name + TCP address + frame target).
+/// A node in a cluster roster (name + gRPC address + deliver target).
 #[derive(Debug, Clone)]
 pub struct ClusterMember {
     pub name: String,
@@ -770,9 +460,8 @@ impl ClusterMember {
     pub fn remote_ref_with<M: RemoteMessage>(
         &self,
         config: &DistributedConfig,
-        tls: Option<Arc<TlsConnector>>,
     ) -> RemoteActorRef<M> {
-        RemoteActorRef::with_config(&self.node_addr, &self.target, config, tls)
+        RemoteActorRef::with_config(&self.node_addr, &self.target, config)
     }
 
     pub fn ring_node(&self) -> RingNode {
@@ -787,8 +476,7 @@ pub struct Cluster<M: RemoteMessage> {
     refs_by_id: HashMap<String, usize>,
     ring: HashRing,
     next: AtomicUsize,
-    distributed_config: DistributedConfig,
-    tls: Option<Arc<TlsConnector>>,
+    pub(crate) distributed_config: DistributedConfig,
 }
 
 impl<M: RemoteMessage> Default for Cluster<M> {
@@ -810,17 +498,7 @@ impl<M: RemoteMessage> Cluster<M> {
             ring: HashRing::new(virtual_nodes),
             next: AtomicUsize::new(0),
             distributed_config: DistributedConfig::default(),
-            tls: None,
         }
-    }
-
-    /// TLS connector used when joining members (`RemoteActorRef` outbound).
-    pub fn set_tls_connector(&mut self, connector: Option<Arc<TlsConnector>>) {
-        self.tls = connector;
-    }
-
-    pub fn tls_connector(&self) -> Option<&Arc<TlsConnector>> {
-        self.tls.as_ref()
     }
 
     pub fn set_distributed_config(&mut self, config: DistributedConfig) {
@@ -848,10 +526,8 @@ impl<M: RemoteMessage> Cluster<M> {
         let idx = self.refs.len();
         self.ring.add_node(member.ring_node());
         self.refs_by_id.insert(member.name.clone(), idx);
-        self.refs.push(member.remote_ref_with(
-            &self.distributed_config,
-            self.tls.clone(),
-        ));
+        self.refs
+            .push(member.remote_ref_with(&self.distributed_config));
         self.members.push(member);
     }
 
@@ -1097,11 +773,10 @@ fn member_is_local_dc(member: &ClusterMember, local_dc: &str) -> bool {
     }
 }
 
-/// Local TCP node serving one actor target — use `member()` to join a [`Cluster`].
+/// Local gRPC node serving one actor target — use `member()` to join a [`Cluster`].
 pub struct NodeHandle<M: RemoteMessage> {
     pub member: ClusterMember,
     _node: Node<M>,
-    _bridge: JoinHandle<()>,
 }
 
 impl<M: RemoteMessage> NodeHandle<M> {
@@ -1114,7 +789,7 @@ impl<M: RemoteMessage> NodeHandle<M> {
     }
 }
 
-/// Bind a TCP node and bridge incoming frames to a local actor on the current runtime.
+/// Bind a gRPC node and serve actor deliveries on the current runtime.
 pub async fn serve_actor<M, A>(
     node_name: impl Into<String>,
     bind_addr: impl Into<String>,
@@ -1133,12 +808,11 @@ where
         actor,
         &DistributedConfig::default(),
         &ActorConfig::default(),
-        None,
     )
     .await
 }
 
-/// Bind a TCP node and bridge on the current runtime with explicit channel sizing.
+/// Bind a gRPC node on the current runtime with explicit channel sizing.
 pub async fn serve_actor_on_current_runtime<M, A>(
     node_name: impl Into<String>,
     bind_addr: impl Into<String>,
@@ -1159,42 +833,11 @@ where
         actor,
         distributed,
         actor_config,
-        None,
     )
     .await
 }
 
-/// Bind a TCP node with TLS and bridge on a dedicated runtime (`feature = "tls"`).
-#[cfg(feature = "tls")]
-pub async fn serve_actor_tls_on_runtime<M, A>(
-    runtime: &Handle,
-    node_name: impl Into<String>,
-    bind_addr: impl Into<String>,
-    target: impl Into<String>,
-    actor: A,
-    distributed: &DistributedConfig,
-    actor_config: &ActorConfig,
-    tls: Arc<TlsAcceptor>,
-) -> std::io::Result<NodeHandle<M>>
-where
-    M: RemoteMessage,
-    A: Actor<M> + Send + Sync + 'static,
-{
-    serve_actor_on_runtime(
-        runtime,
-        node_name,
-        bind_addr,
-        target,
-        actor,
-        distributed,
-        actor_config,
-        Some(tls),
-    )
-    .await
-}
-
-/// Bind a TCP node and bridge on a dedicated runtime with load limits.
-#[allow(clippy::too_many_arguments)]
+/// Bind a gRPC node on a dedicated runtime.
 pub async fn serve_actor_on_runtime<M, A>(
     runtime: &Handle,
     node_name: impl Into<String>,
@@ -1203,7 +846,6 @@ pub async fn serve_actor_on_runtime<M, A>(
     actor: A,
     distributed: &DistributedConfig,
     actor_config: &ActorConfig,
-    tls: Option<Arc<TlsAcceptor>>,
 ) -> std::io::Result<NodeHandle<M>>
 where
     M: RemoteMessage,
@@ -1219,21 +861,10 @@ where
             std::io::Error::other(format!("failed to spawn bridged actor: {e}"))
         })?;
 
-    let node =
-        Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed, tls).await?;
+    let node = Node::<M>::bind_on_runtime(runtime, &node_name, bind_addr, distributed).await?;
     let address = node.address().to_string();
 
-    let (tx, mut rx) = mpsc::channel(distributed.bridge_capacity);
-    node.register(&target, tx).await;
-
-    let bridge = spawn_on(Some(runtime), async move {
-        while let Some(msg) = rx.recv().await {
-            if actor_ref.send(msg).await.is_err() {
-                tracing::warn!("serve_actor bridge: actor mailbox closed");
-                break;
-            }
-        }
-    });
+    node.register_actor(&target, actor_ref).await;
 
     Ok(NodeHandle {
         member: ClusterMember {
@@ -1243,7 +874,6 @@ where
             dc: None,
         },
         _node: node,
-        _bridge: bridge,
     })
 }
 
@@ -1255,8 +885,11 @@ mod ack_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
-    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-    struct RemotePing(u64);
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct RemotePing {
+        #[prost(uint64, tag = "1")]
+        n: u64,
+    }
 
     struct PingCounter(Arc<AtomicU64>);
 
@@ -1267,6 +900,44 @@ mod ack_tests {
             let _ = msg;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn data_plane_grpc_send_burst_and_ack() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let handle = serve_actor(
+            "echo",
+            "127.0.0.1:0",
+            "echo",
+            PingCounter(counter.clone()),
+        )
+        .await
+        .expect("serve");
+
+        let remote = RemoteActorRef::<RemotePing>::new(&handle.member.node_addr, "echo");
+        for i in 0..100u64 {
+            remote
+                .send(RemotePing { n: i })
+                .await
+                .expect("send");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(counter.load(Ordering::Relaxed), 100);
+
+        remote
+            .send_with_ack(RemotePing { n: 999 }, Duration::from_secs(2))
+            .await
+            .expect("ack");
+
+        let bad = RemoteActorRef::<RemotePing>::new(&handle.member.node_addr, "missing");
+        let err = bad
+            .send_with_ack(RemotePing { n: 1 }, Duration::from_millis(500))
+            .await
+            .expect_err("dead target");
+        assert!(
+            matches!(err, ConsistencyError::NotEnoughAcks { .. })
+                || matches!(err, ConsistencyError::Timeout { .. })
+        );
     }
 
     #[tokio::test]
@@ -1283,7 +954,7 @@ mod ack_tests {
 
         let remote = RemoteActorRef::<RemotePing>::new(&handle.member.node_addr, "worker");
         remote
-            .send_with_ack(RemotePing(1), Duration::from_secs(2))
+            .send_with_ack(RemotePing { n: 1 }, Duration::from_secs(2))
             .await
             .expect("ack");
 
@@ -1298,18 +969,18 @@ mod ack_tests {
             .expect("bind");
         let addr = node.address().to_string();
 
-        // Capacity 1, no consumer — second ack'd send blocks in handle_conn.
+        // Capacity 1, no consumer — second ack'd deliver blocks until mailbox drains.
         let (tx, _rx) = mpsc::channel(1);
         node.register("worker", tx).await;
 
         let remote = RemoteActorRef::<RemotePing>::new(&addr, "worker");
         remote
-            .send_with_ack(RemotePing(1), Duration::from_secs(2))
+            .send_with_ack(RemotePing { n: 1 }, Duration::from_secs(2))
             .await
             .expect("first ack");
 
         let err = remote
-            .send_with_ack(RemotePing(2), Duration::from_millis(200))
+            .send_with_ack(RemotePing { n: 2 }, Duration::from_millis(200))
             .await
             .expect_err("timeout");
         assert!(matches!(err, ConsistencyError::Timeout { .. }));
@@ -1336,7 +1007,7 @@ mod ack_tests {
         });
 
         let remote = RemoteActorRef::<RemotePing>::new(&addr, "worker");
-        remote.send(RemotePing(7)).await.expect("send");
+        remote.send(RemotePing { n: 7 }).await.expect("send");
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);

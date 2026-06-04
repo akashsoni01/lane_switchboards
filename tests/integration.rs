@@ -104,8 +104,11 @@ async fn child_slot_holds_current_ref() {
     child.send(EchoMsg::Ping).await.expect("send");
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct RemotePing(u64);
+#[derive(Clone, PartialEq, prost::Message)]
+struct RemotePing {
+    #[prost(uint64, tag = "1")]
+    n: u64,
+}
 
 struct PingCounter(Arc<std::sync::atomic::AtomicU64>);
 
@@ -146,7 +149,7 @@ async fn cluster_round_robin_across_nodes() {
 
     for i in 0..4 {
         cluster
-            .send_round_robin(RemotePing(i))
+            .send_round_robin(RemotePing { n: i })
             .await
             .expect("send");
     }
@@ -186,7 +189,7 @@ async fn cluster_hash_ring_routes_same_key_to_same_node() {
 
     for _ in 0..3 {
         cluster
-            .send_by_key(&key, RemotePing(key))
+            .send_by_key(&key, RemotePing { n: key })
             .await
             .expect("send");
     }
