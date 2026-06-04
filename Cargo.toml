@@ -87,6 +87,10 @@ harness = false
 name = "ecommerce_flash_sale"
 path = "examples/ecommerce_flash_sale.rs"
 
+[[example]]
+name = "calculator_mesh"
+path = "examples/calculator_mesh.rs"
+
 [build-dependencies]
 tonic-build = "0.12"
 prost-build = "0.13"
