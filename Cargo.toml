@@ -99,6 +99,12 @@ path = "examples/calculator_mesh_simplified.rs"
 tonic-build = "0.12"
 prost-build = "0.13"
 
+# --- Stream (TCP / optional TLS) ---
+
+[[example]]
+name = "stream_calc"
+path = "examples/stream_calc.rs"
+
 # --- Core runtime demos ---
 
 [[example]]
