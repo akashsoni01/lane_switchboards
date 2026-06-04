@@ -3,6 +3,7 @@
 Release notes for **v0.0.6** — Cassandra-style **tunable consistency** on the service mesh (quorum acks, multi-DC `EACH_QUORUM`, Paxos reads), optional **`tls`** / **`metrics`** features, and new examples/docs.
 
 For the full project overview see [README.md](./README.md).  
+Next release: [READMEv0.0.7.md](./READMEv0.0.7.md) (gRPC/protobuf wire).  
 Previous release notes: [READMEv0.0.5.md](./READMEv0.0.5.md) · [READMEv0.0.4.md](./READMEv0.0.4.md) · [Ideas blog post](./docs/lane_switchboards_blog.md)
 
 ---
