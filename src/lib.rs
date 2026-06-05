@@ -5,6 +5,7 @@
 //!   [`ChildRegistry`] / [`ChildSlot`] for stable child refs after restart
 //! - [`registry`]: global actor index
 //! - [`distributed`]: gRPC/protobuf remote messaging, [`Cluster`] roster, [`serve_actor`]
+//! - [`topology`]: declarative multi-DC cluster builder ([`DcTopology`], [`DcCluster`])
 //! - [`mesh`]: gRPC service mesh — registry, discovery, routing ([`ServiceMesh`], [`MeshRouter`])
 //! - [`stream`]: TCP listen/connect helpers; optional TLS with feature `tls`
 //!
@@ -31,6 +32,7 @@ pub mod paxos_grpc;
 pub mod registry;
 pub mod stream;
 pub mod supervisor;
+pub mod topology;
 #[cfg(feature = "tls")]
 pub mod tls;
 
@@ -87,3 +89,4 @@ pub use supervisor::{
     supervise_named_child, supervise_named_child_settled, ChildRegistry, ChildSlot, ChildSpec,
     IntensityAction, RestartSignal, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
+pub use topology::{DcCluster, DcTopology, NodeInfo};
