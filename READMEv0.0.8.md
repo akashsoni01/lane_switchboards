@@ -297,6 +297,63 @@ cargo run --example ecommerce_flash_sale --release
 
 Each region runs independently:
 
+```mermaid
+flowchart TB
+    subgraph roster ["What the coordinator Cluster knows — 8 members total"]
+        direction LR
+        R1["6 × us-east workers"]
+        R2["1 × eu-west-gateway"]
+        R3["1 × ap-south-gateway"]
+    end
+
+    subgraph us_east ["us-east — home region · separate VPC or k8s cluster"]
+        COORD["Health Coordinator<br/>LOCAL_DC = us-east<br/>separate deployment from workers"]
+        subgraph ue_workers ["Worker pool — joined to Cluster"]
+            UE["us-east-1 … us-east-6<br/>:19101 – :19106 · target heartbeat"]
+        end
+        UEGW["us-east-gateway :19100<br/>not probed by coordinator"]
+        UEGW -.->|"in-region fan-out"| UE
+    end
+
+    subgraph eu_west ["eu-west — remote region · separate VPC or k8s cluster"]
+        EUGW["eu-west-gateway :19200<br/>LB eu-west-lb.example.com<br/>joined to Cluster"]
+        subgraph ew_workers ["Worker pool — private to eu-west"]
+            EW["eu-west-1 … eu-west-6<br/>:19201 – :19206 · target heartbeat"]
+        end
+        EUGW -->|"LAN fan-out"| EW
+    end
+
+    subgraph ap_south ["ap-south — remote region · separate VPC or k8s cluster"]
+        APGW["ap-south-gateway :19300<br/>LB ap-south-lb.example.com<br/>joined to Cluster"]
+        subgraph ap_workers ["Worker pool — private to ap-south"]
+            AP["ap-south-1 … ap-south-6<br/>:19301 – :19306 · target heartbeat"]
+        end
+        APGW -->|"LAN fan-out"| AP
+    end
+
+    SD["Service discovery<br/>Consul · k8s Service · env"]
+
+    COORD -->|"dc_members us-east<br/>direct · 6 RPCs · 2s timeout"| UE
+    COORD -->|"dc_members eu-west<br/>1 WAN RPC · 5s timeout"| EUGW
+    COORD -->|"dc_members ap-south<br/>1 WAN RPC · 5s timeout"| APGW
+
+    SD -.->|"coordinator loads gateway addrs"| COORD
+    SD -.->|"each region publishes its gateway"| EUGW
+    SD -.->|"each region publishes its gateway"| APGW
+
+    roster ~~~ us_east
+```
+
+**How to read the diagram**
+
+| Symbol / edge | Meaning |
+|---------------|---------|
+| **Coordinator** | Runs in the home DC (`us-east`); builds the `Cluster` roster and runs health probes on a timer. |
+| **Solid arrows from coordinator** | gRPC `send_with_ack` on the persistent bidi stream — local workers directly, remote regions via gateway only. |
+| **Gateway → workers** | Happens inside the remote region over LAN; the coordinator never dials individual remote worker IPs. |
+| **Dotted arrows from service discovery** | Production source of gateway hostnames; workers stay off the global roster. |
+| **8-member roster** | 6 local worker refs + 1 ref per remote gateway — not all 18 nodes. |
+
 | Component | Per region | Bind |
 |-----------|------------|------|
 | Worker pool (N nodes) | `DcWorkers::spawn` or `serve_actor` × N | `{region-host}:9101..910N` |
