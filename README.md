@@ -6,7 +6,7 @@ OTP-style primitives in Rust: actors, supervision, linking, monitoring, distribu
 
 Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
 
-**Release notes:** [v0.7.0](READMEv0.0.7.md) · [v0.0.6](READMEv0.0.6.md) · [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
+**Release notes:** [v0.0.8](READMEv0.0.8.md) · [v0.7.0](READMEv0.0.7.md) · [v0.0.6](READMEv0.0.6.md) · [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
 
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 
@@ -31,18 +31,33 @@ For the canonical reference, see the [Erlang/OTP System Documentation](https://w
 
 Lane Switchboards is **not** a replacement for Tokio (runtime) or Actix Web (HTTP). It is a **small OTP-style actor layer** for fault-tolerant, message-driven domain logic. Use it when you want Erlang-like supervision and lifecycle primitives in Rust without adopting a larger framework.
 
-| | **lane_switchboards** | **Tokio** (tasks + channels) | **Actix Web** | **Ractor** |
-|---|----------------------|------------------------------|---------------|------------|
-| **Primary role** | OTP actor runtime | Async runtime & I/O | HTTP server / web framework | Production actor framework |
-| **Actor mailboxes** | Built-in (`Envelope`, `ActorRef`) | Roll your own (`mpsc`) | Not core (use for HTTP handlers) | Built-in |
-| **Supervision trees** | OneForOne / OneForAll / RestForOne + intensity limits | None — manual restart loops | None | Via `ractor-supervisor` |
-| **Link / monitor / trap_exit** | Yes — OTP semantics | None | None | Partial (monitoring exists) |
-| **Hot code upgrade** | In-process `DynActor` swap | None | None | Not built-in |
-| **Distributed actors** | gRPC/protobuf, bidi streams, cluster roster | Bring your own | Not included | Cluster features vary |
-| **Global actor registry** | `DashMap` index for cross-actor routing | None | None | Registry patterns available |
-| **Panic → supervisor path** | `catch_unwind` in `handle` | Task dies silently unless you wrap | Request fails; no actor tree | Framework-dependent |
-| **Learning curve** | Small codebase (~1k LOC core) | Low-level, you design everything | Web-focused API | Medium, ecosystem docs |
-| **Best for** | Supervised domain actors, demos, custom OTP, recoverable state patterns | Any async Rust | REST/gRPC gateways, HTTP | Production actor systems at scale |
+| | **lane_switchboards** | **Tokio** (tasks + channels) | **Actix Web** | **Ractor** | **Lunatic** |
+|---|----------------------|------------------------------|---------------|------------|------------|
+| **Primary role** | OTP actor runtime | Async runtime & I/O | HTTP server / web framework | Production actor framework | WASM actor runtime — Erlang processes in sandboxed WASM |
+| **Actor mailboxes** | Built-in (`Envelope`, `ActorRef`) | Roll your own (`mpsc`) | Not core (use for HTTP handlers) | Built-in | Built-in (Erlang-style typed channels) |
+| **Supervision trees** | OneForOne / OneForAll / RestForOne + intensity limits | None — manual restart loops | None | Via `ractor-supervisor` | Yes — Erlang-style supervisors |
+| **Link / monitor / trap_exit** | Yes — OTP semantics | None | None | Partial (monitoring exists) | Yes — full Erlang linking semantics |
+| **Hot code upgrade** | In-process `DynActor` swap (`Upgrade` envelope) | None | None | Not built-in | WASM module hot-reload |
+| **Distributed actors** | gRPC/protobuf, bidi streams, cluster roster | Bring your own | Not included | Cluster features vary | Yes — distributed WASM nodes |
+| **Global actor registry** | `DashMap` index for cross-actor routing | None | None | Registry patterns available | Process-name lookup |
+| **Panic → supervisor path** | `catch_unwind` in `handle` + typed `ExitReason` | Task dies silently unless you wrap | Request fails; no actor tree | Framework-dependent | Full isolation — WASM boundary contains all panics |
+| **Learning curve** | Small codebase (~1k LOC core) | Low-level, you design everything | Web-focused API | Medium, ecosystem docs | Medium-high (WASM toolchain, `no_std` patterns) |
+| **Best for** | Supervised domain actors, demos, custom OTP, recoverable state patterns | Any async Rust | REST/gRPC gateways, HTTP | Production actor systems at scale | Sandboxed / multi-tenant actors, plugin isolation, secure WASM compute |
+
+## Supported features
+
+Feature-level comparison between **lane_switchboards** and **Lunatic**.
+
+| Feature | lane_switchboards | Lunatic |
+|---------|:-----------------:|:-------:|
+| **Creating, cancelling & waiting on processes** | ✅ `spawn` / `ActorRef::kill` / `JoinHandle::await` | ✅ |
+| **Fine-grained process permissions** | ❌ no sandbox — host OS permissions only | ✅ WASM capability sandbox per process |
+| **Process supervision** | ✅ `OneForOne` / `OneForAll` / `RestForOne`, intensity limits | ✅ Erlang-style supervisors |
+| **Channel-based message passing** | ✅ `Envelope<M>` mailbox, `ActorRef::send`, typed `mpsc` | ✅ typed channels |
+| **TCP networking** | ✅ `stream_connect` / `stream_accept` / `MaybeTlsStream` | ✅ |
+| **Filesystem access** | ❌ use `std::fs` / `tokio::fs` directly | ✅ sandboxed filesystem API |
+| **Distributed nodes** | ✅ gRPC bidi streams, `Cluster`, `serve_actor`, hash-ring routing | ✅ distributed WASM nodes |
+| **Hot reloading** | ✅ in-process `DynActor` swap via `Envelope::Upgrade` | ✅ WASM module hot-reload |
 
 ### When to reach for lane_switchboards
 
@@ -332,6 +347,9 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | **E-commerce flash sale** (mesh + supervision + autoscale + QUORUM) | `cargo run --example ecommerce_flash_sale` — see [ecommerce_flash_sale.md](examples/ecommerce_flash_sale.md) |
 | Calculator on service mesh (RestForOne + prost) | `cargo run --example calculator_mesh` — see [calculator_mesh.md](examples/calculator_mesh.md) |
 | Calculator mesh (minimal) | `cargo run --example calculator_mesh_simplified` — see [calculator_mesh_simplified.md](examples/calculator_mesh_simplified.md) |
+| Raw TCP calculator (`stream_connect` / `stream_accept` / `MaybeTlsStream`) | `cargo run --example stream_calc` — see [stream_calc.md](examples/stream_calc.md) |
+| **Multi-DC heartbeat** (3 DCs × 6 nodes, partition detection) | `cargo run --example multi_dc_heartbeat` — see [multi_dc_heartbeat.md](examples/multi_dc_heartbeat.md) |
+| **Multi-DC heartbeat (production layout)** — regional gateways, `LOCAL_DC`, port blocks | `cargo run --example multi_dc_heartbeat_topology` — see [multi_dc_heartbeat.md](examples/multi_dc_heartbeat.md#production-layout-topology) |
 
 ## Benchmarks
 

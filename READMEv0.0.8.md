@@ -365,6 +365,8 @@ flowchart TB
 - **Local region** — join every worker with `.with_dc("us-east")`.
 - **Remote regions** — join **gateway only** with `.with_dc("eu-west")`; do not add individual worker addresses to the global roster.
 
+Runnable skeleton with production DNS and supervisors: [`multi_dc_heartbeat_prod`](examples/multi_dc_heartbeat_prod.rs) (`DRY_RUN=1` default).
+
 ```rust
 use lane_switchboards::topology::{DcTopology, DcWorkers};
 use lane_switchboards::distributed::{Cluster, ClusterMember, serve_actor};
@@ -612,7 +614,17 @@ Same machine, but:
 
 Use this to verify coordinator logic before deploying per-region processes.
 
-### 4) Mesh and distributed smoke tests
+### 4) Production deployment skeleton (fictional DNS, compiles without infra)
+
+```bash
+cargo run --example multi_dc_heartbeat_prod
+DEPLOY_ROLE=regional-gateway LOCAL_DC=eu-west cargo run --example multi_dc_heartbeat_prod
+DEPLOY_ROLE=worker LOCAL_DC=us-east WORKER_NAME=us-east-hb-3 cargo run --example multi_dc_heartbeat_prod
+```
+
+Production hostnames (`*.prod.example.com`), supervisors, and `send_with_ack` probes — **`DRY_RUN=1` by default** (no network). Set `DRY_RUN=0` on real hardware.
+
+### 5) Mesh and distributed smoke tests
 
 ```bash
 cargo run --example distributed_demo
@@ -622,7 +634,7 @@ cargo run --example horizontal_scaling
 cargo run --example horizontal_scaling_rest_for_one
 ```
 
-### 5) Supervision and fault injection
+### 6) Supervision and fault injection
 
 ```bash
 cargo run --example supervisor_strategies
@@ -631,7 +643,7 @@ cargo run --example rest_for_one_calculator_timer
 cargo run --example handle_timeout_calculator_timer
 ```
 
-### 6) Benchmarks (localhost baseline only)
+### 7) Benchmarks (localhost baseline only)
 
 ```bash
 cargo bench --bench wire
@@ -724,6 +736,7 @@ let workers = DcWorkers::spawn(
 | Raw TCP calculator | `cargo run --example stream_calc` |
 | Multi-DC API tour | `cargo run --example multi_dc_heartbeat` |
 | Multi-DC production layout | `cargo run --example multi_dc_heartbeat_topology` |
+| Multi-DC production skeleton (fictional DNS) | `cargo run --example multi_dc_heartbeat_prod` |
 | Hot code upgrade | `cargo run --example hot_upgrade` |
 | gRPC distributed | `cargo run --example distributed_demo` |
 | gRPC cluster | `cargo run --example grpc_cluster` |
@@ -757,5 +770,6 @@ let workers = DcWorkers::spawn(
 | `examples/stream_calc.rs` | Raw TCP calculator demo |
 | `examples/multi_dc_heartbeat.rs` | Single-process API tour |
 | `examples/multi_dc_heartbeat_topology.rs` | Regional gateway production layout |
+| `examples/multi_dc_heartbeat_prod.rs` | Production DNS + supervisors + dry-run deploy roles |
 | `examples/multi_dc_heartbeat.md` | Testing vs production guide |
 | `README.md` | Lunatic comparison, supported features matrix |
