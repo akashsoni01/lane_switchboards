@@ -190,3 +190,7 @@ path = "examples/handle_timeout_calculator_timer.rs"
 [[example]]
 name = "grpc_cluster"
 path = "examples/grpc_cluster.rs"
+
+[[example]]
+name = "multi_dc_heartbeat"
+path = "examples/multi_dc_heartbeat.rs"
