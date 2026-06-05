@@ -1,5 +1,81 @@
 # multi_dc_heartbeat
 
+Two examples — pick based on what you want to learn:
+
+| Example | Command | Purpose |
+|---------|---------|---------|
+| [`multi_dc_heartbeat.rs`](./multi_dc_heartbeat.rs) | `cargo run --example multi_dc_heartbeat` | API tour — all 18 nodes in one process, every DC broadcasts to every DC |
+| [`multi_dc_heartbeat_topology.rs`](./multi_dc_heartbeat_topology.rs) | `cargo run --example multi_dc_heartbeat_topology` | **Production layout** — regional gateways, coordinator in `LOCAL_DC`, distinct port blocks |
+
+```bash
+cargo run --example multi_dc_heartbeat
+cargo run --example multi_dc_heartbeat_topology   # recommended for real deployments
+```
+
+---
+
+## Production layout (`multi_dc_heartbeat_topology`)
+
+The original example puts **all 18 nodes on ephemeral localhost ports in one process** and uses `cluster.datacenters("local")`. That is fine for learning APIs but **not** how you run multi-DC in production:
+
+| Demo anti-pattern | Production pattern |
+|-------------------|-------------------|
+| One process owns all regions | Each region runs its own worker pool + gateway |
+| All nodes in coordinator roster (18 members) | Coordinator roster: **local workers + remote gateways only** (8 members) |
+| Cross-DC sends hit 6 worker addresses per region | Cross-DC sends hit **1 gateway per region**; gateway fans out locally |
+| `datacenters("local")` | `datacenters("us-east")` where `"us-east"` is the coordinator's home DC |
+| All nodes on `127.0.0.1:0` | Fixed port blocks per region (`19101-19106`, `19201-19206`, …) |
+
+### Architecture
+
+```mermaid
+flowchart TB
+    COORD["Health coordinator<br/>LOCAL_DC=us-east"]
+
+    subgraph us-east["us-east (local)"]
+        GW1["gateway :19100"]
+        W1["workers :19101-19106"]
+        GW1 --> W1
+    end
+
+    subgraph eu-west["eu-west (remote)"]
+        GW2["gateway :19200"]
+        W2["workers :19201-19206"]
+        GW2 --> W2
+    end
+
+    subgraph ap-south["ap-south (remote)"]
+        GW3["gateway :19300"]
+        W3["workers :19301-19306"]
+        GW3 --> W3
+    end
+
+    COORD -->|"dc_members(us-east)"| W1
+    COORD -->|"dc_members(eu-west)"| GW2
+    COORD -->|"dc_members(ap-south)"| GW3
+```
+
+### Coordinator roster (8 members, not 18)
+
+```
+local  dc_members(us-east)  → 6 worker refs   (direct — same region)
+remote dc_members(eu-west) → 1 gateway ref   (not 6 worker addrs)
+remote dc_members(ap-south)→ 1 gateway ref
+```
+
+Uses [`DcWorkers`](../src/topology.rs) per region and [`ClusterMember::with_dc`](../src/distributed.rs) on the coordinator-built roster.
+
+### Deploying for real
+
+1. Run worker pools + gateway in each region (separate processes / k8s clusters).
+2. Set `LOCAL_DC` from env on the coordinator (e.g. `us-east`).
+3. Register **gateway URLs** in service discovery — not individual worker IPs.
+4. On partition, coordinator **stops routing** to the unreachable region (Round 3 in the topology example).
+
+---
+
+## API tour (`multi_dc_heartbeat`)
+
 [`multi_dc_heartbeat.rs`](./multi_dc_heartbeat.rs) is a **3-datacenter × 6-node heartbeat demo** that covers every DC-aware API on [`Cluster`](../src/distributed.rs).
 
 ```bash

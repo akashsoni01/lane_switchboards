@@ -1,33 +1,42 @@
-//! Multi-datacenter heartbeat — 3 DCs × 6 nodes each (18 nodes total).
+//! Production-style multi-DC heartbeat using [`DcTopology`] / [`DcWorkers`].
 //!
-//! Demonstrates all DC-aware [`Cluster`] APIs via [`DcTopology`] / [`DcCluster`]:
+//! Unlike the all-localhost demo in [`multi_dc_heartbeat`](./multi_dc_heartbeat.rs),
+//! this models how heartbeat monitoring works in a real deployment:
 //!
-//! - [`ClusterMember::with_dc`] — tag each node with its datacenter
-//! - [`Cluster::dc_members`]    — all remote refs for one DC
-//! - [`Cluster::datacenters`]   — enumerate distinct DCs in the roster
-//! - [`Cluster::dc_replicas_for_key`] — consistent-hash replicas within a DC
-//! - [`Cluster::send_all`]      — global fan-out with per-node results
+//! - **Regional worker pools** — 6 nodes per DC on distinct port blocks (simulating
+//!   separate hosts: `19101-19106`, `19201-19206`, `19301-19306`).
+//! - **One gateway per DC** — cross-region traffic hits `eu-west-gateway @ :19200`,
+//!   not 6 individual worker addresses. The gateway fans out locally.
+//! - **Coordinator in `LOCAL_DC`** — health checks run from `us-east`; the roster
+//!   contains local workers + remote gateways only (8 members, not 18).
+//! - **`local_dc` is explicit** — routing uses `cluster.datacenters("us-east")` and
+//!   `local_replicas_for_key(..., "us-east")`, not the meaningless `"local"` sentinel.
 //!
-//! Three scenarios are run back-to-back:
-//!
-//! 1. **Intra-DC broadcast** — every node receives a pulse from its own DC
-//! 2. **Cross-DC probes**   — all 6 directed DC→DC pairs exchange one round
-//! 3. **Partition simulation** — `eu-west` stops sending; `us-east` and
-//!    `ap-south` nodes detect the missing beats in the stats summary
-//!
-//! Run: `cargo run --example multi_dc_heartbeat`
+//! Run: `cargo run --example multi_dc_heartbeat_topology`
 //! See: `examples/multi_dc_heartbeat.md`
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
-use lane_switchboards::distributed::Cluster;
+use lane_switchboards::distributed::{serve_actor, Cluster, ClusterMember, RemoteActorRef};
 use lane_switchboards::prost::Message;
-use lane_switchboards::topology::{DcCluster, DcTopology, NodeInfo};
+use lane_switchboards::topology::{DcTopology, DcWorkers, NodeInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-// ── Wire types (protobuf) ─────────────────────────────────────────────────
+// ── Where the health coordinator runs (env: LOCAL_DC in production) ───────
+
+const LOCAL_DC: &str = "us-east";
+const WORKERS_PER_DC: usize = 6;
+
+/// Gateway port + workers at `port_base + 1 .. port_base + WORKERS_PER_DC`.
+const REGION_PORTS: [(&str, u16); 3] = [
+    ("us-east", 19_100),
+    ("eu-west", 19_200),
+    ("ap-south", 19_300),
+];
+
+// ── Wire types ────────────────────────────────────────────────────────────
 
 #[derive(Clone, PartialEq, Message)]
 pub struct HbMsg {
@@ -46,16 +55,12 @@ pub mod hb_msg {
     }
 }
 
-/// One heartbeat pulse.
 #[derive(Clone, PartialEq, Message)]
 pub struct Heartbeat {
-    /// Logical name of the sending node (e.g. `"us-east-3"`).
     #[prost(string, tag = "1")]
     pub from_node: String,
-    /// Datacenter of the sender (e.g. `"us-east"`).
     #[prost(string, tag = "2")]
     pub from_dc: String,
-    /// Monotonically increasing sequence number.
     #[prost(uint64, tag = "3")]
     pub seq: u64,
 }
@@ -72,260 +77,334 @@ impl HbMsg {
     }
 }
 
-// ── Shared per-node statistics ────────────────────────────────────────────
+// ── Per-worker stats ──────────────────────────────────────────────────────
 
-/// Accumulated heartbeat counts, keyed by *source datacenter*.
 #[derive(Default)]
 struct NodeStats {
     beats_from_dc: HashMap<String, u64>,
 }
 
-// ── HeartbeatActor ────────────────────────────────────────────────────────
+type StatsRegistry = Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<NodeStats>>>>>;
 
 struct HeartbeatActor {
-    node_name: String,
-    dc: String,
     stats: Arc<Mutex<NodeStats>>,
 }
 
 #[async_trait::async_trait]
 impl Actor<HbMsg> for HeartbeatActor {
-    async fn pre_start(&mut self) -> Result<(), ActorProcessingErr> {
-        tracing::debug!(node = %self.node_name, dc = %self.dc, "heartbeat actor up");
-        Ok(())
-    }
-
     async fn handle(&mut self, msg: HbMsg) -> Result<(), ActorProcessingErr> {
         if let Some(hb_msg::Kind::Beat(hb)) = msg.kind {
             let mut s = self.stats.lock().await;
             *s.beats_from_dc.entry(hb.from_dc.clone()).or_insert(0) += 1;
-            tracing::trace!(
-                to   = %self.node_name,
-                from = %hb.from_node,
-                seq  = hb.seq,
-                "♥ received"
-            );
         }
         Ok(())
     }
 }
 
-// ── Heartbeat helpers ─────────────────────────────────────────────────────
+/// Regional entry point — receives cross-DC probes and fans out to local workers.
+struct RegionalGateway {
+    workers: Vec<RemoteActorRef<HbMsg>>,
+}
 
-async fn beat_intra_dc(cluster: &Cluster<HbMsg>, dc: &str, seq: u64) {
-    let msg = HbMsg::beat(dc, dc, seq);
-    for r in cluster.dc_members(dc) {
-        let _ = r.send(msg.clone()).await;
+#[async_trait::async_trait]
+impl Actor<HbMsg> for RegionalGateway {
+    async fn handle(&mut self, msg: HbMsg) -> Result<(), ActorProcessingErr> {
+        for worker in &self.workers {
+            worker.send(msg.clone()).await?;
+        }
+        Ok(())
     }
 }
 
-async fn beat_cross_dc(cluster: &Cluster<HbMsg>, from_dc: &str, to_dc: &str, seq: u64) {
-    let msg = HbMsg::beat(from_dc, from_dc, seq);
-    for r in cluster.dc_members(to_dc) {
-        let _ = r.send(msg.clone()).await;
+struct RegionalSite {
+    dc: String,
+    port_base: u16,
+    workers: DcWorkers<HbMsg>,
+    gateway_addr: String,
+    _gateway: lane_switchboards::distributed::NodeHandle<HbMsg>,
+}
+
+impl RegionalSite {
+    async fn spawn(dc: &str, port_base: u16, stats: StatsRegistry) -> std::io::Result<Self> {
+        let dc_name = dc.to_string();
+        let stats_reg = stats.clone();
+        let workers = DcWorkers::spawn(
+            DcTopology::new().datacenter_with_ports(&dc_name, WORKERS_PER_DC, port_base),
+            "heartbeat",
+            move |_, node_name| {
+                let entry = Arc::new(Mutex::new(NodeStats::default()));
+                stats_reg
+                    .lock()
+                    .expect("stats")
+                    .insert(node_name.to_string(), entry.clone());
+                HeartbeatActor { stats: entry }
+            },
+        )
+        .await?;
+
+        let worker_refs: Vec<RemoteActorRef<HbMsg>> = workers
+            .nodes()
+            .iter()
+            .map(|n| RemoteActorRef::new(&n.addr, "heartbeat"))
+            .collect();
+
+        let gateway_bind = format!("127.0.0.1:{port_base}");
+        let gateway = serve_actor(
+            format!("{dc}-gateway"),
+            &gateway_bind,
+            "gateway",
+            RegionalGateway {
+                workers: worker_refs,
+            },
+        )
+        .await?;
+
+        Ok(Self {
+            dc: dc.to_string(),
+            port_base,
+            workers,
+            gateway_addr: gateway.address().to_string(),
+            _gateway: gateway,
+        })
+    }
+
+    fn worker_port_range(&self) -> String {
+        format!(
+            "{}-{}",
+            self.port_base + 1,
+            self.port_base + WORKERS_PER_DC as u16
+        )
     }
 }
 
-async fn print_dc_summary(
-    nodes: &[NodeInfo],
-    stats_by_name: &HashMap<String, Arc<Mutex<NodeStats>>>,
-) {
-    let mut totals: HashMap<String, HashMap<String, u64>> = HashMap::new();
-    for node in nodes {
-        let beats = {
-            let s = stats_by_name[&node.name].lock().await;
-            s.beats_from_dc.clone()
-        };
-        let row = totals.entry(node.dc.clone()).or_default();
-        for (from_dc, count) in beats {
-            *row.entry(from_dc).or_insert(0) += count;
+/// Build the coordinator roster: local workers + remote gateways only.
+fn build_coordinator_cluster(sites: &[RegionalSite]) -> Cluster<HbMsg> {
+    let mut cluster = Cluster::new();
+    for site in sites {
+        if site.dc == LOCAL_DC {
+            for node in site.workers.nodes() {
+                cluster.join(
+                    ClusterMember::new(&node.name, &node.addr, "heartbeat")
+                        .with_dc(site.dc.clone()),
+                );
+            }
+        } else {
+            cluster.join(
+                ClusterMember::new(
+                    format!("{}-gateway", site.dc),
+                    &site.gateway_addr,
+                    "gateway",
+                )
+                .with_dc(site.dc.clone()),
+            );
         }
     }
-    let mut target_dcs: Vec<&String> = totals.keys().collect();
-    target_dcs.sort();
-    for target_dc in target_dcs {
-        let from_map = &totals[target_dc];
-        let mut parts: Vec<String> = from_map
+    cluster
+}
+
+async fn probe_local_workers(cluster: &Cluster<HbMsg>, seq: u64) {
+    let msg = HbMsg::beat(format!("{LOCAL_DC}-coordinator"), LOCAL_DC, seq);
+    for worker in cluster.dc_members(LOCAL_DC) {
+        let _ = worker.send(msg.clone()).await;
+    }
+}
+
+async fn probe_remote_dc(cluster: &Cluster<HbMsg>, remote_dc: &str, seq: u64) -> usize {
+    let msg = HbMsg::beat(format!("{LOCAL_DC}-coordinator"), LOCAL_DC, seq);
+    let mut ok = 0;
+    for gateway in cluster.dc_members(remote_dc) {
+        if gateway
+            .send_with_ack(msg.clone(), Duration::from_millis(500))
+            .await
+            .is_ok()
+        {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+async fn print_worker_summary(all_workers: &[NodeInfo], stats: &StatsRegistry) {
+    let map = stats.lock().expect("stats");
+    let mut totals: HashMap<String, HashMap<String, u64>> = HashMap::new();
+    for node in all_workers {
+        let beats = map[&node.name].lock().await.beats_from_dc.clone();
+        let row = totals.entry(node.dc.clone()).or_default();
+        for (from, count) in beats {
+            *row.entry(from).or_insert(0) += count;
+        }
+    }
+    let mut dcs: Vec<_> = totals.keys().collect();
+    dcs.sort();
+    for dc in dcs {
+        let mut parts: Vec<String> = totals[dc]
             .iter()
             .map(|(from, n)| format!("{from}×{n}"))
             .collect();
         parts.sort();
-        println!("  {target_dc:<12} ←  {}", parts.join("   "));
+        println!("  {dc:<12} ←  {}", parts.join("   "));
     }
 }
 
-const DCS: [&str; 3] = ["us-east", "eu-west", "ap-south"];
-
-// ── main ──────────────────────────────────────────────────────────────────
+fn all_worker_nodes(sites: &[RegionalSite]) -> Vec<NodeInfo> {
+    sites
+        .iter()
+        .flat_map(|s| s.workers.nodes().iter().cloned())
+        .collect()
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    println!("=== multi_dc_heartbeat — 3 DCs × 6 nodes ===\n");
+    println!("=== multi_dc_heartbeat_topology — production layout ===\n");
+    println!("Coordinator LOCAL_DC={LOCAL_DC}  (simulates Virginia ops plane)\n");
 
-    let stats_by_name: Arc<std::sync::Mutex<HashMap<String, Arc<Mutex<NodeStats>>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let stats: StatsRegistry = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    println!("Spawning nodes…");
-    let topology = DcTopology::new()
-        .datacenter("us-east", 6)
-        .datacenter("eu-west", 6)
-        .datacenter("ap-south", 6);
-
-    let stats_registry = stats_by_name.clone();
-    let dc_cluster = DcCluster::spawn(topology, "heartbeat", move |dc, node_name| {
-        let stats = Arc::new(Mutex::new(NodeStats::default()));
-        stats_registry
-            .lock()
-            .expect("stats registry")
-            .insert(node_name.to_string(), stats.clone());
-        HeartbeatActor {
-            node_name: node_name.to_string(),
-            dc: dc.to_string(),
-            stats,
-        }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    for node in dc_cluster.nodes() {
+    println!("Regional sites (distinct port blocks = separate hosts):\n");
+    let mut sites = Vec::new();
+    for (dc, port_base) in REGION_PORTS {
+        let site = RegionalSite::spawn(dc, port_base, stats.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let role = if dc == LOCAL_DC { "local" } else { "remote" };
         println!(
-            "  {:<14}  dc={:<10}  addr={}",
-            node.name, node.dc, node.addr
+            "  {dc:<10}  gateway @ 127.0.0.1:{port_base:<5}  workers @ {}  ({role})",
+            site.worker_port_range()
         );
+        sites.push(site);
     }
-    println!("\n{} nodes online\n", dc_cluster.nodes().len());
 
-    let cluster = dc_cluster.cluster();
-    let known_dcs = cluster.datacenters("local");
+    let cluster = build_coordinator_cluster(&sites);
+    let worker_nodes = all_worker_nodes(&sites);
+
     println!(
-        "Cluster roster: {} nodes  |  DCs: [{}]",
-        cluster.len(),
-        known_dcs.join(", ")
+        "\nCoordinator roster from {} ({} members — not all 18 workers):",
+        LOCAL_DC,
+        cluster.len()
     );
-    for dc in &known_dcs {
-        println!("  dc_members({dc:<10}) → {} nodes", cluster.dc_members(dc).len());
+    println!(
+        "  local  dc_members({LOCAL_DC:<10}) → {} worker refs",
+        cluster.dc_members(LOCAL_DC).len()
+    );
+    for (dc, _) in REGION_PORTS {
+        if dc != LOCAL_DC {
+            println!(
+                "  remote dc_members({dc:<10}) → {} gateway ref(s)",
+                cluster.dc_members(dc).len()
+            );
+        }
     }
+
+    let known = cluster.datacenters(LOCAL_DC);
+    println!(
+        "\ncluster.datacenters(\"{LOCAL_DC}\") → [{}]",
+        known.join(", ")
+    );
+    println!(
+        "  (uses coordinator home DC — not the \"local\" placeholder)\n"
+    );
 
     tokio::time::sleep(Duration::from_millis(60)).await;
 
-    // ── Round 1: intra-DC broadcast ──────────────────────────────────────
-    println!("\n─── Round 1: intra-DC broadcast ───────────────────────────────");
-    let mut seq = 1u64;
-    for dc in DCS {
-        beat_intra_dc(cluster, dc, seq).await;
-        println!("  {dc} → {dc:<10}  (1 beat × 6 nodes, seq={seq})");
+    // ── Round 1: intra-DC from coordinator ───────────────────────────────
+    println!("─── Round 1: coordinator probes LOCAL workers only ────────────");
+    let seq = 1;
+    probe_local_workers(&cluster, seq).await;
+    println!(
+        "  {LOCAL_DC}-coordinator → {WORKERS_PER_DC} local workers @ :19101-19106  (seq={seq})"
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    println!("\nWorker stats (only {LOCAL_DC} should have beats):");
+    print_worker_summary(&worker_nodes, &stats).await;
+
+    // ── Round 2: cross-DC via gateways (1 RPC per remote DC) ───────────
+    println!("\n─── Round 2: cross-DC via regional gateways ───────────────────");
+    let mut seq = 2;
+    for (dc, _) in REGION_PORTS {
+        if dc == LOCAL_DC {
+            continue;
+        }
+        let ok = probe_remote_dc(&cluster, dc, seq).await;
+        println!(
+            "  {LOCAL_DC}-coordinator → {dc}-gateway → {WORKERS_PER_DC} workers  (seq={seq}, gateways_ok={ok})"
+        );
         seq += 1;
     }
     tokio::time::sleep(Duration::from_millis(80)).await;
-    println!("\nStats after round 1  (own_dc×6 per DC):");
-    print_dc_summary(dc_cluster.nodes(), &stats_by_name.lock().expect("stats")).await;
+    println!("\nWorker stats ({LOCAL_DC} workers hear remote coordinator beats):");
+    print_worker_summary(&worker_nodes, &stats).await;
 
-    // ── Round 2: all 6 cross-DC directed pairs ───────────────────────────
-    println!("\n─── Round 2: cross-DC probes (all 6 directed pairs) ───────────");
-    for from_dc in DCS {
-        for to_dc in DCS {
-            if from_dc != to_dc {
-                beat_cross_dc(cluster, from_dc, to_dc, seq).await;
-                println!("  {from_dc} → {to_dc:<10}  seq={seq}");
-                seq += 1;
-            }
-        }
-    }
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    println!("\nStats after round 2  (each DC hears from all 3 DCs):");
-    print_dc_summary(dc_cluster.nodes(), &stats_by_name.lock().expect("stats")).await;
-
-    // ── Round 3: eu-west partition ───────────────────────────────────────
-    println!("\n─── Round 3: eu-west partition (eu-west stops sending) ────────");
-    println!("  eu-west outbound heartbeats: SUPPRESSED");
-
-    let stats_map = stats_by_name.lock().expect("stats");
+    // ── Round 3: eu-west partition — coordinator stops routing there ─────
+    println!("\n─── Round 3: eu-west partition (coordinator stops probing) ────");
     let mut snap_eu: HashMap<String, u64> = HashMap::new();
-    for node in dc_cluster.nodes().iter().filter(|n| n.dc != "eu-west") {
-        let count = stats_map[&node.name]
-            .lock()
-            .await
-            .beats_from_dc
-            .get("eu-west")
-            .copied()
-            .unwrap_or(0);
-        snap_eu.insert(node.name.clone(), count);
-    }
-    drop(stats_map);
-
-    for from_dc in DCS {
-        for to_dc in DCS {
-            if from_dc == to_dc || from_dc == "eu-west" {
-                continue;
-            }
-            beat_cross_dc(cluster, from_dc, to_dc, seq).await;
-            println!("  {from_dc} → {to_dc:<10}  seq={seq}");
-            seq += 1;
+    {
+        let map = stats.lock().expect("stats");
+        for node in worker_nodes.iter().filter(|n| n.dc == "eu-west") {
+            let count = map[&node.name]
+                .lock()
+                .await
+                .beats_from_dc
+                .get(LOCAL_DC)
+                .copied()
+                .unwrap_or(0);
+            snap_eu.insert(node.name.clone(), count);
         }
     }
-    for dc in ["us-east", "ap-south"] {
-        beat_intra_dc(cluster, dc, seq).await;
-        seq += 1;
-    }
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    println!("\nStats after round 3  (eu-west count frozen on us-east and ap-south):");
-    print_dc_summary(dc_cluster.nodes(), &stats_by_name.lock().expect("stats")).await;
+    println!("  eu-west-gateway marked unreachable — coordinator skips remote probes");
 
-    // ── Partition detection ──────────────────────────────────────────────
-    println!("\n─── Partition detection ────────────────────────────────────────");
-    println!("  Nodes that received zero NEW beats from eu-west in round 3:\n");
-    let stats_map = stats_by_name.lock().expect("stats");
-    let mut missed = 0usize;
-    for node in dc_cluster.nodes().iter().filter(|n| n.dc != "eu-west") {
-        let after = stats_map[&node.name]
+    let seq = 4;
+    probe_local_workers(&cluster, seq).await;
+    let ap_ok = probe_remote_dc(&cluster, "ap-south", seq + 1).await;
+    println!(
+        "  {LOCAL_DC} local probe seq={seq}  |  ap-south gateway seq={} (ok={ap_ok})  |  eu-west SKIPPED",
+        seq + 1
+    );
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    println!("\nWorker stats (eu-west frozen; us-east + ap-south advanced):");
+    print_worker_summary(&worker_nodes, &stats).await;
+
+    println!("\n─── Partition detection (eu-west workers stale vs coordinator) ─");
+    let map = stats.lock().expect("stats");
+    let mut stalled = 0;
+    for node in worker_nodes.iter().filter(|n| n.dc == "eu-west") {
+        let after = map[&node.name]
             .lock()
             .await
             .beats_from_dc
-            .get("eu-west")
+            .get(LOCAL_DC)
             .copied()
             .unwrap_or(0);
         let before = snap_eu[&node.name];
         if after == before {
             println!(
-                "  ⚠  {:<14} ({})  eu-west silent  [had {before}, still {after}]",
-                node.name, node.dc
+                "  ⚠  {:<14}  no new beats from {LOCAL_DC}  [had {before}, still {after}]",
+                node.name
             );
-            missed += 1;
+            stalled += 1;
         }
     }
-    drop(stats_map);
-    println!("\n  → {missed} nodes detected the eu-west partition");
+    println!("\n  → {stalled}/{WORKERS_PER_DC} eu-west workers stale (coordinator stopped probing)");
 
-    // ── DC-aware routing demo ────────────────────────────────────────────
-    println!("\n─── DC-aware routing (dc_replicas_for_key) ─────────────────────");
-    let key = "session-abc123";
-    for dc in DCS {
-        let replicas = cluster.dc_replicas_for_key(&key, dc, "local", 3);
-        let names: Vec<&str> = replicas
-            .iter()
-            .filter_map(|r| dc_cluster.node_name(&r.node_addr))
-            .collect();
-        println!("  key={key:?}  dc={dc:<10}  n=3  →  [{}]", names.join(", "));
-    }
-
-    // ── Cluster-wide broadcast ───────────────────────────────────────────
-    println!("\n─── Global broadcast (send_all) ────────────────────────────────");
-    let results = cluster
-        .send_all(HbMsg::beat("coordinator", "control-plane", seq))
-        .await;
-    let (ok, err): (Vec<_>, Vec<_>) = results.iter().partition(|(_, r)| r.is_ok());
+    // ── Local routing (coordinator home DC) ────────────────────────────
+    println!("\n─── local_replicas_for_key (coordinator home DC only) ─────────");
+    let key = "tenant-42/session-7";
+    let local = cluster.local_replicas_for_key(&key, 3, LOCAL_DC);
+    let names: Vec<String> = local
+        .iter()
+        .filter_map(|r| {
+            worker_nodes
+                .iter()
+                .find(|n| n.addr == r.node_addr)
+                .map(|n| n.name.clone())
+        })
+        .collect();
     println!(
-        "  broadcast to {} nodes → {} ok, {} err",
-        results.len(),
-        ok.len(),
-        err.len()
+        "  key={key:?}  local_dc={LOCAL_DC}  n=3  →  [{}]",
+        names.join(", ")
     );
+    println!("  (remote DC workers excluded — use dc_replicas_for_key for other regions)");
 
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    println!("\nFinal stats (includes coordinator broadcast):");
-    print_dc_summary(dc_cluster.nodes(), &stats_by_name.lock().expect("stats")).await;
-
-    println!("\nDone. See examples/multi_dc_heartbeat.md");
+    println!("\nDone. Compare with: cargo run --example multi_dc_heartbeat");
     Ok(())
 }

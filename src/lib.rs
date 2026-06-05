@@ -89,4 +89,4 @@ pub use supervisor::{
     supervise_named_child, supervise_named_child_settled, ChildRegistry, ChildSlot, ChildSpec,
     IntensityAction, RestartSignal, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
-pub use topology::{DcCluster, DcTopology, NodeInfo};
+pub use topology::{DatacenterSpec, DcCluster, DcTopology, DcWorkers, NodeInfo};

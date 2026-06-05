@@ -194,3 +194,7 @@ path = "examples/grpc_cluster.rs"
 [[example]]
 name = "multi_dc_heartbeat"
 path = "examples/multi_dc_heartbeat.rs"
+
+[[example]]
+name = "multi_dc_heartbeat_topology"
+path = "examples/multi_dc_heartbeat_topology.rs"

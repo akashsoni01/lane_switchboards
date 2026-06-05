@@ -2,16 +2,25 @@
 //!
 //! Collapses the repetitive setup in multi-DC examples — node naming, `serve_actor`,
 //! [`ClusterMember::with_dc`], and [`Cluster::join`] — into a chainable [`DcTopology`]
-//! builder and a single [`DcCluster::spawn`] call.
+//! builder and [`DcCluster`] / [`DcWorkers`] spawn helpers.
 
 use crate::actor::Actor;
 use crate::distributed::{serve_actor, Cluster, ClusterMember, NodeHandle, RemoteMessage};
 use std::collections::HashMap;
 
-/// Declarative datacenter layout: each entry is `(dc_name, node_count)`.
+/// One datacenter in a [`DcTopology`].
+#[derive(Debug, Clone)]
+pub struct DatacenterSpec {
+    pub name: String,
+    pub count: usize,
+    /// When set, node `i` binds `127.0.0.1:{port_base + i}`.
+    pub port_base: Option<u16>,
+}
+
+/// Declarative datacenter layout.
 #[derive(Debug, Default, Clone)]
 pub struct DcTopology {
-    datacenters: Vec<(String, usize)>,
+    datacenters: Vec<DatacenterSpec>,
 }
 
 impl DcTopology {
@@ -19,27 +28,156 @@ impl DcTopology {
         Self::default()
     }
 
-    /// Add a datacenter with `count` nodes. Chainable.
+    /// Add a datacenter with `count` nodes on ephemeral ports. Chainable.
     pub fn datacenter(mut self, name: impl Into<String>, count: usize) -> Self {
-        self.datacenters.push((name.into(), count));
+        self.datacenters.push(DatacenterSpec {
+            name: name.into(),
+            count,
+            port_base: None,
+        });
+        self
+    }
+
+    /// Add a datacenter whose nodes bind `127.0.0.1:{port_base + i}` for `i` in `1..=count`.
+    ///
+    /// Reserve `port_base` for a regional gateway in multi-DC production layouts.
+    pub fn datacenter_with_ports(
+        mut self,
+        name: impl Into<String>,
+        count: usize,
+        port_base: u16,
+    ) -> Self {
+        self.datacenters.push(DatacenterSpec {
+            name: name.into(),
+            count,
+            port_base: Some(port_base),
+        });
         self
     }
 
     pub fn total_nodes(&self) -> usize {
-        self.datacenters.iter().map(|(_, count)| count).sum()
+        self.datacenters.iter().map(|spec| spec.count).sum()
     }
 
-    pub fn datacenters(&self) -> &[(String, usize)] {
+    pub fn specs(&self) -> &[DatacenterSpec] {
         &self.datacenters
+    }
+
+    /// `(dc_name, node_count)` pairs — port bases omitted.
+    pub fn datacenters(&self) -> Vec<(String, usize)> {
+        self.datacenters
+            .iter()
+            .map(|spec| (spec.name.clone(), spec.count))
+            .collect()
+    }
+
+    fn bind_addr(spec: &DatacenterSpec, index: u16) -> String {
+        match spec.port_base {
+            Some(base) => format!("127.0.0.1:{}", base + index),
+            None => "127.0.0.1:0".to_string(),
+        }
     }
 }
 
-/// Metadata for one spawned node in a [`DcCluster`].
+/// Metadata for one spawned node.
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
     pub name: String,
     pub dc: String,
     pub addr: String,
+}
+
+struct SpawnedNodes<M: RemoteMessage> {
+    nodes: Vec<NodeInfo>,
+    addr_to_name: HashMap<String, String>,
+    handles: Vec<NodeHandle<M>>,
+}
+
+async fn spawn_topology_nodes<M, B, A>(
+    topology: &DcTopology,
+    target: &str,
+    build: &B,
+) -> std::io::Result<SpawnedNodes<M>>
+where
+    M: RemoteMessage,
+    B: Fn(&str, &str) -> A,
+    A: Actor<M> + Send + Sync + 'static,
+{
+    let mut nodes = Vec::with_capacity(topology.total_nodes());
+    let mut addr_to_name = HashMap::with_capacity(topology.total_nodes());
+    let mut handles = Vec::with_capacity(topology.total_nodes());
+
+    for spec in topology.specs() {
+        for i in 1..=spec.count {
+            let name = format!("{}-{i}", spec.name);
+            let actor = build(&spec.name, &name);
+            let bind = DcTopology::bind_addr(spec, i as u16);
+            let handle = serve_actor(&name, &bind, target, actor).await?;
+            let addr = handle.address().to_string();
+            addr_to_name.insert(addr.clone(), name.clone());
+            nodes.push(NodeInfo {
+                name,
+                dc: spec.name.clone(),
+                addr,
+            });
+            handles.push(handle);
+        }
+    }
+
+    Ok(SpawnedNodes {
+        nodes,
+        addr_to_name,
+        handles,
+    })
+}
+
+/// Worker pool for one or more datacenters — no [`Cluster`] join (regional site).
+pub struct DcWorkers<M: RemoteMessage> {
+    nodes: Vec<NodeInfo>,
+    addr_to_name: HashMap<String, String>,
+    _handles: Vec<NodeHandle<M>>,
+}
+
+impl<M: RemoteMessage> DcWorkers<M> {
+    /// Spawn nodes declared in `topology` without joining a cluster.
+    pub async fn spawn<B, A>(
+        topology: DcTopology,
+        target: impl Into<String>,
+        build: B,
+    ) -> std::io::Result<Self>
+    where
+        B: Fn(&str, &str) -> A,
+        A: Actor<M> + Send + Sync + 'static,
+    {
+        let target = target.into();
+        let spawned = spawn_topology_nodes(&topology, &target, &build).await?;
+        tracing::info!(
+            nodes = spawned.nodes.len(),
+            dcs = topology.specs().len(),
+            "dc workers spawned"
+        );
+        Ok(Self {
+            nodes: spawned.nodes,
+            addr_to_name: spawned.addr_to_name,
+            _handles: spawned.handles,
+        })
+    }
+
+    pub fn nodes(&self) -> &[NodeInfo] {
+        &self.nodes
+    }
+
+    pub fn node_name(&self, addr: &str) -> Option<&str> {
+        self.addr_to_name.get(addr).map(String::as_str)
+    }
+
+    pub fn dc_node_names(&self, dc: &str) -> Vec<&str> {
+        self.nodes
+            .iter()
+            .filter(|node| node.dc == dc)
+            .map(|node| node.name.as_str())
+            .collect()
+    }
 }
 
 /// A populated multi-DC [`Cluster`] with node bookkeeping.
@@ -51,9 +189,7 @@ pub struct DcCluster<M: RemoteMessage> {
 }
 
 impl<M: RemoteMessage> DcCluster<M> {
-    /// Spawn every node in `topology` using `build(dc, node_name)` to create the actor,
-    /// bind each via [`serve_actor`] on `127.0.0.1:0`, tag with its DC, and join
-    /// a single [`Cluster`]. `target` is the gRPC deliver target (e.g. `"heartbeat"`).
+    /// Spawn every node in `topology`, tag with its DC, and join one [`Cluster`].
     ///
     /// Nodes are named `"{dc}-{i}"` with `i` starting at 1.
     pub async fn spawn<B, A>(
@@ -66,40 +202,25 @@ impl<M: RemoteMessage> DcCluster<M> {
         A: Actor<M> + Send + Sync + 'static,
     {
         let target = target.into();
+        let spawned = spawn_topology_nodes(&topology, &target, &build).await?;
         let mut cluster = Cluster::<M>::new();
-        let mut nodes = Vec::with_capacity(topology.total_nodes());
-        let mut addr_to_name = HashMap::with_capacity(topology.total_nodes());
-        let mut handles = Vec::with_capacity(topology.total_nodes());
-
-        for (dc, count) in topology.datacenters() {
-            for i in 1..=*count {
-                let name = format!("{dc}-{i}");
-                let actor = build(dc, &name);
-                let handle = serve_actor(&name, "127.0.0.1:0", &target, actor).await?;
-                let addr = handle.address().to_string();
-                let member = ClusterMember::new(&name, &addr, &target).with_dc(dc.clone());
-                cluster.join(member);
-                addr_to_name.insert(addr.clone(), name.clone());
-                nodes.push(NodeInfo {
-                    name: name.clone(),
-                    dc: dc.clone(),
-                    addr,
-                });
-                handles.push(handle);
-            }
+        for node in &spawned.nodes {
+            let member =
+                ClusterMember::new(&node.name, &node.addr, &target).with_dc(node.dc.clone());
+            cluster.join(member);
         }
 
         tracing::info!(
-            nodes = nodes.len(),
-            dcs = topology.datacenters().len(),
+            nodes = spawned.nodes.len(),
+            dcs = topology.specs().len(),
             "dc topology spawned"
         );
 
         Ok(Self {
             cluster,
-            nodes,
-            addr_to_name,
-            _handles: handles,
+            nodes: spawned.nodes,
+            addr_to_name: spawned.addr_to_name,
+            _handles: spawned.handles,
         })
     }
 
@@ -107,7 +228,6 @@ impl<M: RemoteMessage> DcCluster<M> {
         &self.cluster
     }
 
-    /// All spawned nodes in spawn order (DC declaration order, then index 1..=count).
     pub fn nodes(&self) -> &[NodeInfo] {
         &self.nodes
     }
@@ -191,6 +311,20 @@ mod tests {
         for node in dc.nodes() {
             assert_eq!(dc.node_name(&node.addr), Some(node.name.as_str()));
         }
+    }
+
+    #[tokio::test]
+    async fn datacenter_with_ports_binds_expected_addresses() {
+        let workers = DcWorkers::spawn(
+            DcTopology::new().datacenter_with_ports("east", 2, 29_100),
+            "worker",
+            |_dc, _name| PingCounter(Arc::new(AtomicU64::new(0))),
+        )
+        .await
+        .expect("spawn");
+
+        assert_eq!(workers.nodes()[0].addr, "127.0.0.1:29101");
+        assert_eq!(workers.nodes()[1].addr, "127.0.0.1:29102");
     }
 
     #[tokio::test]
