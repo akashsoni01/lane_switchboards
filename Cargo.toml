@@ -211,3 +211,7 @@ path = "examples/multi_dc_heartbeat_topology.rs"
 [[example]]
 name = "multi_dc_heartbeat_prod"
 path = "examples/multi_dc_heartbeat_prod.rs"
+
+[[example]]
+name = "resilient_monitor"
+path = "examples/resilient_monitor.rs"
