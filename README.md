@@ -93,6 +93,95 @@ Feature-level comparison between **lane_switchboards** and **Lunatic**.
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | gRPC service mesh — TTL registry, tonic client, diff sync, `serve_microservice` |
 
+## Core actor API
+
+Every actor runs a single mailbox loop. Application messages and lifecycle control both arrive as [`Envelope<M>`](src/actor.rs) variants; [`ActorRef<M>`](src/actor.rs) helpers wrap the common cases. See [`envelope_demo.md`](examples/envelope_demo.md) (`cargo run --example envelope_demo`) for runnable demos of each control envelope.
+
+### Spawn
+
+| Function | When to use |
+|----------|-------------|
+| **`spawn(actor, supervisor_tx)`** | Default mailbox size; returns `(ActorRef<M>, JoinHandle<()>)` |
+| **`spawn_with_config(actor, supervisor_tx, &ActorConfig)`** | Custom mailbox capacity, `handle_timeout`, slow-handle threshold |
+| **`spawn_on_runtime(&Handle, actor, supervisor_tx, &ActorConfig)`** | Spawn on a specific Tokio runtime (supervisors, dedicated runtimes) |
+
+Pass `Some(supervisor_tx)` when the actor is a supervised child — panics, errors, and handle timeouts notify the supervisor via [`RestartSignal`](src/supervisor.rs). Use `None` for standalone actors.
+
+```rust
+use lane_switchboards::{spawn, spawn_with_config, ActorConfig};
+
+let (worker, join) = spawn(MyWorker::default(), None).await?;
+let (tuned, _) = spawn_with_config(MyWorker::default(), None, &ActorConfig {
+    mailbox_capacity: 128,
+    handle_timeout: Some(std::time::Duration::from_secs(5)),
+    ..Default::default()
+}).await?;
+```
+
+### `ActorRef` — messaging and lifecycle
+
+| Method | Envelope | Effect |
+|--------|----------|--------|
+| **`send(msg)`** | `Msg` | Deliver application message; processed one at a time |
+| **`stop()`** | `Stop` | Graceful shutdown → `ExitReason::Shutdown`; runs `post_stop`; does **not** propagate to linked peers |
+| **`kill()`** | `Kill` | Forced shutdown → `ExitReason::Killed`; runs `post_stop`; **does** propagate to linked peers |
+| **`link(peer_id)`** | `Link` | Bidirectional failure link — runtime also registers the reverse link on the peer |
+| **`unlink(peer_id)`** | `Unlink` | Remove a link; peer no longer receives `LinkedExit` from this actor |
+| **`monitor(observer_id)`** | `Monitor` | Returns `oneshot::Receiver<ExitReason>` — one-shot exit notification; observer is **not** killed |
+| **`demonitor(observer_id)`** | `Demonitor` | Remove a pending monitor registration |
+| **`upgrade(new_impl)`** | `Upgrade` | Hot-swap implementation in-place; same `ActorRef` and mailbox; calls `on_upgrade(old_version)` |
+
+**Link vs monitor:** A **link** ties fates together — abnormal exit on one side can kill linked peers (unless they trap). A **monitor** only **observes** exit on a `oneshot` channel and does not affect the observer's lifecycle.
+
+**Upgrade / downgrade:** There is one API — `upgrade(new_impl)`. Swapping to a newer struct is an upgrade; swapping back to an older implementation is a downgrade using the same call. Migrate state manually before calling `upgrade` (read fields via `send`, then construct the new type). See [`hot_upgrade.rs`](examples/hot_upgrade.rs).
+
+```rust
+use lane_switchboards::{spawn, ActorId, ExitReason};
+
+let (a, _) = spawn(WorkerA::default(), None).await?;
+let (b, b_join) = spawn(WorkerB::default(), None).await?;
+
+// Bidirectional link (both sides must link for mutual propagation)
+a.link(b.id).await?;
+b.link(a.id).await?;
+
+// Observe exit without linking fates
+let exit_rx = b.monitor(ActorId::new()).await;
+b.stop().await?;
+let reason = exit_rx.await?; // ExitReason::Shutdown
+
+// Hot upgrade — ActorRef stays valid
+a.upgrade(WorkerA_v2 { /* migrated state */ }).await?;
+
+// Tear down
+a.unlink(b.id).await?;
+a.kill().await?;
+let _ = b_join.await;
+```
+
+### `Actor` lifecycle hooks
+
+| Method | When |
+|--------|------|
+| `pre_start()` | Once before the mailbox loop |
+| `on_upgrade(old_version)` | After `ActorRef::upgrade` swaps the implementation |
+| `on_handle_begin(&msg)` | Before each `handle` — journal pending work for timeout recovery |
+| `handle(msg)` | Normal message processing |
+| `on_handle_stuck(ctx)` | After `handle_timeout` — persist journal / stuck action |
+| `post_stop()` | After the loop exits, before monitors and linked peers are notified |
+| `trap_exit()` | Return `true` to log linked exits without exiting (OTP `trap_exit`) |
+
+### Runtime observability
+
+[`ActorMonitor::global()`](src/monitor.rs) tracks every spawned actor:
+
+```rust
+use lane_switchboards::ActorMonitor;
+
+let stats = ActorMonitor::global().get(actor.id);
+let all = ActorMonitor::global().all(); // messages, panics, timeouts, in-flight, handle ms
+```
+
 ### When to use `supervisor.rs`
 
 Use `src/supervisor.rs` when actor failure should be part of normal control flow (OTP style), not a process-ending bug.
@@ -162,7 +251,7 @@ let slot = Arc::new(ChildSlot::new());
 let spec = ChildSlot::child_spec(0, slot.clone(), || MyWorker::default());
 
 let _handle = Supervisor::new(SupervisorConfig::default(), vec![spec]).start().await?;
-let worker = slot.require().await?;
+let worker = slot.require()?;
 ```
 
 Low-level `child_spec(order, factory)` is still available when you need a custom spawn factory.
