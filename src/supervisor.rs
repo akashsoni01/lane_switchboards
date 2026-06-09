@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// Notification sent to supervisor when a child fails.
@@ -251,9 +251,12 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
 }
 
 /// Single supervised child slot — use for OneForOne with one actor.
+///
+/// Reads (`get`, `require`) load the current ref from [`ArcSwap`] without locking.
+/// Writes happen on every spawn/restart via `child_spec`.
 #[derive(Clone)]
 pub struct ChildSlot<M: Send + Sync + 'static> {
-    current: Arc<Mutex<Option<ActorRef<M>>>>,
+    current: Arc<ArcSwap<Option<ActorRef<M>>>>,
 }
 
 impl<M: Send + Sync + 'static> Default for ChildSlot<M> {
@@ -265,17 +268,17 @@ impl<M: Send + Sync + 'static> Default for ChildSlot<M> {
 impl<M: Send + Sync + 'static> ChildSlot<M> {
     pub fn new() -> Self {
         Self {
-            current: Arc::new(Mutex::new(None)),
+            current: Arc::new(ArcSwap::from_pointee(None)),
         }
     }
 
-    pub async fn get(&self) -> Option<ActorRef<M>> {
-        self.current.lock().await.clone()
+    /// Lock-free lookup — loads the current ref from [`ArcSwap`].
+    pub fn get(&self) -> Option<ActorRef<M>> {
+        self.current.load().as_ref().clone()
     }
 
-    pub async fn require(&self) -> Result<ActorRef<M>, ActorProcessingErr> {
+    pub fn require(&self) -> Result<ActorRef<M>, ActorProcessingErr> {
         self.get()
-            .await
             .ok_or_else(|| "supervised child not running".into())
     }
 
@@ -294,7 +297,7 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
             Box::pin(async move {
                 let (actor_ref, _) =
                     spawn_on_runtime(&handle, build(), Some(sup_tx), &actor_config).await?;
-                *slot.current.lock().await = Some(actor_ref.clone());
+                slot.current.store(Arc::new(Some(actor_ref.clone())));
                 Ok(actor_ref)
             })
         })

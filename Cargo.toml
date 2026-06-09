@@ -165,6 +165,10 @@ name = "calculator"
 path = "examples/calculator.rs"
 
 [[example]]
+name = "single_child_supervisor"
+path = "examples/single_child_supervisor.rs"
+
+[[example]]
 name = "resilient_calculator"
 path = "examples/resilient_calculator.rs"
 

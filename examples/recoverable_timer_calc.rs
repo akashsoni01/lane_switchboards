@@ -230,7 +230,7 @@ impl CalcHandle {
         };
 
         let sup_handle = Supervisor::new(config, vec![spec]).start().await?;
-        slot.require().await?;
+        slot.require()?;
 
         Ok(Self {
             slot,
@@ -242,7 +242,6 @@ impl CalcHandle {
     async fn actor(&self) -> ActorRef<CalcMsg> {
         self.slot
             .get()
-            .await
             .expect("supervised calculator running")
     }
 

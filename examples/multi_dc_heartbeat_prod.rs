@@ -340,7 +340,7 @@ impl Actor<HbMsg> for SupervisedHeartbeatService {
         .start_settled(Duration::from_millis(50))
         .await?;
         self._supervisor = Some(sup);
-        self.slot.require().await?;
+        self.slot.require()?;
         tracing::info!(
             node = %self.node_name,
             dc = %self.dc,
@@ -353,7 +353,6 @@ impl Actor<HbMsg> for SupervisedHeartbeatService {
         let child = self
             .slot
             .get()
-            .await
             .ok_or_else(|| -> ActorProcessingErr { "heartbeat worker not running".into() })?;
         child.send(msg).await.map_err(|e| e.to_string())?;
         Ok(())
@@ -419,7 +418,7 @@ impl RegionalGatewayService {
             .start()
             .await?;
         self._stats_supervisor = Some(sup);
-        self.stats_slot.require().await?;
+        self.stats_slot.require()?;
         Ok(())
     }
 }
@@ -440,7 +439,7 @@ impl Actor<HbMsg> for RegionalGatewayService {
         for worker in &self.workers {
             worker.send(msg.clone()).await?;
         }
-        if let Some(actor) = self.stats_slot.get().await {
+        if let Some(actor) = self.stats_slot.get() {
             let _ = actor
                 .send(GatewayStatsMsg::RecordFanOut {
                     worker_count: self.workers.len(),
@@ -568,8 +567,8 @@ impl SupervisedCoordinator {
         )
         .start_settled(Duration::from_millis(50))
         .await?;
-        slot.require().await?;
-        let actor = slot.get().await.expect("coordinator child running");
+        slot.require()?;
+        let actor = slot.get().expect("coordinator child running");
         Ok((
             Self {
                 _slot: slot.clone(),

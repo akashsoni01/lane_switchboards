@@ -287,6 +287,7 @@ let handle = Supervisor::new(SupervisorConfig::default(), vec![spec]).start().aw
 | [`supervisor_strategies`](./examples/supervisor_strategies.md) | `Supervisor` + `ChildSpec` + `ChildRegistry` + all three strategies |
 | [`rest_for_one_calculator_timer_optimized`](./examples/rest_for_one_calculator_timer_optimized.md) | `registry_child_spec!`, `registry_ask!`, `SupervisorHandle` |
 | [`calculator_mesh_simplified`](./examples/calculator_mesh_simplified.md) | Gateway holds `SupervisorHandle` + `ChildRegistry` behind mesh RPC |
+| [`single_child_supervisor`](./examples/single_child_supervisor.md) | `ChildSlot` + handle_timeout + stuck journal (from latency example) |
 | [`resilient_calculator`](./examples/resilient_calculator.md) | `ChildSlot` instead of registry for a single child |
 
 ---

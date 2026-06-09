@@ -330,6 +330,7 @@ See [READMEv0.0.5.md](READMEv0.0.5.md) for migration notes (hash ring remapping,
 | Envelope variants (link, monitor, upgrade, …) | `cargo run --example envelope_demo` — see [envelope_demo.md](examples/envelope_demo.md) |
 | Supervisor strategies + intensity limits | `cargo run --example supervisor_strategies` — see [supervisor_strategies.md](examples/supervisor_strategies.md) |
 | Calculator (add, sub, mul, div) | `cargo run --example calculator` — see [calculator.md](examples/calculator.md) |
+| Single-child supervisor (`ChildSlot`) | `cargo run --example single_child_supervisor` — see [single_child_supervisor.md](examples/single_child_supervisor.md) |
 | Resilient calculator (survives panic) | `cargo run --example resilient_calculator` — see [resilient_calculator.md](examples/resilient_calculator.md) |
 | Resilient calculator + last-result timer | `cargo run --example resilient_calculator_timer` |
 | Recoverable calculator + journal timer | `cargo run --example recoverable_timer_calc` — see [recoverable_timer_calc.md](examples/recoverable_timer_calc.md) |

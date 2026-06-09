@@ -100,7 +100,7 @@ async fn child_slot_holds_current_ref() {
     };
     let _sup = Supervisor::new(config, vec![spec]).start().await.expect("start");
 
-    let child = slot.require().await.expect("spawned");
+    let child = slot.require().expect("spawned");
     child.send(EchoMsg::Ping).await.expect("send");
 }
 
