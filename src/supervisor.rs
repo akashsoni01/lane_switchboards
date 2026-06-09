@@ -2,6 +2,7 @@
 
 use crate::actor::{spawn_on_runtime, Actor, ActorId, ActorProcessingErr, ActorRef, ExitReason};
 use crate::config::ActorConfig;
+use arc_swap::ArcSwap;
 use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -128,18 +129,32 @@ where
     })
 }
 
-struct RegistryInner<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> {
+struct RegistrySnapshot<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> {
     refs: HashMap<K, ActorRef<M>>,
     generations: HashMap<K, u64>,
 }
 
+impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Clone
+    for RegistrySnapshot<M, K>
+{
+    fn clone(&self) -> Self {
+        Self {
+            refs: self.refs.clone(),
+            generations: self.generations.clone(),
+        }
+    }
+}
+
 /// Named child refs updated on every spawn/restart — share with actors and main.
+///
+/// Reads (`get`, `generation`, …) load an [`ArcSwap`] snapshot without locking.
+/// Writes clone-on-write via `rcu` so concurrent lookups stay wait-free.
 #[derive(Clone)]
 pub struct ChildRegistry<
     M: Send + Sync + 'static,
     K: Eq + Hash + Clone + Send + Sync + 'static = String,
 > {
-    inner: Arc<Mutex<RegistryInner<M, K>>>,
+    snapshot: Arc<ArcSwap<RegistrySnapshot<M, K>>>,
 }
 
 impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Default
@@ -153,36 +168,65 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Def
 impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> ChildRegistry<M, K> {
     pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(RegistryInner {
+            snapshot: Arc::new(ArcSwap::from_pointee(RegistrySnapshot {
                 refs: HashMap::new(),
                 generations: HashMap::new(),
             })),
         }
     }
 
+    /// Lock-free lookup — loads the current snapshot from [`ArcSwap`].
     pub async fn get<Q>(&self, name: &Q) -> Option<ActorRef<M>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner.lock().await.refs.get(name).cloned()
+        self.snapshot.load().refs.get(name).cloned()
+    }
+
+    /// Same as [`Self::get`] but synchronous for hot paths (no await point).
+    pub fn get_sync<Q>(&self, name: &Q) -> Option<ActorRef<M>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        self.snapshot.load().refs.get(name).cloned()
+    }
+
+    fn update_snapshot<F>(&self, mut f: F)
+    where
+        F: FnMut(&RegistrySnapshot<M, K>) -> RegistrySnapshot<M, K>,
+    {
+        self.snapshot.rcu(|snap| Arc::new(f(snap.as_ref())));
     }
 
     pub async fn track(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
-        self.inner.lock().await.refs.insert(name.into(), actor_ref);
+        let name = name.into();
+        self.update_snapshot(|snap| {
+            let mut next = snap.clone();
+            next.refs.insert(name.clone(), actor_ref.clone());
+            next
+        });
     }
 
     pub async fn bump_generation(&self, name: impl Into<K>) {
-        let mut inner = self.inner.lock().await;
-        *inner.generations.entry(name.into()).or_insert(0) += 1;
+        let name = name.into();
+        self.update_snapshot(|snap| {
+            let mut next = snap.clone();
+            *next.generations.entry(name.clone()).or_insert(0) += 1;
+            next
+        });
     }
 
     /// Atomically register a ref and bump its generation counter.
     pub async fn track_and_bump(&self, name: impl Into<K>, actor_ref: ActorRef<M>) {
         let name = name.into();
-        let mut inner = self.inner.lock().await;
-        inner.refs.insert(name.clone(), actor_ref);
-        *inner.generations.entry(name).or_insert(0) += 1;
+        self.update_snapshot(|snap| {
+            let mut next = snap.clone();
+            next.refs.insert(name.clone(), actor_ref.clone());
+            *next.generations.entry(name.clone()).or_insert(0) += 1;
+            next
+        });
     }
 
     pub async fn generation<Q>(&self, name: &Q) -> u64
@@ -190,9 +234,8 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.inner
-            .lock()
-            .await
+        self.snapshot
+            .load()
             .generations
             .get(name)
             .copied()
@@ -204,15 +247,15 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let inner = self.inner.lock().await;
-        inner.refs.get(name).cloned().map(|actor_ref| {
-            let generation = inner.generations.get(name).copied().unwrap_or(0);
+        let snap = self.snapshot.load();
+        snap.refs.get(name).cloned().map(|actor_ref| {
+            let generation = snap.generations.get(name).copied().unwrap_or(0);
             (actor_ref, generation)
         })
     }
 
     pub async fn generations(&self) -> HashMap<K, u64> {
-        self.inner.lock().await.generations.clone()
+        self.snapshot.load().generations.clone()
     }
 }
 
