@@ -262,9 +262,27 @@ impl ActorMonitor {
     pub(crate) fn record_timeout(&self, id: ActorId, elapsed: Duration) {
         if let Some(cell) = self.cell(id) {
             cell.handle_timeouts.fetch_add(1, Ordering::Relaxed);
+            // Count as a handled message so messages_handled is consistent with
+            // total_handle_ms (both include the timed-out call).
+            cell.messages_handled.fetch_add(1, Ordering::Relaxed);
             cell.dec_in_flight();
             let ms = duration_ms(elapsed);
             cell.last_handle_ms.store(ms, Ordering::Relaxed);
+            // Record wall time spent in the stuck handler so max/mean are accurate.
+            cell.total_handle_ms.fetch_add(ms, Ordering::Relaxed);
+            loop {
+                let prev = cell.max_handle_ms.load(Ordering::Relaxed);
+                if ms <= prev {
+                    break;
+                }
+                if cell
+                    .max_handle_ms
+                    .compare_exchange_weak(prev, ms, Ordering::Relaxed, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
             tracing::error!(
                 %id,
                 handle_ms = ms,
