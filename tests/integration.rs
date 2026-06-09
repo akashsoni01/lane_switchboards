@@ -47,7 +47,7 @@ async fn child_registry_tracks_named_child() {
     };
     let _sup = Supervisor::new(config, vec![spec]).start().await.expect("start");
 
-    let echo = registry.get("echo").await.expect("spawned");
+    let echo = registry.get("echo").expect("spawned");
     echo.send(EchoMsg::Ping).await.expect("send");
 }
 

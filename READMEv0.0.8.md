@@ -3,7 +3,7 @@
 Release notes for **v0.0.8** — actor runtime hardening, typed supervisor signals, multi-DC topology builder, raw TCP stream example, and production-style regional heartbeat monitoring.
 
 For the full project overview see [README.md](./README.md).  
-Previous release: [READMEv0.0.7.md](./READMEv0.0.7.md) · [Multi-DC heartbeat guide](./examples/multi_dc_heartbeat.md) · [Wire reference](./docs/wire_protocol.md)
+Previous release: [READMEv0.0.7.md](./READMEv0.0.7.md) · Next: [READMEv0.0.9.md](./READMEv0.0.9.md) (supervision types guide + lock-free `ChildRegistry`) · [Multi-DC heartbeat guide](./examples/multi_dc_heartbeat.md) · [Wire reference](./docs/wire_protocol.md)
 
 ---
 

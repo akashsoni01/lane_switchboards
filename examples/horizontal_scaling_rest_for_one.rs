@@ -121,7 +121,7 @@ async fn role_ref(
     registry: &ChildRegistry<LocalMsg>,
     role: LocalRole,
 ) -> Option<ActorRef<LocalMsg>> {
-    registry.get(role.name()).await
+    registry.get(role.name())
 }
 
 struct LocalWorker {

@@ -97,7 +97,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get("calculator") {
                     let (tx, rx) = oneshot::channel();
                     let _ = calc.send(AppMsg::LastResult(tx)).await;
                     match rx.await {
@@ -177,7 +177,6 @@ impl SupervisedApp {
         let timer = self
             .registry
             .get("timer")
-            .await
             .ok_or_else(|| anyhow::anyhow!("timer not running"))?;
         timer
             .send(AppMsg::TimerStart(timer.clone()))
@@ -195,7 +194,6 @@ async fn add(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<f64> {
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::Add(a, b, tx)).await.map_err(actor_err)?;
@@ -208,7 +206,6 @@ async fn div(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<Result<f64, 
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::Div(a, b, tx)).await.map_err(actor_err)?;

@@ -178,7 +178,6 @@ where
 {
     let actor = registry
         .get(name)
-        .await
         .ok_or_else(|| anyhow::anyhow!("child not in registry"))?;
     actor.send(msg).await.map_err(actor_err)?;
     Ok(())

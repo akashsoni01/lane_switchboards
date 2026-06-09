@@ -23,7 +23,7 @@ macro_rules! actor_ask {
 macro_rules! registry_ask {
     ($registry:expr, $name:expr, $missing:expr, |$reply:ident| $msg:expr) => {{
         let __name = $name;
-        match $registry.get(&__name).await {
+        match $registry.get(&__name) {
             Some(__actor) => $crate::actor_ask!(__actor, |$reply| $msg),
             None => Err::<_, $crate::actor::ActorProcessingErr>($missing.into()),
         }

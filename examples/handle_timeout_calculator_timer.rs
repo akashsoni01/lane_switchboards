@@ -182,7 +182,6 @@ impl Actor<AppMsg> for Calculator {
                 let calc = self
                     .registry
                     .get("calculator")
-                    .await
                     .ok_or("calculator ref missing")?;
                 let (tx, rx) = oneshot::channel();
                 calc.send(AppMsg::Ping(tx)).await?;
@@ -199,7 +198,6 @@ impl Actor<AppMsg> for Calculator {
                 let ledger = self
                     .registry
                     .get("ledger")
-                    .await
                     .ok_or("ledger ref missing")?;
                 let (tx, _rx) = oneshot::channel();
                 ledger.send(AppMsg::LedgerFetch(tx)).await?;
@@ -235,7 +233,7 @@ impl Actor<AppMsg> for Ledger {
     async fn handle(&mut self, msg: AppMsg) -> Result<(), ActorProcessingErr> {
         match msg {
             AppMsg::LedgerFetch(reply) => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get("calculator") {
                     let (tx, rx) = oneshot::channel();
                     calc.send(AppMsg::LastResult(tx)).await?;
                     let _ = reply.send(rx.await.ok().flatten());
@@ -271,7 +269,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.registry.get("calculator").await {
+                if let Some(calc) = self.registry.get("calculator") {
                     let (tx, rx) = oneshot::channel();
                     let _ = calc.send(AppMsg::LastResult(tx)).await;
                     match rx.await {
@@ -370,7 +368,6 @@ impl SupervisedApp {
         let timer = self
             .registry
             .get("timer")
-            .await
             .ok_or_else(|| anyhow::anyhow!("timer not running"))?;
         timer
             .send(AppMsg::TimerStart(timer.clone()))
@@ -388,7 +385,6 @@ async fn add(app: &SupervisedApp, a: f64, b: f64) -> anyhow::Result<f64> {
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::Add(a, b, tx)).await.map_err(actor_err)?;
@@ -406,7 +402,6 @@ async fn slow_div(
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::SlowDiv(a, b, delay_ms, tx))
@@ -424,7 +419,6 @@ async fn probe_self_deadlock(app: &SupervisedApp) -> anyhow::Result<Result<(), S
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::SelfDeadlockProbe(tx))
@@ -445,7 +439,6 @@ async fn probe_cross_deadlock(
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::CrossDeadlockProbe(amount, tx))
@@ -463,7 +456,6 @@ async fn stuck_journal(app: &SupervisedApp) -> anyhow::Result<Vec<StuckAction>> 
     let calc = app
         .registry
         .get("calculator")
-        .await
         .ok_or_else(|| anyhow::anyhow!("calculator not running"))?;
     let (tx, rx) = oneshot::channel();
     calc.send(AppMsg::StuckJournal(tx)).await.map_err(actor_err)?;

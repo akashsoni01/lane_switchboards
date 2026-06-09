@@ -303,7 +303,6 @@ where
 {
     let actor = registry
         .get(name)
-        .await
         .ok_or_else(|| format!("child {name} not running"))?;
     actor.send(msg).await.map_err(Into::into)
 }

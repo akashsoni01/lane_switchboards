@@ -84,7 +84,6 @@ async fn start_supervisor(
 async fn fail_worker(registry: &ChildRegistry<SupMsg>, name: &str) -> anyhow::Result<()> {
     let actor = registry
         .get(name)
-        .await
         .ok_or_else(|| anyhow::anyhow!("worker {name} not found"))?;
     actor.send(SupMsg::Fail).await.map_err(actor_err)?;
     tokio::time::sleep(Duration::from_millis(150)).await;
@@ -94,7 +93,6 @@ async fn fail_worker(registry: &ChildRegistry<SupMsg>, name: &str) -> anyhow::Re
 async fn ping_worker(registry: &ChildRegistry<SupMsg>, name: &str) -> anyhow::Result<()> {
     let actor = registry
         .get(name)
-        .await
         .ok_or_else(|| anyhow::anyhow!("worker {name} not found"))?;
     actor.send(SupMsg::Ping).await.map_err(actor_err)?;
     Ok(())

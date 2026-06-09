@@ -243,7 +243,7 @@ async fn supervise_named_child_registers_and_restarts() {
         .await
         .expect("supervise_named_child");
 
-    let child = registry.get("echo").await.expect("registered");
+    let child = registry.get("echo").expect("registered");
     assert_eq!(child.id, sup.initial_ref().expect("initial ref").id);
 
     child

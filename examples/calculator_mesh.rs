@@ -96,7 +96,7 @@ impl Actor<AppMsg> for ResultTimer {
                 self.schedule_next();
             }
             AppMsg::TimerTick if self.running => {
-                if let Some(calc) = self.registry.get(&ChildName::Calculator).await {
+                if let Some(calc) = self.registry.get(&ChildName::Calculator) {
                     match actor_ask!(calc, |reply| AppMsg::LastResult(reply)) {
                         Ok(Some(v)) => println!("[{}] timer last_result = {v}", self.instance),
                         Ok(None) => println!("[{}] timer last_result = (none)", self.instance),
@@ -290,7 +290,6 @@ impl CalculatorGateway {
         let timer = self
             .registry
             .get(&ChildName::Timer)
-            .await
             .ok_or_else(|| "timer child not running")?;
         timer
             .send(AppMsg::TimerStart(timer.clone()))

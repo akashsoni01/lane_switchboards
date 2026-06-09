@@ -176,16 +176,7 @@ impl<M: Send + Sync + 'static, K: Eq + Hash + Clone + Send + Sync + 'static> Chi
     }
 
     /// Lock-free lookup — loads the current snapshot from [`ArcSwap`].
-    pub async fn get<Q>(&self, name: &Q) -> Option<ActorRef<M>>
-    where
-        K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
-    {
-        self.snapshot.load().refs.get(name).cloned()
-    }
-
-    /// Same as [`Self::get`] but synchronous for hot paths (no await point).
-    pub fn get_sync<Q>(&self, name: &Q) -> Option<ActorRef<M>>
+    pub fn get<Q>(&self, name: &Q) -> Option<ActorRef<M>>
     where
         K: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
