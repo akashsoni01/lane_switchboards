@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "lane_core"]
+resolver = "2"
+
 [package]
 name = "lane_switchboards"
 version = "0.7.0"
@@ -18,6 +22,7 @@ include = [
 ]
 
 [dependencies]
+lane_core = { path = "lane_core" }
 prost = "0.13"
 prost-types = "0.13"
 tonic = { version = "0.12", features = ["transport", "codegen"] }

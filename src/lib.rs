@@ -11,8 +11,15 @@
 //!
 //! Ractor-based HTTP client: see the `gateway` example (`examples/gateway/`).
 
-pub mod actor;
-pub mod config;
+// Core primitives live in the `lane_core` sibling crate.
+// Re-exporting the modules keeps `crate::actor::ActorId` etc. working
+// throughout the rest of lane_switchboards unchanged.
+pub use lane_core::actor;
+pub use lane_core::config;
+pub use lane_core::monitor;
+pub use lane_core::registry;
+pub use lane_core::supervisor;
+
 pub mod consistency;
 pub mod distributed;
 pub mod distributed_grpc;
@@ -26,12 +33,9 @@ pub mod macros;
 pub mod mesh;
 pub mod mesh_registry_grpc;
 pub mod proto;
-pub mod monitor;
 pub mod paxos;
 pub mod paxos_grpc;
-pub mod registry;
 pub mod stream;
-pub mod supervisor;
 pub mod topology;
 #[cfg(feature = "tls")]
 pub mod tls;
