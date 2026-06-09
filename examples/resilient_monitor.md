@@ -20,7 +20,8 @@ cargo run --example resilient_monitor
 | `in_flight` | Handles started but not yet finished (0 for stopped actors) |
 | `last_handle_ms` | Duration of the most recent handle call |
 | `max_handle_ms` | Longest handle call ever recorded |
-| `total_handle_ms` | Sum of all successful handle durations; `/ messages_handled` = mean |
+| `total_handle_ms` | Sum of all successful handle durations |
+| `mean_handle_ms` | `total_handle_ms / messages_handled` — computed in `snapshot()`; `0` when no messages handled |
 
 Stats for a stopped actor are preserved as a **post-mortem snapshot** — readable via `ActorMonitor::global().get(id)` until `purge(id)` is called.
 
@@ -231,7 +232,8 @@ Actor IDs are monotonically assigned at spawn time, so the exact numbers will va
 
 ```rust
 let stats = ActorMonitor::global().get(actor.id)?;
-let mean_ms = stats.total_handle_ms.checked_div(stats.messages_handled).unwrap_or(0);
+println!("mean {}ms  max {}ms  total {}ms",
+    stats.mean_handle_ms, stats.max_handle_ms, stats.total_handle_ms);
 ```
 
 ### Reading post-mortem after exit

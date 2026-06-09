@@ -160,11 +160,6 @@ impl WorkerApp {
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 fn print_stats(label: &str, stats: &ActorStats) {
-    let mean_ms = if stats.messages_handled > 0 {
-        stats.total_handle_ms / stats.messages_handled
-    } else {
-        0
-    };
     println!("  [{label}]");
     println!("    messages_handled : {}", stats.messages_handled);
     println!("    panics           : {}", stats.panics);
@@ -173,7 +168,8 @@ fn print_stats(label: &str, stats: &ActorStats) {
     println!("    handle_errors    : {}", stats.handle_errors);
     println!("    last_handle_ms   : {}", stats.last_handle_ms);
     println!("    max_handle_ms    : {}", stats.max_handle_ms);
-    println!("    mean_handle_ms   : {mean_ms}");
+    println!("    total_handle_ms  : {}", stats.total_handle_ms);
+    println!("    mean_handle_ms   : {}", stats.mean_handle_ms);
     println!("    in_flight        : {}", stats.in_flight);
 }
 
@@ -213,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── phase 1: normal work ──────────────────────────────────────────────────
     println!("\n=== Phase 1: normal work (5 × add) ===\n");
-    for i in 1..=50000u32 {
+    for i in 1..=5u32 {
         let result = add(&app, i as f64, 1.0).await;
         println!("  add({i}, 1) = {result}");
     }
@@ -286,18 +282,14 @@ async fn main() -> anyhow::Result<()> {
     let all = ActorMonitor::global().all();
     println!("  {} live actor(s):", all.len());
     for s in &all {
-        let mean = if s.messages_handled > 0 {
-            s.total_handle_ms / s.messages_handled
-        } else {
-            0
-        };
         println!(
-            "    {}  handled={} panics={} timeouts={} slow={} mean_ms={mean}",
+            "    {}  handled={} panics={} timeouts={} slow={} mean_ms={}",
             s.actor_id,
             s.messages_handled,
             s.panics,
             s.handle_timeouts,
             s.slow_handles,
+            s.mean_handle_ms,
         );
     }
 

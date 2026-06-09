@@ -33,8 +33,11 @@ pub struct ActorStats {
     pub in_flight: u64,
     pub last_handle_ms: u64,
     pub max_handle_ms: u64,
-    /// Sum of all successful handle durations — divide by `messages_handled` for mean.
+    /// Sum of all successful handle durations.
     pub total_handle_ms: u64,
+    /// Mean duration per successful handle call (`total_handle_ms / messages_handled`).
+    /// `0` when no messages have been handled yet.
+    pub mean_handle_ms: u64,
     pub slow_handles: u64,
 }
 
@@ -66,16 +69,24 @@ impl StatsCell {
     }
 
     fn snapshot(&self, id: ActorId) -> ActorStats {
+        let messages_handled = self.messages_handled.load(Ordering::Relaxed);
+        let total_handle_ms = self.total_handle_ms.load(Ordering::Relaxed);
+        let mean_handle_ms = if messages_handled > 0 {
+            total_handle_ms / messages_handled
+        } else {
+            0
+        };
         ActorStats {
             actor_id: id,
-            messages_handled: self.messages_handled.load(Ordering::Relaxed),
+            messages_handled,
             handle_errors: self.handle_errors.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
             handle_timeouts: self.handle_timeouts.load(Ordering::Relaxed),
             in_flight: self.in_flight.load(Ordering::Relaxed),
             last_handle_ms: self.last_handle_ms.load(Ordering::Relaxed),
             max_handle_ms: self.max_handle_ms.load(Ordering::Relaxed),
-            total_handle_ms: self.total_handle_ms.load(Ordering::Relaxed),
+            total_handle_ms,
+            mean_handle_ms,
             slow_handles: self.slow_handles.load(Ordering::Relaxed),
         }
     }

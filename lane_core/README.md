@@ -67,7 +67,8 @@ Core OTP actor primitives for the **lane_switchboards** runtime.
 | `in_flight` | Handles started but not yet finished (0 for stopped actors) |
 | `last_handle_ms` | Duration of the most recent handle call |
 | `max_handle_ms` | Longest handle call ever recorded |
-| `total_handle_ms` | Sum of all successful handle durations; divide by `messages_handled` for mean |
+| `total_handle_ms` | Sum of all successful handle durations |
+| `mean_handle_ms` | `total_handle_ms / messages_handled`; `0` when no messages handled yet |
 
 ### `supervisor`
 
