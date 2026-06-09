@@ -6,7 +6,7 @@ OTP-style primitives in Rust: actors, supervision, linking, monitoring, distribu
 
 Actors run with strict OTP mailbox semantics: one message handled at a time (sequential runtime).
 
-**Release notes:** [v0.0.9](READMEv0.0.9.md) · [v0.0.8](READMEv0.0.8.md) · [v0.7.0](READMEv0.0.7.md) · [v0.0.6](READMEv0.0.6.md) · [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
+**Release notes:** [v0.0.9](READMEv0.0.9.md) · [v0.0.8](READMEv0.0.8.md) · [v0.8.0](READMEv0.0.7.md) · [v0.0.6](READMEv0.0.6.md) · [v0.0.5](READMEv0.0.5.md) · [v0.0.4](READMEv0.0.4.md) · [Ideas blog post](docs/lane_switchboards_blog.md)
 
 In Erlang/OTP, linking and unlinking are built-in mechanisms for managing process lifecycles. They define how processes react if a related process crashes or terminates.
 

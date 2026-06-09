@@ -1,9 +1,12 @@
 [package]
 name = "lane_core"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 description = "Core OTP actor primitives for lane_switchboards: actors, supervision, linking, monitoring, and hot upgrade"
 license = "MIT"
+readme = "README.md"
+keywords = ["actor", "otp", "supervision", "concurrency", "erlang"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
