@@ -381,7 +381,7 @@ async fn run_actor<M: Send + Sync + 'static>(
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         unregister_actor(id);
-        ActorMonitor::global().mark_inactive(id);
+        ActorMonitor::global().unregister(id);
         return;
     }
 
@@ -540,7 +540,7 @@ async fn finish_actor<M: Send + Sync + 'static>(
         propagate_linked_exit(id, &exit_reason, links).await;
     }
     unregister_actor(id);
-    ActorMonitor::global().mark_inactive(id);
+    ActorMonitor::global().unregister(id);
 }
 
 fn should_propagate_linked_exit(reason: &ExitReason) -> bool {

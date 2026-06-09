@@ -9,6 +9,12 @@ use std::time::Duration;
 
 static MONITOR: Lazy<ActorMonitor> = Lazy::new(ActorMonitor::new);
 
+/// Clamp a `Duration` to milliseconds that fit in `u64`.
+#[inline(always)]
+fn duration_ms(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Snapshot of one actor's runtime counters (deadlock / slow-handle detection).
 #[derive(Debug, Clone)]
 pub struct ActorStats {
@@ -20,6 +26,8 @@ pub struct ActorStats {
     pub in_flight: u64,
     pub last_handle_ms: u64,
     pub max_handle_ms: u64,
+    /// Sum of all successful handle durations — divide by `messages_handled` for mean.
+    pub total_handle_ms: u64,
     pub slow_handles: u64,
 }
 
@@ -31,6 +39,7 @@ struct StatsCell {
     in_flight: AtomicU64,
     last_handle_ms: AtomicU64,
     max_handle_ms: AtomicU64,
+    total_handle_ms: AtomicU64,
     slow_handles: AtomicU64,
 }
 
@@ -44,6 +53,7 @@ impl StatsCell {
             in_flight: AtomicU64::new(0),
             last_handle_ms: AtomicU64::new(0),
             max_handle_ms: AtomicU64::new(0),
+            total_handle_ms: AtomicU64::new(0),
             slow_handles: AtomicU64::new(0),
         }
     }
@@ -58,21 +68,40 @@ impl StatsCell {
             in_flight: self.in_flight.load(Ordering::Relaxed),
             last_handle_ms: self.last_handle_ms.load(Ordering::Relaxed),
             max_handle_ms: self.max_handle_ms.load(Ordering::Relaxed),
+            total_handle_ms: self.total_handle_ms.load(Ordering::Relaxed),
             slow_handles: self.slow_handles.load(Ordering::Relaxed),
         }
+    }
+
+    /// Saturating decrement of `in_flight` — never wraps to `u64::MAX`.
+    fn dec_in_flight(&self) {
+        self.in_flight
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 }
 
 /// Process-global actor monitor (stats for every registered actor).
+///
+/// Live stats are held in `cells` (one `StatsCell` per running actor).  On exit
+/// the cell is removed and a final `ActorStats` snapshot is stored in
+/// `post_mortem` so callers can still read stats for a recently-stopped actor.
+/// Post-mortem entries are evicted by explicit `purge` or when a new actor
+/// registers the same `ActorId` (which never happens in practice because ids are
+/// monotonically assigned).
 #[derive(Clone)]
 pub struct ActorMonitor {
     cells: Arc<DashMap<ActorId, Arc<StatsCell>>>,
+    post_mortem: Arc<DashMap<ActorId, ActorStats>>,
 }
 
 impl ActorMonitor {
     pub fn new() -> Self {
         Self {
             cells: Arc::new(DashMap::new()),
+            post_mortem: Arc::new(DashMap::new()),
         }
     }
 
@@ -81,22 +110,48 @@ impl ActorMonitor {
     }
 
     pub fn register(&self, id: ActorId) {
-        self.cells.entry(id).or_insert_with(|| Arc::new(StatsCell::new()));
+        self.post_mortem.remove(&id);
+        self.cells
+            .entry(id)
+            .or_insert_with(|| Arc::new(StatsCell::new()));
     }
 
+    /// Capture a final snapshot into the post-mortem store, then drop the live cell.
+    ///
+    /// After this call `get(id)` returns the frozen snapshot; `in_flight` is
+    /// forced to 0 in the snapshot so external readers see a clean final state.
     pub fn unregister(&self, id: ActorId) {
-        self.cells.remove(&id);
-    }
-
-    /// Keep stats after actor exit but clear in-flight counter.
-    pub fn mark_inactive(&self, id: ActorId) {
-        if let Some(cell) = self.cells.get(&id) {
-            cell.in_flight.store(0, Ordering::Relaxed);
+        if let Some((_, cell)) = self.cells.remove(&id) {
+            let mut snapshot = cell.snapshot(id);
+            snapshot.in_flight = 0;
+            self.post_mortem.insert(id, snapshot);
         }
     }
 
+    /// Capture a final stats snapshot and remove both live and post-mortem entries.
+    ///
+    /// Use this when you want to consume the final stats exactly once (e.g. for
+    /// structured logging on exit) without keeping a permanent post-mortem entry.
+    pub fn snapshot_and_unregister(&self, id: ActorId) -> Option<ActorStats> {
+        self.post_mortem.remove(&id).map(|(_, s)| s).or_else(|| {
+            self.cells
+                .remove(&id)
+                .map(|(_, cell)| cell.snapshot(id))
+        })
+    }
+
+    /// Remove the post-mortem entry for `id`. Call this once you have consumed
+    /// the final snapshot and no longer need it.
+    pub fn purge(&self, id: ActorId) {
+        self.post_mortem.remove(&id);
+    }
+
+    /// Look up stats for a live *or* recently-stopped actor.
     pub fn get(&self, id: ActorId) -> Option<ActorStats> {
-        self.cells.get(&id).map(|e| e.value().snapshot(id))
+        self.cells
+            .get(&id)
+            .map(|e| e.value().snapshot(id))
+            .or_else(|| self.post_mortem.get(&id).map(|e| e.value().clone()))
     }
 
     pub fn all(&self) -> Vec<ActorStats> {
@@ -115,14 +170,24 @@ impl ActorMonitor {
         }
     }
 
-    pub(crate) fn finish_handle(&self, id: ActorId, elapsed: Duration, slow_threshold: Option<Duration>) {
+    pub(crate) fn finish_handle(
+        &self,
+        id: ActorId,
+        elapsed: Duration,
+        slow_threshold: Option<Duration>,
+    ) {
         let Some(cell) = self.cells.get(&id) else {
             return;
         };
-        let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
-        cell.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let ms = duration_ms(elapsed);
+        cell.dec_in_flight();
         cell.messages_handled.fetch_add(1, Ordering::Relaxed);
         cell.last_handle_ms.store(ms, Ordering::Relaxed);
+        cell.total_handle_ms.fetch_add(ms, Ordering::Relaxed);
+
+        // Spin to update the running maximum. Use compare_exchange_weak (may
+        // fail spuriously but avoids an extra barrier) and Acquire on failure
+        // so the re-read of `prev` always sees the latest stored value.
         loop {
             let prev = cell.max_handle_ms.load(Ordering::Relaxed);
             if ms <= prev {
@@ -130,42 +195,45 @@ impl ActorMonitor {
             }
             if cell
                 .max_handle_ms
-                .compare_exchange(prev, ms, Ordering::Relaxed, Ordering::Relaxed)
+                .compare_exchange_weak(prev, ms, Ordering::Relaxed, Ordering::Acquire)
                 .is_ok()
             {
                 break;
             }
         }
-        if slow_threshold.is_some_and(|t| elapsed > t) {
-            cell.slow_handles.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                %id,
-                handle_ms = ms,
-                threshold_ms = slow_threshold.map(|t| t.as_millis()).unwrap_or(0),
-                "actor handle exceeded slow threshold"
-            );
+
+        if let Some(threshold) = slow_threshold {
+            if elapsed > threshold {
+                cell.slow_handles.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    %id,
+                    handle_ms = ms,
+                    threshold_ms = threshold.as_millis(),
+                    "actor handle exceeded slow threshold"
+                );
+            }
         }
     }
 
     pub(crate) fn record_error(&self, id: ActorId) {
         if let Some(cell) = self.cells.get(&id) {
             cell.handle_errors.fetch_add(1, Ordering::Relaxed);
-            cell.in_flight.fetch_sub(1, Ordering::Relaxed);
+            cell.dec_in_flight();
         }
     }
 
     pub(crate) fn record_panic(&self, id: ActorId) {
         if let Some(cell) = self.cells.get(&id) {
             cell.panics.fetch_add(1, Ordering::Relaxed);
-            cell.in_flight.fetch_sub(1, Ordering::Relaxed);
+            cell.dec_in_flight();
         }
     }
 
     pub(crate) fn record_timeout(&self, id: ActorId, elapsed: Duration) {
         if let Some(cell) = self.cells.get(&id) {
             cell.handle_timeouts.fetch_add(1, Ordering::Relaxed);
-            cell.in_flight.fetch_sub(1, Ordering::Relaxed);
-            let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+            cell.dec_in_flight();
+            let ms = duration_ms(elapsed);
             cell.last_handle_ms.store(ms, Ordering::Relaxed);
             tracing::error!(
                 %id,
