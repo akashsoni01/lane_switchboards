@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 enum WorkerMsg {
     /// Fast add — completes in microseconds.
     Add(f64, f64, oneshot::Sender<f64>),
+    AddOnly(f64, f64),
     /// Sleeps for `delay_ms` before replying — triggers `slow_handles` when above threshold.
     SlowWork {
         delay_ms: u64,
@@ -59,6 +60,7 @@ impl Actor<WorkerMsg> for MonitoredWorker {
     async fn on_handle_begin(&mut self, msg: &WorkerMsg) -> Result<(), ActorProcessingErr> {
         self.pending_op = Some(match msg {
             WorkerMsg::Add(..) => "Add",
+            WorkerMsg::AddOnly(..) => "AddOnly",
             WorkerMsg::SlowWork { .. } => "SlowWork",
             WorkerMsg::CrashNow => "CrashNow",
             WorkerMsg::HangForever => "HangForever",
@@ -83,6 +85,12 @@ impl Actor<WorkerMsg> for MonitoredWorker {
                 self.pending_op = None;
                 let _ = reply.send(a + b);
             }
+
+            WorkerMsg::AddOnly(a, b) => {
+                self.pending_op = None;
+                let res = a + b;
+            }
+
             WorkerMsg::SlowWork { delay_ms, reply } => {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 self.pending_op = None;
@@ -182,6 +190,14 @@ async fn add(app: &WorkerApp, a: f64, b: f64) -> f64 {
     rx.await.expect("reply")
 }
 
+
+async fn add_only(app: &WorkerApp, a: f64, b: f64) {
+    app.actor_ref()
+        .send(WorkerMsg::AddOnly(a, b))
+        .await
+        .expect("send");
+}
+
 async fn slow_work(app: &WorkerApp, delay_ms: u64) -> String {
     let (tx, rx) = oneshot::channel();
     app.actor_ref()
@@ -209,9 +225,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ── phase 1: normal work ──────────────────────────────────────────────────
     println!("\n=== Phase 1: normal work (5 × add) ===\n");
-    for i in 1..=5u32 {
-        let result = add(&app, i as f64, 1.0).await;
-        println!("  add({i}, 1) = {result}");
+    for i in 1..=5000000u32 {
+        let result = add_only(&app, i as f64, 1.0).await;
+        // println!("  add({i}, 1) = {result}");
     }
 
     let id = app.actor_id();
