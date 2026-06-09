@@ -25,7 +25,6 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 bytes = "1"
 tokio = { version = "1.38", features = ["full"] }
 tracing = { version = "0.1", features = ["log", "max_level_info", "release_max_level_warn"] }
-dashmap = "6.1"
 # serde: ServiceRecord and ConsistencyConfig (HTTP/debug fixtures — not on gRPC wire)
 serde = { version = "1.0", features = ["derive", "rc"] }
 actix = "0.13"
