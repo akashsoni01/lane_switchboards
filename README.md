@@ -92,6 +92,7 @@ Feature-level comparison between **lane_switchboards** and **Lunatic**.
 | `config.rs` | `ActorConfig` mailbox + timeout tuning; `DistributedConfig` bridge, in-flight, frame limits |
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | gRPC service mesh — TTL registry, tonic client, diff sync, `serve_microservice` |
+| `storage/` | **Distributed KV store** — `StorageNode`, `StorageClient`, WAL, Paxos SERIAL, read repair |
 
 ## Core actor API
 
@@ -332,6 +333,70 @@ Microservices over gRPC with a **control plane** (`MeshRegistry`) and **data pla
 | **`join_mesh`** | Register locally + with gRPC registry |
 
 Wire types must implement [`RemoteMessage`](src/distributed.rs) (`prost::Message` + `Default`). See [`service_mesh.md`](examples/service_mesh.md) (`cargo run --example service_mesh`).
+
+## Distributed key-value storage
+
+An embedded Cassandra-style distributed KV store with tunable consistency, Paxos linearisable writes, and an optional write-ahead log backed by a lane-core `Actor`.
+
+| Component | Role |
+|-----------|------|
+| **`StorageNode`** | Owns a `MemTable`, acts as Paxos acceptor, fans out replication |
+| **`StorageClient`** | External gRPC client for `StorageGateway` |
+| **`MemTable`** | Lock-free-read `BTreeMap` — ordered key space, range scans, tombstones |
+| **`WalActor`** | lane-core actor owning the WAL file — sequential writes, no lock |
+| **`StorageRouter`** | Ring-based replica-set selection |
+| **`ReplicationClient`** | gRPC client for internal node-to-node replication |
+
+### Quick start — QUORUM write/read
+
+```rust
+use lane_switchboards::{
+    storage::StorageNode, HashRing, RingNode, ConsistencyConfig,
+    WriteConsistency, ReadConsistency, Key, Value,
+};
+
+let mut ring = HashRing::new(150);
+ring.add_node(RingNode::new("n1", "127.0.0.1", 7001));
+
+// RAM-only, single-node, rf=1
+let node = StorageNode::new(
+    "n1".into(),
+    ring,
+    ConsistencyConfig { rf: 1, local_rf: 1, ..Default::default() },
+    "127.0.0.1:0",
+    None,  // no Paxos
+    None,  // RAM-only (no WAL)
+).await?;
+
+let k = Key::from(b"hello".as_ref());
+let v = Value::from(b"world".as_ref());
+
+node.put(k.clone(), v, WriteConsistency::One).await?;
+let got = node.get(&k, ReadConsistency::One).await?;  // Some(b"world")
+```
+
+### Durable WAL mode
+
+```rust
+let node = StorageNode::new(
+    "n1".into(), ring, consistency,
+    "0.0.0.0:7001",
+    Some("0.0.0.0:7002"),        // Paxos acceptor address
+    Some(PathBuf::from("/var/data/n1")),  // WAL directory
+).await?;
+
+// Checkpoint: snapshot MemTable, truncate WAL
+node.checkpoint(&PathBuf::from("/var/data/n1")).await?;
+```
+
+### Observability
+
+```rust
+let stats  = node.stats();   // puts_total, quorum_failures, wal_bytes_written, …
+let health = node.health();  // record_count, tombstone_count, replica_peers, …
+```
+
+See [`docs/storage.md`](docs/storage.md) for the full architecture guide, consistency level matrix, Paxos path walkthrough, and WAL recovery sequence.
 
 ## Deadlock / slow-handle prevention
 

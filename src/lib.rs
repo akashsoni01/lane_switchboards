@@ -78,7 +78,8 @@ pub use paxos::{
 };
 pub use paxos_grpc::PaxosProposerClient;
 pub use storage::{
-    Key, MemTable, Record, StorageError, StorageNode, TableKind, Value,
+    Key, MemTable, Record, StorageClient, StorageError, StorageHealth, StorageNode, StorageStats,
+    TableKind, Value,
 };
 pub use proto::paxos::{
     AcceptReply, CommitRequest, PrepareRequest, PromiseReply, ProposeRequest,

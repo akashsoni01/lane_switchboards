@@ -14,7 +14,7 @@
 //!
 //! let node = StorageNode::new(
 //!     "n1".into(), ring, ConsistencyConfig { rf: 1, local_rf: 1, ..Default::default() },
-//!     "127.0.0.1:0", None,
+//!     "127.0.0.1:0", None, None,
 //! ).await?;
 //!
 //! let k = Key::from("hello".as_bytes().to_vec());
@@ -28,8 +28,10 @@
 pub mod replication;
 pub mod router;
 pub mod table;
+pub mod wal;
 
 pub use table::{Key, MemTable, Record, TableKind, Value};
+pub use wal::WalHandle;
 
 use crate::consistency::{
     is_local_only, is_paxos_read, read_acks_required, write_acks_required, ConsistencyConfig,
@@ -37,6 +39,7 @@ use crate::consistency::{
 };
 use crate::paxos_grpc::{PaxosAcceptorHandle, PaxosProposerClient};
 use crate::proto::storage::{
+    storage_gateway_client::StorageGatewayClient,
     storage_gateway_server::{StorageGateway, StorageGatewayServer},
     storage_service_server::{StorageService, StorageServiceServer},
     Ack, DeleteRequest, GetReply, GetRequest, PutRequest, ReadReplicaReply, ReadReplicaRequest,
@@ -46,10 +49,10 @@ use replication::ReplicationClient;
 use router::{ReplicaSet, StorageRouter};
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::SystemTime;
-use std::sync::Mutex as StdMutex;
 use tokio::task::JoinHandle;
 use tonic::{Request, Response, Status};
 
@@ -84,6 +87,176 @@ impl From<StorageError> for Status {
     }
 }
 
+// ── StorageStats / StorageHealth ─────────────────────────────────────────────
+
+/// Atomic counters kept inside `StorageNode` — same pattern as `monitor::StatsCell`.
+struct StorageStatsCell {
+    puts_total: AtomicU64,
+    gets_total: AtomicU64,
+    deletes_total: AtomicU64,
+    read_repairs: AtomicU64,
+    paxos_writes: AtomicU64,
+    quorum_failures: AtomicU64,
+    wal_bytes_written: AtomicU64,
+}
+
+impl StorageStatsCell {
+    fn new() -> Self {
+        Self {
+            puts_total: AtomicU64::new(0),
+            gets_total: AtomicU64::new(0),
+            deletes_total: AtomicU64::new(0),
+            read_repairs: AtomicU64::new(0),
+            paxos_writes: AtomicU64::new(0),
+            quorum_failures: AtomicU64::new(0),
+            wal_bytes_written: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self, tombstone_count: usize) -> StorageStats {
+        StorageStats {
+            puts_total: self.puts_total.load(Ordering::Relaxed),
+            gets_total: self.gets_total.load(Ordering::Relaxed),
+            deletes_total: self.deletes_total.load(Ordering::Relaxed),
+            read_repairs: self.read_repairs.load(Ordering::Relaxed),
+            paxos_writes: self.paxos_writes.load(Ordering::Relaxed),
+            quorum_failures: self.quorum_failures.load(Ordering::Relaxed),
+            wal_bytes_written: self.wal_bytes_written.load(Ordering::Relaxed),
+            tombstone_count: tombstone_count as u64,
+        }
+    }
+}
+
+/// Snapshot of `StorageNode` runtime counters.
+#[derive(Debug, Clone)]
+pub struct StorageStats {
+    pub puts_total: u64,
+    pub gets_total: u64,
+    pub deletes_total: u64,
+    pub read_repairs: u64,
+    pub paxos_writes: u64,
+    pub quorum_failures: u64,
+    pub wal_bytes_written: u64,
+    pub tombstone_count: u64,
+}
+
+/// Lightweight health summary for a `StorageNode`.
+#[derive(Debug, Clone)]
+pub struct StorageHealth {
+    pub node_id: String,
+    pub record_count: usize,
+    pub tombstone_count: usize,
+    /// `None` when the node is RAM-only (no WAL configured).
+    pub wal_bytes_written: Option<u64>,
+    pub replica_peers: usize,
+    pub ring_rf: usize,
+}
+
+// ── StorageClient ─────────────────────────────────────────────────────────────
+
+/// External client for a `StorageNode`'s `StorageGateway` gRPC service.
+///
+/// ```no_run
+/// # use lane_switchboards::storage::{StorageClient, Key, Value};
+/// # use lane_switchboards::{WriteConsistency, ReadConsistency};
+/// # #[tokio::main] async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut client = StorageClient::connect("http://127.0.0.1:7001").await?;
+/// let k = Key::from("hello".as_bytes().to_vec());
+/// let v = Value::from("world".as_bytes().to_vec());
+/// client.put(k.clone(), v).await?;
+/// let got = client.get(&k).await?;
+/// assert_eq!(got.as_deref(), Some("world".as_bytes()));
+/// # Ok(()) }
+/// ```
+pub struct StorageClient {
+    inner: StorageGatewayClient<tonic::transport::Channel>,
+    pub default_write_cl: WriteConsistency,
+    pub default_read_cl: ReadConsistency,
+}
+
+impl StorageClient {
+    pub async fn connect(addr: &str) -> Result<Self, StorageError> {
+        let uri: tonic::transport::Uri = addr
+            .parse()
+            .map_err(|e| StorageError(format!("StorageClient bad addr {addr}: {e}")))?;
+        let inner = StorageGatewayClient::connect(uri)
+            .await
+            .map_err(|e| StorageError(format!("StorageClient connect {addr}: {e}")))?;
+        Ok(Self {
+            inner,
+            default_write_cl: WriteConsistency::Quorum,
+            default_read_cl: ReadConsistency::Quorum,
+        })
+    }
+
+    pub async fn put(&mut self, key: Key, value: Value) -> Result<(), StorageError> {
+        self.put_cl(key, value, self.default_write_cl).await
+    }
+
+    pub async fn put_cl(
+        &mut self,
+        key: Key,
+        value: Value,
+        cl: WriteConsistency,
+    ) -> Result<(), StorageError> {
+        let resp = self
+            .inner
+            .put(PutRequest {
+                key: key.to_vec(),
+                value: value.to_vec(),
+                write_consistency: format!("{cl:?}").to_uppercase(),
+            })
+            .await
+            .map_err(|s| StorageError(format!("put rpc: {s}")))?
+            .into_inner();
+        if !resp.ok {
+            return Err(StorageError(resp.error));
+        }
+        Ok(())
+    }
+
+    pub async fn get(&mut self, key: &Key) -> Result<Option<Value>, StorageError> {
+        self.get_cl(key, self.default_read_cl).await
+    }
+
+    pub async fn get_cl(
+        &mut self,
+        key: &Key,
+        cl: ReadConsistency,
+    ) -> Result<Option<Value>, StorageError> {
+        let resp = self
+            .inner
+            .get(GetRequest {
+                key: key.to_vec(),
+                read_consistency: format!("{cl:?}").to_uppercase(),
+            })
+            .await
+            .map_err(|s| StorageError(format!("get rpc: {s}")))?
+            .into_inner();
+        Ok(if resp.found {
+            Some(Value::from(resp.value))
+        } else {
+            None
+        })
+    }
+
+    pub async fn delete(&mut self, key: &Key) -> Result<(), StorageError> {
+        let resp = self
+            .inner
+            .delete(DeleteRequest {
+                key: key.to_vec(),
+                write_consistency: format!("{:?}", self.default_write_cl).to_uppercase(),
+            })
+            .await
+            .map_err(|s| StorageError(format!("delete rpc: {s}")))?
+            .into_inner();
+        if !resp.ok {
+            return Err(StorageError(resp.error));
+        }
+        Ok(())
+    }
+}
+
 // ── StorageNode ─────────────────────────────────────────────────────────────
 
 /// A single node in the distributed storage cluster.
@@ -103,6 +276,9 @@ pub struct StorageNode {
     consistency: ConsistencyConfig,
     pub paxos: Option<PaxosAcceptorHandle>,
     ballot: AtomicU64,
+    /// Optional WAL actor handle (`None` for RAM-only nodes).
+    wal: Option<WalHandle>,
+    stats: Arc<StorageStatsCell>,
     _server_task: StdMutex<Option<JoinHandle<()>>>,
 }
 
@@ -111,12 +287,14 @@ impl StorageNode {
     ///
     /// - `bind_addr`  — address for the storage replication + gateway gRPC server (`:0` in tests).
     /// - `paxos_addr` — address to bind the Paxos acceptor on; `None` disables Paxos.
+    /// - `wal_path`   — directory for WAL + snapshot files; `None` for RAM-only mode.
     pub async fn new(
         id: String,
         ring: crate::hash_ring::HashRing,
         consistency: ConsistencyConfig,
         bind_addr: &str,
         paxos_addr: Option<&str>,
+        wal_path: Option<PathBuf>,
     ) -> Result<Arc<Self>, StorageError> {
         let rf = consistency.rf;
 
@@ -133,24 +311,51 @@ impl StorageNode {
             None
         };
 
+        // WAL startup sequence (Phase 6):
+        // 1. If snapshot exists → load it into MemTable.
+        // 2. Replay WAL entries with lsn > checkpoint_lsn.
+        // 3. Open WAL actor for new writes.
+        let (initial_table, wal_handle) = if let Some(ref dir) = wal_path {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| StorageError(format!("create wal dir: {e}")))?;
+            let snap = dir.join("snapshot.dat");
+            let lsn_file = dir.join("snapshot.lsn");
+            let wal_file = dir.join("wal.dat");
+
+            let (table, checkpoint_lsn) = wal::load_snapshot(&snap, &lsn_file).await?;
+            let replay_records = wal::replay(&wal_file, checkpoint_lsn).await?;
+            for rec in replay_records {
+                table.insert(rec);
+            }
+
+            let handle = WalHandle::open(&wal_file).await?;
+            (Arc::new(table), Some(handle))
+        } else {
+            (Arc::new(MemTable::new(TableKind::Set)), None)
+        };
+
         // Bind the TCP listener before building the node so we know the real address.
         let listener = tokio::net::TcpListener::bind(bind_addr)
             .await
             .map_err(|e| StorageError(format!("bind storage grpc {bind_addr}: {e}")))?;
-        let address = listener.local_addr()
+        let address = listener
+            .local_addr()
             .map_err(|e| StorageError(format!("local addr: {e}")))?
             .to_string();
 
         let node = Arc::new(StorageNode {
             id: id.clone(),
             address: address.clone(),
-            table: Arc::new(MemTable::new(TableKind::Set)),
+            table: initial_table,
             router: StorageRouter::new(ring, id, rf),
             replica_clients: RwLock::new(HashMap::new()),
             paxos_addrs: RwLock::new(HashMap::new()),
             consistency,
             paxos,
             ballot: AtomicU64::new(1),
+            wal: wal_handle,
+            stats: Arc::new(StorageStatsCell::new()),
             _server_task: StdMutex::new(None),
         });
 
@@ -234,12 +439,22 @@ impl StorageNode {
         cl: WriteConsistency,
     ) -> Result<(), StorageError> {
         tracing::info!(key_len = key.len(), cl = ?cl, "storage.put");
+        self.stats.puts_total.fetch_add(1, Ordering::Relaxed);
 
         if cl == WriteConsistency::Serial {
-            return self.paxos_put(key, value, false).await;
+            self.stats.paxos_writes.fetch_add(1, Ordering::Relaxed);
+            let result = self.paxos_put(key, value, false).await;
+            if result.is_err() {
+                self.stats.quorum_failures.fetch_add(1, Ordering::Relaxed);
+            }
+            return result;
         }
 
-        self.replicate_to_quorum(key, value, false, cl).await
+        let result = self.replicate_to_quorum(key, value, false, cl).await;
+        if result.is_err() {
+            self.stats.quorum_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Delete `key` by writing a tombstone.
@@ -249,9 +464,10 @@ impl StorageNode {
         cl: WriteConsistency,
     ) -> Result<(), StorageError> {
         tracing::info!(key_len = key.len(), cl = ?cl, "storage.delete");
+        self.stats.deletes_total.fetch_add(1, Ordering::Relaxed);
 
         if cl == WriteConsistency::Serial {
-            // Tombstone via Paxos: value = empty bytes, tombstone flag handled locally after commit
+            self.stats.paxos_writes.fetch_add(1, Ordering::Relaxed);
             let empty = Value::new();
             self.paxos_put(key.clone(), empty, false).await?;
             let ballot = self.ballot.fetch_add(1, Ordering::Relaxed);
@@ -259,8 +475,13 @@ impl StorageNode {
             return Ok(());
         }
 
-        self.replicate_to_quorum(key.clone(), Value::new(), true, cl)
-            .await
+        let result = self
+            .replicate_to_quorum(key.clone(), Value::new(), true, cl)
+            .await;
+        if result.is_err() {
+            self.stats.quorum_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     /// Shared fan-out logic for both `put` and `delete`.
@@ -286,7 +507,23 @@ impl StorageNode {
             written_at: SystemTime::now(),
         };
 
-        // Write locally if this node owns the key.
+        // WAL: append before any replication so the write survives a crash.
+        if let Some(ref wal) = self.wal {
+            match wal.append(&record).await {
+                Ok(_) => {
+                    let approx_bytes = record.key.len() + record.value.len() + 32;
+                    self.stats
+                        .wal_bytes_written
+                        .fetch_add(approx_bytes as u64, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "WAL append failure");
+                    return Err(e);
+                }
+            }
+        }
+
+        // Write locally if this node is in the replica set for this key.
         let wrote_local = if self.router.is_local_replica(&key) {
             if tombstone {
                 self.table.delete(&key, ballot);
@@ -326,11 +563,13 @@ impl StorageNode {
             }
 
             _ => {
-                // Quorum / All: collect acks from peers.
-                let mut acks = if wrote_local { 1usize } else { 0 };
+                // Quorum / All: Cassandra fan-out — spawn ALL peer writes as detached
+                // tasks so every replica eventually receives the write regardless of
+                // whether we waited for its ack. Collect acks via an mpsc channel.
+                let initial_acks = if wrote_local { 1usize } else { 0 };
 
-                if acks >= required {
-                    // Already satisfied; fire-and-forget remainder.
+                if initial_acks >= required {
+                    // Local write alone satisfies the requirement; background-replicate.
                     for (_, mut client) in peers {
                         let k = key.clone();
                         let v = value.clone();
@@ -341,54 +580,56 @@ impl StorageNode {
                     return Ok(());
                 }
 
-                let needed = required - acks;
-                let mut join_set = tokio::task::JoinSet::new();
+                let needed = required - initial_acks;
+                let (ack_tx, mut ack_rx) = tokio::sync::mpsc::channel::<()>(peers.len() + 1);
                 for (_, mut client) in peers {
                     let k = key.clone();
                     let v = value.clone();
-                    join_set.spawn(async move {
-                        client.replicate(k, v, ballot, tombstone, true).await
+                    let tx = ack_tx.clone();
+                    // Detached spawn: runs to completion even after we've collected quorum.
+                    tokio::spawn(async move {
+                        if client.replicate(k, v, ballot, tombstone, true).await.is_ok() {
+                            let _ = tx.send(()).await;
+                        }
                     });
                 }
+                drop(ack_tx); // channel closes when all spawns finish
 
                 let timeout = self.consistency.ack_timeout;
-                let peer_result = tokio::time::timeout(timeout, async {
-                    let mut peer_acks = 0usize;
-                    while let Some(res) = join_set.join_next().await {
-                        if let Ok(Ok(())) = res {
-                            peer_acks += 1;
-                            if peer_acks >= needed {
-                                return Ok(peer_acks);
-                            }
+                let mut peer_acks = 0usize;
+                let result = tokio::time::timeout(timeout, async {
+                    while let Some(()) = ack_rx.recv().await {
+                        peer_acks += 1;
+                        if peer_acks >= needed {
+                            return Ok(());
                         }
                     }
                     Err(peer_acks)
                 })
                 .await;
-                join_set.abort_all();
 
-                match peer_result {
-                    Ok(Ok(_)) => {
-                        tracing::debug!(required, acks = required, "write quorum satisfied");
+                let total_acks = initial_acks + peer_acks;
+                match result {
+                    Ok(Ok(())) => {
+                        tracing::debug!(required, acks = total_acks, "write quorum satisfied");
                         Ok(())
                     }
-                    Ok(Err(got)) => {
-                        acks += got;
-                        tracing::warn!(required, received = acks, "write quorum shortfall");
+                    Ok(Err(_)) => {
+                        tracing::warn!(required, received = total_acks, "write quorum shortfall");
                         Err(StorageError(format!(
-                            "not enough write acks: required {required}, got {acks}"
+                            "not enough write acks: required {required}, got {total_acks}"
                         )))
                     }
                     Err(_) => {
-                        tracing::warn!(
-                            required,
-                            timeout_ms = timeout.as_millis(),
-                            "write timed out"
-                        );
-                        Err(StorageError(format!(
-                            "write timed out after {:?}",
-                            timeout
-                        )))
+                        // Timed out — check if we accumulated enough anyway.
+                        if total_acks >= required {
+                            Ok(())
+                        } else {
+                            tracing::warn!(required, received = total_acks, timeout_ms = timeout.as_millis(), "write timed out");
+                            Err(StorageError(format!(
+                                "write timed out: got {total_acks} of {required} acks"
+                            )))
+                        }
                     }
                 }
             }
@@ -405,6 +646,7 @@ impl StorageNode {
         cl: ReadConsistency,
     ) -> Result<Option<Value>, StorageError> {
         tracing::info!(key_len = key.len(), cl = ?cl, "storage.get");
+        self.stats.gets_total.fetch_add(1, Ordering::Relaxed);
 
         if is_paxos_read(cl) {
             let local_only = matches!(cl, ReadConsistency::LocalSerial);
@@ -491,6 +733,8 @@ impl StorageNode {
                         .collect()
                 }; // RwLockReadGuard dropped here
                 let winning_clone = winning.clone();
+                let repairs = stale_clients.len() as u64;
+                self.stats.read_repairs.fetch_add(repairs, Ordering::Relaxed);
                 tokio::spawn(async move {
                     for (nid, mut client) in stale_clients {
                         tracing::debug!(stale_node = %nid, "read repair triggered");
@@ -683,6 +927,45 @@ impl StorageNode {
 
     pub fn table(&self) -> &MemTable {
         &self.table
+    }
+
+    /// Snapshot of runtime counters (cheap — all atomic loads).
+    pub fn stats(&self) -> StorageStats {
+        let tombstones = self.table.tombstone_count();
+        self.stats.snapshot(tombstones)
+    }
+
+    /// Lightweight health summary.
+    pub fn health(&self) -> StorageHealth {
+        let record_count = self.table.len();
+        let tombstone_count = self.table.tombstone_count();
+        let wal_bytes = self
+            .wal
+            .as_ref()
+            .map(|w| w.bytes_appended.load(Ordering::Relaxed));
+        let replica_peers = self.replica_clients.read().unwrap().len();
+        StorageHealth {
+            node_id: self.id.clone(),
+            record_count,
+            tombstone_count,
+            wal_bytes_written: wal_bytes,
+            replica_peers,
+            ring_rf: self.consistency.rf,
+        }
+    }
+
+    /// Atomically write a snapshot of the current MemTable and truncate the WAL.
+    /// The node continues accepting writes during and after the checkpoint.
+    /// Returns `Ok(())` for RAM-only nodes (no-op).
+    pub async fn checkpoint(&self, dir: &std::path::Path) -> Result<(), StorageError> {
+        let wal = match &self.wal {
+            Some(w) => w,
+            None => return Ok(()),
+        };
+        let records = self.table.all_with_tombstones();
+        let snap = dir.join("snapshot.dat");
+        let lsn_file = dir.join("snapshot.lsn");
+        wal.checkpoint(snap, records, lsn_file).await
     }
 }
 
@@ -931,7 +1214,7 @@ mod tests {
             local_rf: 1,
             ..Default::default()
         };
-        StorageNode::new("n1".into(), ring, consistency, "127.0.0.1:0", None)
+        StorageNode::new("n1".into(), ring, consistency, "127.0.0.1:0", None, None)
             .await
             .expect("storage node")
     }
@@ -962,5 +1245,379 @@ mod tests {
         let k = Key::from(b"no-such-key".as_ref());
         let got = node.get(&k, ReadConsistency::One).await.unwrap();
         assert!(got.is_none());
+    }
+
+    // ── Phase 4 helpers ───────────────────────────────────────────────────────
+
+    async fn three_node_cluster() -> (Arc<StorageNode>, Arc<StorageNode>, Arc<StorageNode>) {
+        // Build a 3-node ring with placeholder ports — the hash ring uses node-id
+        // strings for virtual-node keys, so the addresses don't affect routing.
+        let mut ring = HashRing::new(150);
+        ring.add_node(RingNode::new("n1", "127.0.0.1", 9901));
+        ring.add_node(RingNode::new("n2", "127.0.0.1", 9902));
+        ring.add_node(RingNode::new("n3", "127.0.0.1", 9903));
+
+        let cons = |rf: usize| ConsistencyConfig {
+            rf,
+            local_rf: rf,
+            ..Default::default()
+        };
+
+        let n1 = StorageNode::new("n1".into(), ring.clone(), cons(3), "127.0.0.1:0", None, None)
+            .await
+            .expect("n1");
+        let n2 = StorageNode::new("n2".into(), ring.clone(), cons(3), "127.0.0.1:0", None, None)
+            .await
+            .expect("n2");
+        let n3 = StorageNode::new("n3".into(), ring.clone(), cons(3), "127.0.0.1:0", None, None)
+            .await
+            .expect("n3");
+
+        // Connect each node's replication clients to its two peers.
+        let addr1 = format!("http://{}", n1.address);
+        let addr2 = format!("http://{}", n2.address);
+        let addr3 = format!("http://{}", n3.address);
+
+        n1.connect_peers(&[
+            ("n2".into(), addr2.clone()),
+            ("n3".into(), addr3.clone()),
+        ])
+        .await
+        .expect("n1 peers");
+        n2.connect_peers(&[
+            ("n1".into(), addr1.clone()),
+            ("n3".into(), addr3.clone()),
+        ])
+        .await
+        .expect("n2 peers");
+        n3.connect_peers(&[
+            ("n1".into(), addr1.clone()),
+            ("n2".into(), addr2.clone()),
+        ])
+        .await
+        .expect("n3 peers");
+
+        (n1, n2, n3)
+    }
+
+    // ── 4.1 Quorum write propagates to all 3 replicas ────────────────────────
+    #[tokio::test]
+    async fn quorum_write_all_three_have_record() {
+        let (n1, n2, n3) = three_node_cluster().await;
+
+        let k = Key::from(b"k41".as_ref());
+        let v = Value::from(b"v41".as_ref());
+
+        n1.put(k.clone(), v.clone(), WriteConsistency::Quorum)
+            .await
+            .expect("quorum write");
+
+        // Give background replication time to propagate to all 3 nodes.
+        tokio::time::sleep(tokio::time::Duration::from_millis(80)).await;
+
+        assert!(n1.table().get(&k).is_some(), "n1 should have record");
+        assert!(n2.table().get(&k).is_some(), "n2 should have record");
+        assert!(n3.table().get(&k).is_some(), "n3 should have record");
+    }
+
+    // ── 4.2 Quorum read returns correct value from 2-of-3 replicas ───────────
+    #[tokio::test]
+    async fn quorum_read_two_of_three() {
+        let (n1, n2, n3) = three_node_cluster().await;
+        let _ = n3; // unused node; 2-of-3 quorum is satisfied by n1+n2.
+
+        let k = Key::from(b"k42".as_ref());
+        let v = Value::from(b"v42".as_ref());
+        let ballot = 100u64;
+
+        // Write directly to n1 and n2's MemTables (bypass put).
+        n1.table().insert(Record {
+            key: k.clone(),
+            value: v.clone(),
+            ballot,
+            tombstone: false,
+            written_at: SystemTime::now(),
+        });
+        n2.table().insert(Record {
+            key: k.clone(),
+            value: v.clone(),
+            ballot,
+            tombstone: false,
+            written_at: SystemTime::now(),
+        });
+
+        let got = n1
+            .get(&k, ReadConsistency::Quorum)
+            .await
+            .expect("quorum read");
+        assert_eq!(got.as_deref(), Some(b"v42".as_ref()));
+    }
+
+    // ── 4.3 Read repair propagates winning value to stale replica ─────────────
+    #[tokio::test]
+    async fn read_repair_propagates() {
+        let (n1, n2, n3) = three_node_cluster().await;
+
+        let k = Key::from(b"k43".as_ref());
+        let v = Value::from(b"v43".as_ref());
+        let ballot = 200u64;
+
+        // Only n1 has the record.
+        n1.table().insert(Record {
+            key: k.clone(),
+            value: v.clone(),
+            ballot,
+            tombstone: false,
+            written_at: SystemTime::now(),
+        });
+
+        // ReadConsistency::All ensures all 3 responses are collected so both n2
+        // and n3 appear as stale and both get repaired.
+        let got = n1
+            .get(&k, ReadConsistency::All)
+            .await
+            .expect("read-all");
+        assert_eq!(got.as_deref(), Some(b"v43".as_ref()));
+
+        // Wait for async read repair to complete.
+        tokio::time::sleep(tokio::time::Duration::from_millis(120)).await;
+
+        let n2_has = n2.table().get(&k).is_some();
+        let n3_has = n3.table().get(&k).is_some();
+        assert!(
+            n2_has || n3_has,
+            "at least one stale replica should be repaired"
+        );
+    }
+
+    // ── 4.4 Quorum write fails without peers ─────────────────────────────────
+    #[tokio::test]
+    async fn quorum_write_fails_without_peers() {
+        // Single node with rf=3 ring but no peers connected → cannot reach quorum.
+        let mut ring = HashRing::new(150);
+        ring.add_node(RingNode::new("n1", "127.0.0.1", 9904));
+        ring.add_node(RingNode::new("n2", "127.0.0.1", 9905));
+        ring.add_node(RingNode::new("n3", "127.0.0.1", 9906));
+        let cons = ConsistencyConfig {
+            rf: 3,
+            local_rf: 3,
+            ..Default::default()
+        };
+        let n1 =
+            StorageNode::new("n1".into(), ring, cons, "127.0.0.1:0", None, None)
+                .await
+                .expect("n1");
+
+        let k = Key::from(b"k44".as_ref());
+        let v = Value::from(b"v44".as_ref());
+        let result = n1.put(k, v, WriteConsistency::Quorum).await;
+        assert!(result.is_err(), "quorum write should fail without peers");
+        let msg = result.unwrap_err().0;
+        assert!(
+            msg.contains("not enough") || msg.contains("timed out"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    // ── 4.5 Node join via sync_from_peer ─────────────────────────────────────
+    #[tokio::test]
+    async fn node_join_sync_from_peer() {
+        let mut ring = HashRing::new(150);
+        ring.add_node(RingNode::new("n1", "127.0.0.1", 9907));
+        ring.add_node(RingNode::new("n2", "127.0.0.1", 9908));
+        ring.add_node(RingNode::new("n3", "127.0.0.1", 9909));
+
+        let cons = ConsistencyConfig {
+            rf: 1, // rf=1 so n1 is primary for all keys
+            local_rf: 1,
+            ..Default::default()
+        };
+        let n1 =
+            StorageNode::new("n1".into(), ring.clone(), cons.clone(), "127.0.0.1:0", None, None)
+                .await
+                .expect("n1");
+        let n3 =
+            StorageNode::new("n3".into(), ring.clone(), cons, "127.0.0.1:0", None, None)
+                .await
+                .expect("n3");
+
+        // Write 100 records directly to n1's table.
+        for i in 0u64..100 {
+            n1.table().insert(Record {
+                key: Key::from(format!("sync-key-{i}").into_bytes()),
+                value: Value::from(format!("v{i}").into_bytes()),
+                ballot: i + 1,
+                tombstone: false,
+                written_at: SystemTime::now(),
+            });
+        }
+
+        // n3 connects to n1 for snapshot.
+        let n1_addr = format!("http://{}", n1.address);
+        n3.connect_peers(&[("n1".into(), n1_addr)])
+            .await
+            .expect("connect n3→n1");
+
+        n3.sync_from_peer("n1").await.expect("sync_from_peer");
+
+        assert_eq!(
+            n3.table().all().len(),
+            100,
+            "n3 should have all 100 records after sync"
+        );
+    }
+
+    // ── Phase 6 WAL tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn wal_recovery_after_crash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_path = dir.path().to_path_buf();
+
+        let mut ring = HashRing::new(150);
+        ring.add_node(RingNode::from_socket_addr("n1", "127.0.0.1:0"));
+        let cons = ConsistencyConfig {
+            rf: 1,
+            local_rf: 1,
+            ..Default::default()
+        };
+
+        // 1. Write 50 records.
+        {
+            let node = StorageNode::new(
+                "n1".into(),
+                ring.clone(),
+                cons.clone(),
+                "127.0.0.1:0",
+                None,
+                Some(wal_path.clone()),
+            )
+            .await
+            .expect("node");
+
+            for i in 0u64..50 {
+                let k = Key::from(format!("wal-k{i}").into_bytes());
+                let v = Value::from(format!("wal-v{i}").into_bytes());
+                node.put(k, v, WriteConsistency::One).await.expect("put");
+            }
+            // Flush so the WAL is fully on disk (actor flushes on post_stop,
+            // but we explicitly flush here to be safe).
+            node.wal.as_ref().unwrap().flush().await.expect("flush");
+            // Drop the node — simulate crash (WAL actor's post_stop flushes).
+        }
+
+        // 2. Reconstruct node from the same WAL path.
+        let node2 = StorageNode::new(
+            "n1".into(),
+            ring.clone(),
+            cons.clone(),
+            "127.0.0.1:0",
+            None,
+            Some(wal_path.clone()),
+        )
+        .await
+        .expect("node2");
+
+        for i in 0u64..50 {
+            let k = Key::from(format!("wal-k{i}").into_bytes());
+            let got = node2
+                .get(&k, ReadConsistency::One)
+                .await
+                .expect("get");
+            assert!(
+                got.is_some(),
+                "key wal-k{i} should survive recovery"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_wal_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wal_path = dir.path().to_path_buf();
+
+        let mut ring = HashRing::new(150);
+        ring.add_node(RingNode::from_socket_addr("n1", "127.0.0.1:0"));
+        let cons = ConsistencyConfig {
+            rf: 1,
+            local_rf: 1,
+            ..Default::default()
+        };
+
+        {
+            let node = StorageNode::new(
+                "n1".into(),
+                ring.clone(),
+                cons.clone(),
+                "127.0.0.1:0",
+                None,
+                Some(wal_path.clone()),
+            )
+            .await
+            .expect("node");
+
+            // Write 50 records, checkpoint, then 50 more.
+            for i in 0u64..50 {
+                let k = Key::from(format!("cp-k{i}").into_bytes());
+                let v = Value::from(format!("cp-v{i}").into_bytes());
+                node.put(k, v, WriteConsistency::One).await.expect("put");
+            }
+
+            node.checkpoint(&wal_path).await.expect("checkpoint");
+
+            for i in 50u64..100 {
+                let k = Key::from(format!("cp-k{i}").into_bytes());
+                let v = Value::from(format!("cp-v{i}").into_bytes());
+                node.put(k, v, WriteConsistency::One).await.expect("put");
+            }
+
+            node.wal.as_ref().unwrap().flush().await.expect("flush");
+        }
+
+        // Recover — all 100 keys should be present.
+        let node2 = StorageNode::new(
+            "n1".into(),
+            ring.clone(),
+            cons.clone(),
+            "127.0.0.1:0",
+            None,
+            Some(wal_path.clone()),
+        )
+        .await
+        .expect("node2");
+
+        assert_eq!(node2.table().all().len(), 100, "all 100 keys after recovery");
+
+        // WAL should only contain the 50 post-checkpoint entries.
+        let wal_entries =
+            wal::replay(&wal_path.join("wal.dat"), 0).await.expect("replay");
+        assert_eq!(
+            wal_entries.len(),
+            50,
+            "WAL should contain only post-checkpoint entries"
+        );
+    }
+
+    // ── Phase 7.4 StorageClient round-trip ───────────────────────────────────
+    #[tokio::test]
+    async fn storage_client_round_trip() {
+        let node = single_node("127.0.0.1:0").await;
+
+        let mut client = StorageClient::connect(&format!("http://{}", node.address))
+            .await
+            .expect("client connect");
+
+        let k = Key::from(b"hello".as_ref());
+        let v = Value::from(b"world".as_ref());
+
+        client.put(k.clone(), v.clone()).await.expect("put");
+
+        let got = client.get(&k).await.expect("get");
+        assert_eq!(got.as_deref(), Some(b"world".as_ref()));
+
+        client.delete(&k).await.expect("delete");
+
+        let after_del = client.get(&k).await.expect("get after delete");
+        assert!(after_del.is_none());
     }
 }

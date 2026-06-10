@@ -78,3 +78,13 @@ message ScanChunk {
   repeated GetReply records = 1;
   bool done = 2;
 }
+
+// Write-ahead log entry (length-delimited in WAL file).
+message WalEntry {
+  uint64 lsn       = 1;
+  bytes  key       = 2;
+  bytes  value     = 3;
+  uint64 ballot    = 4;
+  bool   tombstone = 5;
+  uint64 timestamp = 6; // unix millis (diagnostic only)
+}
