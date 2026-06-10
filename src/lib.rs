@@ -35,6 +35,7 @@ pub mod mesh_registry_grpc;
 pub mod proto;
 pub mod paxos;
 pub mod paxos_grpc;
+pub mod storage;
 pub mod stream;
 pub mod topology;
 #[cfg(feature = "tls")]
@@ -76,6 +77,9 @@ pub use paxos::{
     PaxosMsg, PaxosNode, PaxosProposer, PaxosReplica,
 };
 pub use paxos_grpc::PaxosProposerClient;
+pub use storage::{
+    Key, MemTable, Record, StorageError, StorageNode, TableKind, Value,
+};
 pub use proto::paxos::{
     AcceptReply, CommitRequest, PrepareRequest, PromiseReply, ProposeRequest,
 };

@@ -47,6 +47,8 @@ pub enum WriteConsistency {
     EachQuorum,
     /// Wait for all replicas to acknowledge. Requires every replica to respond.
     All,
+    /// Linearizable write via Paxos (cluster-wide). Delegates to the Paxos write path.
+    Serial,
 }
 
 /// Read-side consistency level (R).
@@ -232,7 +234,7 @@ pub fn write_acks_required(
         WriteConsistency::Two => 2,
         WriteConsistency::Three => 3,
         WriteConsistency::LocalQuorum => quorum_for(local_rf),
-        WriteConsistency::Quorum => quorum_for(rf),
+        WriteConsistency::Quorum | WriteConsistency::Serial => quorum_for(rf),
         WriteConsistency::EachQuorum => {
             return each_quorum_acks_required(dc_rfs.unwrap_or(&[]))
                 .map(|v| v.iter().sum());
@@ -494,6 +496,10 @@ mod tests {
         assert_eq!(
             write_acks_required(WriteConsistency::All, 3, 3, None).unwrap(),
             3
+        );
+        assert_eq!(
+            write_acks_required(WriteConsistency::Serial, 3, 3, None).unwrap(),
+            2
         );
         assert_eq!(
             write_acks_required(WriteConsistency::EachQuorum, 3, 3, Some(&[3, 3])).unwrap(),

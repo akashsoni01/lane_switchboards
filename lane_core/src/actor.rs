@@ -268,7 +268,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
 
     pub async fn upgrade(
         &self,
-        new_impl: impl Actor<M> + Send + Sync + 'static,
+        new_impl: impl Actor<M> + 'static,
     ) -> Result<(), ActorProcessingErr> {
         let boxed = into_dyn_actor(new_impl);
         self.tx

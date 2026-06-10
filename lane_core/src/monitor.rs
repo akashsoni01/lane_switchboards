@@ -71,11 +71,7 @@ impl StatsCell {
     fn snapshot(&self, id: ActorId) -> ActorStats {
         let messages_handled = self.messages_handled.load(Ordering::Relaxed);
         let total_handle_ms = self.total_handle_ms.load(Ordering::Relaxed);
-        let mean_handle_ms = if messages_handled > 0 {
-            total_handle_ms / messages_handled
-        } else {
-            0
-        };
+        let mean_handle_ms = total_handle_ms.checked_div(messages_handled).unwrap_or(0);
         ActorStats {
             actor_id: id,
             messages_handled,

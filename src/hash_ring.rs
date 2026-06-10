@@ -39,6 +39,8 @@ pub struct RingNode {
     pub id: String,
     pub host: String,
     pub port: u16,
+    /// Optional datacenter tag — used by `LOCAL_*` consistency levels.
+    pub dc: Option<String>,
 }
 
 impl RingNode {
@@ -47,14 +49,20 @@ impl RingNode {
             id: id.into(),
             host: host.into(),
             port,
+            dc: None,
         }
+    }
+
+    pub fn with_dc(mut self, dc: impl Into<String>) -> Self {
+        self.dc = Some(dc.into());
+        self
     }
 
     /// Parse `"host:port"` (e.g. `"127.0.0.1:65140"`).
     pub fn try_from_socket_addr(id: impl Into<String>, addr: &str) -> Result<Self, String> {
         let id = id.into();
         let (host, port) = parse_host_port(addr)?;
-        Ok(Self { id, host, port })
+        Ok(Self { id, host, port, dc: None })
     }
 
     /// Parse `"host:port"`, panicking if the address is malformed.

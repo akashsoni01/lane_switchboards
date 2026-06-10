@@ -7,6 +7,7 @@ fn main() {
                 "proto/mesh_control.proto",
                 "proto/mesh_data.proto",
                 "proto/paxos.proto",
+                "proto/storage.proto",
             ],
             &["proto/"],
         )

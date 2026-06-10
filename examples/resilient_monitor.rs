@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── phase 1: normal work ──────────────────────────────────────────────────
     println!("\n=== Phase 1: normal work (5 × add) ===\n");
-    for i in 1..=5000000u32 {
+    for i in 1..=5u32 {
         let result = add_only(&app, i as f64, 1.0).await;
         // println!("  add({i}, 1) = {result}");
     }

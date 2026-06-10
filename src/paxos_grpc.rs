@@ -192,6 +192,7 @@ pub async fn bind_paxos_acceptor_on_runtime(
 /// gRPC client for Paxos reads / commits across acceptors.
 pub struct PaxosProposerClient {
     clients: Vec<crate::proto::paxos::paxos_acceptor_client::PaxosAcceptorClient<tonic::transport::Channel>>,
+    next_ballot: std::sync::atomic::AtomicU64,
 }
 
 impl PaxosProposerClient {
@@ -204,7 +205,10 @@ impl PaxosProposerClient {
                     .await?;
             clients.push(client);
         }
-        Ok(Self { clients })
+        Ok(Self {
+            clients,
+            next_ballot: std::sync::atomic::AtomicU64::new(1),
+        })
     }
 
     /// Prepare quorum read — returns highest accepted value bytes if any.
@@ -277,6 +281,137 @@ impl PaxosProposerClient {
             }
         }
         Ok(highest.map(|(_, v)| v))
+    }
+
+    /// Full Paxos write: Prepare → Propose → Commit.
+    ///
+    /// Implements the completion obligation: if any acceptor already has an accepted
+    /// value, that value is proposed instead of `value` (single-decree Paxos).
+    /// Retries up to 3 rounds on ballot contention.
+    pub async fn write(
+        &mut self,
+        key: &str,
+        value: Vec<u8>,
+        quorum: usize,
+        timeout: std::time::Duration,
+    ) -> Result<(), crate::consistency::ConsistencyError> {
+        use crate::consistency::ConsistencyError;
+        use std::sync::atomic::Ordering;
+
+        if self.clients.len() < quorum {
+            return Err(ConsistencyError::NotEnoughReplicas {
+                required: quorum,
+                available: self.clients.len(),
+            });
+        }
+
+        const MAX_ROUNDS: usize = 3;
+        let key_str = key.to_string();
+        let mut ballot = self.next_ballot.fetch_add(1, Ordering::Relaxed);
+
+        for round in 0..MAX_ROUNDS {
+            // ── Phase 1: Prepare ────────────────────────────────────────────
+            let phase1 = tokio::time::timeout(timeout, async {
+                let mut join_set = tokio::task::JoinSet::new();
+                for mut client in self.clients.clone() {
+                    let k = key_str.clone();
+                    let b = ballot;
+                    join_set.spawn(async move {
+                        client.prepare(PrepareRequest { ballot: b, key: k }).await
+                    });
+                }
+                let mut promises = Vec::new();
+                while let Some(r) = join_set.join_next().await {
+                    if let Ok(Ok(resp)) = r {
+                        let inner = resp.into_inner();
+                        if inner.promised {
+                            promises.push(inner);
+                        }
+                    }
+                }
+                promises
+            })
+            .await;
+
+            let promises = match phase1 {
+                Ok(p) if p.len() >= quorum => p,
+                Ok(p) => {
+                    return Err(ConsistencyError::NotEnoughAcks {
+                        required: quorum,
+                        received: p.len(),
+                        dc: None,
+                    })
+                }
+                Err(_) => return Err(ConsistencyError::Timeout { after: timeout }),
+            };
+
+            // Completion obligation: if any acceptor already accepted a value,
+            // we MUST propose that value (highest ballot wins).
+            let propose_value = promises
+                .iter()
+                .filter(|p| p.accepted_ballot > 0)
+                .max_by_key(|p| p.accepted_ballot)
+                .map(|p| p.accepted_value.clone())
+                .unwrap_or_else(|| value.clone());
+
+            // ── Phase 2: Propose ────────────────────────────────────────────
+            let phase2 = tokio::time::timeout(timeout, async {
+                let mut join_set = tokio::task::JoinSet::new();
+                for mut client in self.clients.clone() {
+                    let k = key_str.clone();
+                    let v = propose_value.clone();
+                    let b = ballot;
+                    join_set.spawn(async move {
+                        client
+                            .propose(ProposeRequest { ballot: b, key: k, value: v })
+                            .await
+                    });
+                }
+                let mut accepts = 0usize;
+                let mut highest_seen = ballot;
+                while let Some(r) = join_set.join_next().await {
+                    if let Ok(Ok(resp)) = r {
+                        let inner = resp.into_inner();
+                        if inner.accepted {
+                            accepts += 1;
+                        } else if inner.higher_ballot > highest_seen {
+                            highest_seen = inner.higher_ballot;
+                        }
+                    }
+                }
+                (accepts, highest_seen)
+            })
+            .await;
+
+            let (accepts, highest_seen) = match phase2 {
+                Ok(result) => result,
+                Err(_) => return Err(ConsistencyError::Timeout { after: timeout }),
+            };
+
+            if accepts >= quorum {
+                // ── Phase 3: Commit (fire-and-forget after quorum) ──────────
+                for mut client in self.clients.clone() {
+                    let k = key_str.clone();
+                    let v = propose_value.clone();
+                    let b = ballot;
+                    tokio::spawn(async move {
+                        let _ = client
+                            .commit(CommitRequest { ballot: b, key: k, value: v })
+                            .await;
+                    });
+                }
+                return Ok(());
+            }
+
+            // Rejected: bump ballot past the highest we saw and retry.
+            if round < MAX_ROUNDS - 1 {
+                ballot = highest_seen + 1;
+                let fresh = self.next_ballot.fetch_add(1, Ordering::Relaxed);
+                ballot = ballot.max(fresh);
+            }
+        }
+
+        Err(ConsistencyError::PaxosContention { rounds: MAX_ROUNDS })
     }
 }
 

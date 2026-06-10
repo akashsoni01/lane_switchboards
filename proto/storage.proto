@@ -1,0 +1,80 @@
+syntax = "proto3";
+package lane_switchboard.storage;
+
+// Internal replication channel: coordinator → replica.
+service StorageService {
+  // Replicate a committed write to this node.
+  rpc Replicate  (ReplicateRequest)   returns (Ack);
+  // Request this node's local value for a key (read quorum).
+  rpc ReadReplica(ReadReplicaRequest) returns (ReadReplicaReply);
+  // Stream all records from this node (node join / repair).
+  rpc Snapshot   (SnapshotRequest)    returns (stream SnapshotChunk);
+}
+
+// External client-facing gateway.
+service StorageGateway {
+  rpc Put    (PutRequest)    returns (Ack);
+  rpc Get    (GetRequest)    returns (GetReply);
+  rpc Delete (DeleteRequest) returns (Ack);
+  rpc Scan   (ScanRequest)   returns (stream ScanChunk);
+}
+
+message ReplicateRequest {
+  bytes  key        = 1;
+  bytes  value      = 2;
+  uint64 ballot     = 3;
+  bool   tombstone  = 4;
+  bool   expect_ack = 5;
+}
+
+message ReadReplicaRequest { bytes key = 1; }
+
+message ReadReplicaReply {
+  bool   found     = 1;
+  bytes  value     = 2;
+  uint64 ballot    = 3;
+  bool   tombstone = 4;
+}
+
+message SnapshotRequest {
+  uint64 from_ballot = 1; // 0 = full snapshot
+}
+
+message SnapshotChunk {
+  repeated ReplicateRequest records = 1;
+  bool done = 2;
+}
+
+message Ack { bool ok = 1; string error = 2; }
+
+message PutRequest {
+  bytes  key               = 1;
+  bytes  value             = 2;
+  string write_consistency = 3; // "QUORUM" | "ONE" | "SERIAL" | etc.
+}
+
+message GetRequest {
+  bytes  key              = 1;
+  string read_consistency = 2;
+}
+
+message GetReply {
+  bool  found = 1;
+  bytes value = 2;
+}
+
+message DeleteRequest {
+  bytes  key               = 1;
+  string write_consistency = 2;
+}
+
+message ScanRequest {
+  bytes  start            = 1;
+  bytes  end              = 2;
+  string read_consistency = 3;
+}
+
+message ScanChunk {
+  repeated GetReply records = 1;
+  bool done = 2;
+}
