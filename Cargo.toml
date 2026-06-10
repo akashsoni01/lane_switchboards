@@ -215,3 +215,7 @@ path = "examples/multi_dc_heartbeat_prod.rs"
 [[example]]
 name = "resilient_monitor"
 path = "examples/resilient_monitor.rs"
+
+[[example]]
+name = "distributed_key_value"
+path = "examples/distributed_key_value.rs"

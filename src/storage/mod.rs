@@ -929,6 +929,14 @@ impl StorageNode {
         &self.table
     }
 
+    /// Flush and fsync the WAL.  No-op for RAM-only nodes.
+    pub async fn flush_wal(&self) -> Result<(), StorageError> {
+        if let Some(ref wal) = self.wal {
+            wal.flush().await?;
+        }
+        Ok(())
+    }
+
     /// Snapshot of runtime counters (cheap — all atomic loads).
     pub fn stats(&self) -> StorageStats {
         let tombstones = self.table.tombstone_count();
@@ -1502,7 +1510,7 @@ mod tests {
             }
             // Flush so the WAL is fully on disk (actor flushes on post_stop,
             // but we explicitly flush here to be safe).
-            node.wal.as_ref().unwrap().flush().await.expect("flush");
+            node.flush_wal().await.expect("flush");
             // Drop the node — simulate crash (WAL actor's post_stop flushes).
         }
 
@@ -1571,7 +1579,7 @@ mod tests {
                 node.put(k, v, WriteConsistency::One).await.expect("put");
             }
 
-            node.wal.as_ref().unwrap().flush().await.expect("flush");
+            node.flush_wal().await.expect("flush");
         }
 
         // Recover — all 100 keys should be present.
