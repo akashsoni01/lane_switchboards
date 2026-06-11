@@ -238,6 +238,16 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
             .map_err(|e| Box::new(e) as ActorProcessingErr)
     }
 
+    /// Enqueue a message without `.await` — for sync callers.
+    ///
+    /// Uses [`mpsc::Sender::try_send`]: returns immediately, or with an error if
+    /// the mailbox is full or the actor has exited.
+    pub fn send_sync(&self, msg: M) -> Result<(), ActorProcessingErr> {
+        self.tx
+            .try_send(Envelope::Msg(msg))
+            .map_err(|e| Box::new(e) as ActorProcessingErr)
+    }
+
     pub async fn stop(&self) -> Result<(), ActorProcessingErr> {
         self.tx
             .send(Envelope::Stop)

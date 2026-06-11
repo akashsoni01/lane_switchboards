@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "lane_switchboards"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Telecom-inspired OTP actor runtime for Rust: mailbox routing, supervision trees, let-it-crash fault isolation, and distributed messaging"
 license = "MIT"
@@ -22,7 +22,7 @@ include = [
 ]
 
 [dependencies]
-lane_core = { path = "lane_core", version = "0.8.0" }
+lane_core = { path = "lane_core", version = "0.9.0" }
 prost = "0.13"
 prost-types = "0.13"
 tonic = { version = "0.12", features = ["transport", "codegen"] }

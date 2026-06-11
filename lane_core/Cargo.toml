@@ -1,6 +1,6 @@
 [package]
 name = "lane_core"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Core OTP actor primitives for lane_switchboards: actors, supervision, linking, monitoring, and hot upgrade"
 license = "MIT"
