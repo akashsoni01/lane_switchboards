@@ -11,8 +11,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Default features
+      - name: Default features (fast path, no monitor)
         run: cargo test --workspace
+      - name: Monitor feature
+        run: cargo test --workspace --features monitor
       - name: Metrics feature
         run: |
           cargo test --workspace --features metrics

@@ -324,6 +324,19 @@ See [`tls_distributed.md`](examples/tls_distributed.md) (`cargo run --example tl
 
 Optional Prometheus text exposition for [`ActorMonitor`](lane_core/src/monitor.rs) counters, supervisor restarts, mesh consistency, storage, and remote actor dispatches.
 
+**Performance:** Default builds have **no** monitor overhead on the message hot path. Enable `monitor` for in-process stats, or `metrics` for Prometheus export (`metrics` implies `monitor`).
+
+```toml
+# Fastest — no per-message stats
+lane_switchboards = { path = "." }
+
+# In-process ActorMonitor only
+lane_switchboards = { path = ".", features = ["monitor"] }
+
+# Full Grafana stack
+lane_switchboards = { path = ".", features = ["metrics"] }
+```
+
 | Piece | Location |
 |-------|----------|
 | Export API | `lane_core/src/metrics.rs` — `render_prometheus_text()`, `serve_metrics_http()` |

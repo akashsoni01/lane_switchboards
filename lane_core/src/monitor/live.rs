@@ -1,29 +1,6 @@
-//! Per-actor runtime stats and handle-duration monitoring.
-//!
-//! # Locking discipline
-//!
-//! `cells` and `post_mortem` are guarded by a `RwLock<HashMap>`.
-//! The read lock is held only long enough to clone the `Arc<ActorCell>`;
-//! all counter updates happen on the `Arc` afterwards — no lock held on the hot path.
-//! Writes (`register`, `unregister`) take the write lock briefly and do no I/O inside it.
-//!
-//! # Counter limits
-//!
-//! All counters and millisecond fields use [`usize`]. Hot-path updates use
-//! saturating arithmetic; when a value would exceed [`usize::MAX`], it is clamped
-//! and a `tracing::warn!` is emitted once per overflow attempt (field + actor id).
-//!
-//! # Prometheus (`metrics` feature)
-//!
-//! Counters and histograms are pre-bound per actor at [`ActorMonitor::register`].
-//! Call [`crate::metrics::render_prometheus_text`] to export Grafana-ready text.
-//!
-//! # Fault isolation
-//!
-//! Monitor updates run inside `catch_unwind`; a panic in stats or Prometheus code is
-//! logged and dropped so observability never takes down actors or the rest of the service.
-//! [`RwLock`] poison from a prior panic is recovered via `into_inner()`.
+//! Live [`ActorMonitor`] implementation (`monitor` feature).
 
+use super::{ActorMeta, ActorStats};
 use crate::actor::{ActorId, ExitReason};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
@@ -55,33 +32,6 @@ fn monitor_try_value<T, F: FnOnce() -> T>(op: &'static str, f: F) -> Option<T> {
 use crate::metrics::PromActorMetrics;
 
 static MONITOR: Lazy<ActorMonitor> = Lazy::new(ActorMonitor::new);
-
-/// Grafana / Prometheus labels for an actor (set via [`crate::config::ActorConfig::monitor_meta`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ActorMeta {
-    pub name: Option<String>,
-    pub actor_type: Option<String>,
-    pub supervisor_id: Option<ActorId>,
-    pub node: Option<String>,
-    pub service: Option<String>,
-}
-
-impl ActorMeta {
-    pub fn with_name(mut self, name: impl Into<String>) -> Self {
-        self.name = Some(name.into());
-        self
-    }
-
-    pub fn with_actor_type(mut self, actor_type: impl Into<String>) -> Self {
-        self.actor_type = Some(actor_type.into());
-        self
-    }
-
-    pub fn with_supervisor(mut self, id: ActorId) -> Self {
-        self.supervisor_id = Some(id);
-        self
-    }
-}
 
 /// Clamp a `Duration` to milliseconds that fit in [`usize`].
 #[inline(always)]
@@ -128,29 +78,6 @@ fn fetch_add_saturating(
 
 fn inc_counter(cell: &ActorCell, counter: &AtomicUsize, field: &'static str, id: ActorId) {
     fetch_add_saturating(cell, counter, 1, field, id);
-}
-
-/// Snapshot of one actor's runtime counters (deadlock / slow-handle detection).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActorStats {
-    pub actor_id: ActorId,
-    pub meta: ActorMeta,
-    pub messages_handled: usize,
-    pub handle_errors: usize,
-    pub panics: usize,
-    pub handle_timeouts: usize,
-    pub in_flight: usize,
-    pub last_handle_ms: usize,
-    pub max_handle_ms: usize,
-    /// Sum of all successful handle durations.
-    pub total_handle_ms: usize,
-    /// Mean duration per successful handle call (`total_handle_ms / messages_handled`).
-    /// `0` when no messages have been handled yet.
-    pub mean_handle_ms: usize,
-    pub slow_handles: usize,
-    /// Approximate messages waiting in the actor mailbox.
-    pub mailbox_depth: usize,
-    pub mailbox_capacity: usize,
 }
 
 struct StatsCell {
@@ -628,6 +555,7 @@ fn unix_now_ms() -> Result<u64, std::time::SystemTimeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::monitor::{ActorMeta, ActorStats};
 
     #[test]
     fn counter_saturates_at_usize_max() {

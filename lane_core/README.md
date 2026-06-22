@@ -81,6 +81,25 @@ bug or panic in stats/Prometheus code cannot crash actors or the rest of the ser
 
 Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { features = ["metrics"] }`.
 
+**Feature flags** (default: all off — fastest actor hot path):
+
+| Feature | What you get |
+|---------|----------------|
+| *(none)* | Actors only; no stat counters, no `Instant::now()` per enqueue |
+| `monitor` | In-process `ActorMonitor` counters (`ActorStats`) |
+| `metrics` | `monitor` + Prometheus `/metrics` export |
+
+```toml
+# Fast — no per-message monitor overhead
+lane_core = { path = "lane_core" }
+
+# In-process stats (resilient_monitor, debugging)
+lane_core = { path = "lane_core", features = ["monitor"] }
+
+# Grafana / Prometheus
+lane_switchboards = { path = ".", features = ["metrics"] }
+```
+
 Metrics are split under `lane_core/src/metrics/`:
 
 | Module | Registry | When registered |

@@ -47,6 +47,7 @@ webpki-roots = { version = "0.26", optional = true }
 
 [features]
 default = []
+monitor = ["lane_core/monitor"]
 metrics = ["lane_core/metrics"]
 watch_sync = []
 tls = [
@@ -215,6 +216,7 @@ path = "examples/multi_dc_heartbeat_prod.rs"
 [[example]]
 name = "resilient_monitor"
 path = "examples/resilient_monitor.rs"
+required-features = ["monitor"]
 
 [[example]]
 name = "metrics_exporter"

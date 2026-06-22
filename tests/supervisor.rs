@@ -23,6 +23,7 @@ impl Actor<EchoMsg> for Echo {
 }
 
 #[tokio::test]
+#[cfg(feature = "monitor")]
 async fn supervise_actor_spawns_single_child() {
     let config = SupervisorConfig {
         strategy: RestartStrategy::OneForOne,

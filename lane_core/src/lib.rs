@@ -4,8 +4,8 @@
 //! |--------|----------------|
 //! | [`actor`] | `Actor` trait, `ActorRef`, spawn, link, monitor, hot upgrade |
 //! | [`config`] | `ActorConfig`, `DistributedConfig`, `DedicatedRuntime` |
-//! | [`monitor`] | `ActorMonitor`, `ActorStats`, `ActorMeta` — per-actor runtime counters |
-//! | [`metrics`] | Prometheus export (`metrics` feature) |
+//! | [`monitor`] | `ActorMonitor`, `ActorStats` — enable with `features = ["monitor"]` |
+//! | [`metrics`] | Prometheus export (`metrics` feature = `monitor` + Prometheus) |
 
 pub mod actor;
 pub mod config;

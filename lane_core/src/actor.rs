@@ -1,6 +1,7 @@
 //! Custom actor runtime: `run_actor` loop, linking, monitoring, hot upgrade.
 
 use crate::config::{spawn_on, ActorConfig};
+#[cfg(feature = "monitor")]
 use crate::monitor::ActorMonitor;
 use crate::registry::{get_control_sender, register_actor, unregister_actor};
 use crate::supervisor::RestartSignal;
@@ -16,6 +17,47 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+
+/// Compile-time no-op when the `monitor` feature is disabled.
+macro_rules! if_monitor {
+    ($($body:tt)*) => {
+        #[cfg(feature = "monitor")]
+        { $($body)* }
+    };
+}
+
+#[cfg(feature = "monitor")]
+pub(crate) struct MailboxItem<M: Send + Sync + 'static> {
+    pub envelope: Envelope<M>,
+    pub enqueued_at: Instant,
+}
+
+#[cfg(feature = "monitor")]
+impl<M: Send + Sync + 'static> MailboxItem<M> {
+    fn new(envelope: Envelope<M>) -> Self {
+        Self {
+            envelope,
+            enqueued_at: Instant::now(),
+        }
+    }
+}
+
+#[cfg(feature = "monitor")]
+type QueueItem<M> = MailboxItem<M>;
+#[cfg(not(feature = "monitor"))]
+type QueueItem<M> = Envelope<M>;
+
+#[cfg(not(feature = "monitor"))]
+#[inline(always)]
+fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>) -> QueueItem<M> {
+    envelope
+}
+
+#[cfg(feature = "monitor")]
+#[inline(always)]
+fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>) -> QueueItem<M> {
+    MailboxItem::new(envelope)
+}
 
 static ACTOR_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -73,21 +115,6 @@ pub struct HandleStuckContext {
     pub actor_id: ActorId,
     pub elapsed: Duration,
     pub limit: Duration,
-}
-
-/// Item in the actor mailbox queue (carries enqueue time for wait metrics).
-pub(crate) struct MailboxItem<M: Send + Sync + 'static> {
-    pub envelope: Envelope<M>,
-    pub enqueued_at: Instant,
-}
-
-impl<M: Send + Sync + 'static> MailboxItem<M> {
-    fn new(envelope: Envelope<M>) -> Self {
-        Self {
-            envelope,
-            enqueued_at: Instant::now(),
-        }
-    }
 }
 
 /// Messages delivered to the actor mailbox.
@@ -233,7 +260,7 @@ where
 /// Handle to a running actor.
 pub struct ActorRef<M: Send + Sync + 'static> {
     pub id: ActorId,
-    tx: mpsc::Sender<MailboxItem<M>>,
+    tx: mpsc::Sender<QueueItem<M>>,
 }
 
 impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
@@ -247,18 +274,25 @@ impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
 
 impl<M: Send + Sync + 'static> ActorRef<M> {
     fn on_mailbox_enqueue_ok(&self) {
-        ActorMonitor::global().record_mailbox_enqueue(self.id);
+        if_monitor! {
+            ActorMonitor::global().record_mailbox_enqueue(self.id);
+        }
     }
 
     fn on_mailbox_send_failed(&self) {
-        ActorMonitor::global().record_mailbox_send_rejected(self.id);
+        if_monitor! {
+            ActorMonitor::global().record_mailbox_send_rejected(self.id);
+        }
     }
 
     async fn mailbox_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
+        #[cfg(feature = "metrics")]
         if self.tx.capacity() == 0 {
-            ActorMonitor::global().record_mailbox_send_blocked(self.id);
+            if_monitor! {
+                ActorMonitor::global().record_mailbox_send_blocked(self.id);
+            }
         }
-        match self.tx.send(MailboxItem::new(envelope)).await {
+        match self.tx.send(queue_item(envelope)).await {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();
                 Ok(())
@@ -271,7 +305,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     }
 
     fn mailbox_try_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
-        match self.tx.try_send(MailboxItem::new(envelope)) {
+        match self.tx.try_send(queue_item(envelope)) {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();
                 Ok(())
@@ -385,12 +419,14 @@ where
     A: Actor<M> + Send + Sync + 'static,
 {
     let id = ActorId::new();
-    let (tx, rx) = mpsc::channel::<MailboxItem<M>>(config.mailbox_capacity);
+    let (tx, rx) = mpsc::channel::<QueueItem<M>>(config.mailbox_capacity);
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(config.mailbox_capacity);
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
     register_actor(id, control_tx, supervisor_tx);
-    ActorMonitor::global().register(id, config.monitor_meta.clone(), config.mailbox_capacity);
+    if_monitor! {
+        ActorMonitor::global().register(id, config.monitor_meta.clone(), config.mailbox_capacity);
+    }
 
     let boxed = into_dyn_actor(actor);
     let config = config.clone();
@@ -402,9 +438,58 @@ where
     Ok((actor_ref, join))
 }
 
+async fn dispatch_control_envelope<M: Send + Sync + 'static>(
+    id: ActorId,
+    actor: &mut Box<dyn DynActor<M>>,
+    envelope: Envelope<M>,
+    links: &mut HashSet<ActorId>,
+    monitors: &mut Vec<(ActorId, oneshot::Sender<ExitReason>)>,
+    actor_version: &mut u32,
+    exit_reason: &mut ExitReason,
+) -> Option<ExitReason> {
+    match envelope {
+        Envelope::Link(peer) => {
+            if links.insert(peer) {
+                send_reverse_link(id, peer).await;
+            }
+            None
+        }
+        Envelope::Unlink(peer) => {
+            links.remove(&peer);
+            None
+        }
+        Envelope::Monitor { observer, notify } => {
+            monitors.push((observer, notify));
+            None
+        }
+        Envelope::Demonitor(observer_id) => {
+            monitors.retain(|(mid, _)| *mid != observer_id);
+            None
+        }
+        Envelope::Upgrade(new_impl) => {
+            *actor = new_impl;
+            if let Err(e) = actor.dyn_on_upgrade(*actor_version).await {
+                return Some(ExitReason::Error(e.to_string()));
+            }
+            *actor_version += 1;
+            tracing::info!(%id, version = *actor_version, "hot code upgrade applied");
+            None
+        }
+        Envelope::Stop => {
+            *exit_reason = ExitReason::Shutdown;
+            Some(ExitReason::Shutdown)
+        }
+        Envelope::Kill => {
+            *exit_reason = ExitReason::Killed;
+            Some(ExitReason::Killed)
+        }
+        Envelope::Msg(_) => None,
+    }
+}
+
 async fn run_actor<M: Send + Sync + 'static>(
     id: ActorId,
-    mut rx: mpsc::Receiver<MailboxItem<M>>,
+    mut rx: mpsc::Receiver<QueueItem<M>>,
     mut control_rx: mpsc::Receiver<ControlMsg>,
     mut actor: Box<dyn DynActor<M>>,
     config: ActorConfig,
@@ -419,7 +504,9 @@ async fn run_actor<M: Send + Sync + 'static>(
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         unregister_actor(id);
-        ActorMonitor::global().unregister(id, Some(&reason));
+        if_monitor! {
+            ActorMonitor::global().unregister(id, Some(&reason));
+        }
         return;
     }
 
@@ -447,47 +534,52 @@ async fn run_actor<M: Send + Sync + 'static>(
             }
             envelope = rx.recv() => {
                 let Some(item) = envelope else { break 'actor_loop };
-                ActorMonitor::global().record_mailbox_dequeue(id);
-                match item.envelope {
-                    Envelope::Msg(m) => {
-                        let mailbox_wait = item.enqueued_at.elapsed();
-                        if let Some(reason) =
-                            handle_message(id, &mut actor, m, &config, mailbox_wait).await
-                        {
-                            exit_reason = reason;
-                            break 'actor_loop;
+                if_monitor! {
+                    ActorMonitor::global().record_mailbox_dequeue(id);
+                }
+                #[cfg(feature = "monitor")]
+                {
+                    let mailbox_wait = item.enqueued_at.elapsed();
+                    match item.envelope {
+                        Envelope::Msg(m) => {
+                            if let Some(reason) =
+                                handle_message(id, &mut actor, m, &config, mailbox_wait).await
+                            {
+                                exit_reason = reason;
+                                break 'actor_loop;
+                            }
+                        }
+                        other => {
+                            if let Some(reason) = dispatch_control_envelope(
+                                id, &mut actor, other, &mut links, &mut monitors,
+                                &mut actor_version, &mut exit_reason,
+                            ).await {
+                                exit_reason = reason;
+                                break 'actor_loop;
+                            }
                         }
                     }
-                    Envelope::Link(peer) => {
-                        if links.insert(peer) {
-                            send_reverse_link(id, peer).await;
+                }
+                #[cfg(not(feature = "monitor"))]
+                {
+                    match item {
+                        Envelope::Msg(m) => {
+                            if let Some(reason) = handle_message(
+                                id, &mut actor, m, &config, Duration::ZERO,
+                            ).await {
+                                exit_reason = reason;
+                                break 'actor_loop;
+                            }
                         }
-                    }
-                    Envelope::Unlink(peer) => {
-                        links.remove(&peer);
-                    }
-                    Envelope::Monitor { observer, notify } => {
-                        monitors.push((observer, notify));
-                    }
-                    Envelope::Demonitor(observer_id) => {
-                        monitors.retain(|(mid, _)| *mid != observer_id);
-                    }
-                    Envelope::Upgrade(new_impl) => {
-                        actor = new_impl;
-                        if let Err(e) = actor.dyn_on_upgrade(actor_version).await {
-                            exit_reason = ExitReason::Error(e.to_string());
-                            break 'actor_loop;
+                        other => {
+                            if let Some(reason) = dispatch_control_envelope(
+                                id, &mut actor, other, &mut links, &mut monitors,
+                                &mut actor_version, &mut exit_reason,
+                            ).await {
+                                exit_reason = reason;
+                                break 'actor_loop;
+                            }
                         }
-                        actor_version += 1;
-                        tracing::info!(%id, version = actor_version, "hot code upgrade applied");
-                    }
-                    Envelope::Stop => {
-                        exit_reason = ExitReason::Shutdown;
-                        break 'actor_loop;
-                    }
-                    Envelope::Kill => {
-                        exit_reason = ExitReason::Killed;
-                        break 'actor_loop;
                     }
                 }
             }
@@ -502,16 +594,20 @@ async fn handle_message<M: Send + Sync + 'static>(
     actor: &mut Box<dyn DynActor<M>>,
     msg: M,
     config: &ActorConfig,
+    #[cfg_attr(not(feature = "monitor"), allow(unused_variables))]
     mailbox_wait: Duration,
 ) -> Option<ExitReason> {
-    let monitor = ActorMonitor::global();
     let started = Instant::now();
-    monitor.begin_handle(id, mailbox_wait);
+    if_monitor! {
+        ActorMonitor::global().begin_handle(id, mailbox_wait);
+    }
 
     // NOTE: on_handle_begin failure is fatal — it terminates the actor.
     // If you want non-fatal journaling, return Ok(()) and log internally.
     if let Err(e) = actor.dyn_on_handle_begin(&msg).await {
-        monitor.record_error(id);
+        if_monitor! {
+            ActorMonitor::global().record_error(id);
+        }
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         return Some(reason);
@@ -527,7 +623,9 @@ async fn handle_message<M: Send + Sync + 'static>(
             Ok(inner) => inner,
             Err(_) => {
                 let elapsed = started.elapsed();
-                monitor.record_timeout(id, elapsed);
+                if_monitor! {
+                    ActorMonitor::global().record_timeout(id, elapsed);
+                }
                 let ctx = HandleStuckContext {
                     actor_id: id,
                     elapsed,
@@ -550,17 +648,27 @@ async fn handle_message<M: Send + Sync + 'static>(
 
     match handle_result {
         Ok(Ok(())) => {
-            monitor.finish_handle(id, started.elapsed(), config.effective_slow_threshold());
+            if_monitor! {
+                ActorMonitor::global().finish_handle(
+                    id,
+                    started.elapsed(),
+                    config.effective_slow_threshold(),
+                );
+            }
             None
         }
         Ok(Err(e)) => {
-            monitor.record_error(id);
+            if_monitor! {
+                ActorMonitor::global().record_error(id);
+            }
             let reason = ExitReason::Error(e.to_string());
             notify_supervisor(id, &reason).await;
             Some(reason)
         }
         Err(_) => {
-            monitor.record_panic(id);
+            if_monitor! {
+                ActorMonitor::global().record_panic(id);
+            }
             let reason = ExitReason::Error("panic in handle".into());
             notify_supervisor(id, &reason).await;
             Some(reason)
@@ -583,7 +691,9 @@ async fn finish_actor<M: Send + Sync + 'static>(
         propagate_linked_exit(id, &exit_reason, links).await;
     }
     unregister_actor(id);
-    ActorMonitor::global().unregister(id, Some(&exit_reason));
+    if_monitor! {
+        ActorMonitor::global().unregister(id, Some(&exit_reason));
+    }
 }
 
 fn should_propagate_linked_exit(reason: &ExitReason) -> bool {

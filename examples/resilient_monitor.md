@@ -3,7 +3,7 @@
 [`resilient_monitor.rs`](./resilient_monitor.rs) walks through every counter in [`ActorMonitor`](../lane_core/src/monitor.rs) across five phases: normal work, slow handles, panics, handle timeouts, and a global snapshot.
 
 ```bash
-cargo run --example resilient_monitor
+cargo run --example resilient_monitor --features monitor
 ```
 
 ---

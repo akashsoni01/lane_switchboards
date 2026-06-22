@@ -238,6 +238,7 @@ impl Actor<SlowMsg> for SlowWorker {
 }
 
 #[tokio::test]
+#[cfg(feature = "monitor")]
 async fn handle_timeout_triggers_stuck_recovery_and_stats() {
     use lane_switchboards::actor::spawn_with_config;
     use lane_switchboards::config::ActorConfig;
