@@ -74,6 +74,9 @@ Counter updates use saturating arithmetic — values never wrap. When an increme
 exceed [`usize::MAX`], the counter is clamped and `tracing::warn!` records the field
 and actor id.
 
+Monitor updates are wrapped in `catch_unwind` and [`RwLock`] poison is recovered, so a
+bug or panic in stats/Prometheus code cannot crash actors or the rest of the service.
+
 ### Prometheus export (`metrics` feature)
 
 Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { features = ["metrics"] }`.

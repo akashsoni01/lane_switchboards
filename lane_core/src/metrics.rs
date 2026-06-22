@@ -15,6 +15,15 @@ use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// Run metrics work; panics are caught so export never crashes actors or HTTP scrapes.
+fn metrics_try<F: FnOnce()>(op: &'static str, f: F) {
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::warn!(op, "metrics panicked; update dropped");
+    }
+}
+
 /// Process-wide label defaults applied when [`ActorMeta`] fields are unset.
 #[derive(Clone, Default)]
 pub struct MetricsConfig {
@@ -721,34 +730,38 @@ pub(crate) fn bind_actor_metrics(
 }
 
 pub(crate) fn record_counter_saturated(field: &'static str, meta: &ActorMeta) {
-    let labels = actor_label_strings(meta);
-    if let Ok(counter) = METRICS.counter_saturated.get_metric_with_label_values(&[
-        field,
-        &labels[0],
-        &labels[1],
-        &labels[2],
-        &labels[3],
-        &labels[4],
-    ]) {
-        counter.inc();
-    }
+    metrics_try("record_counter_saturated", || {
+        let labels = actor_label_strings(meta);
+        if let Ok(counter) = METRICS.counter_saturated.get_metric_with_label_values(&[
+            field,
+            &labels[0],
+            &labels[1],
+            &labels[2],
+            &labels[3],
+            &labels[4],
+        ]) {
+            counter.inc();
+        }
+    });
 }
 
 pub(crate) fn record_exit(prom: &PromActorMetrics, reason: &ExitReason) {
-    let mut labels = prom.exit_labels.clone();
-    labels[0] = exit_reason_label(reason).to_string();
-    let refs: [&str; 6] = [
-        &labels[0],
-        &labels[1],
-        &labels[2],
-        &labels[3],
-        &labels[4],
-        &labels[5],
-    ];
-    if let Ok(counter) = prom.exits.get_metric_with_label_values(&refs) {
-        counter.inc();
-    }
-    prom.alive.set(0.0);
+    metrics_try("record_exit", || {
+        let mut labels = prom.exit_labels.clone();
+        labels[0] = exit_reason_label(reason).to_string();
+        let refs: [&str; 6] = [
+            &labels[0],
+            &labels[1],
+            &labels[2],
+            &labels[3],
+            &labels[4],
+            &labels[5],
+        ];
+        if let Ok(counter) = prom.exits.get_metric_with_label_values(&refs) {
+            counter.inc();
+        }
+        prom.alive.set(0.0);
+    });
 }
 
 pub(crate) fn sync_scrape_gauges(
@@ -760,21 +773,25 @@ pub(crate) fn sync_scrape_gauges(
     max_handle_ms: usize,
     mailbox_depth: usize,
 ) {
-    prom.uptime_seconds.set(registered_at.elapsed().as_secs_f64());
-    prom.in_flight.set(in_flight as f64);
-    prom.last_handle_seconds.set(last_handle_ms as f64 / 1000.0);
-    prom.max_handle_seconds.set(max_handle_ms as f64 / 1000.0);
-    prom.mailbox_depth.set(mailbox_depth as f64);
+    metrics_try("sync_scrape_gauges", || {
+        prom.uptime_seconds.set(registered_at.elapsed().as_secs_f64());
+        prom.in_flight.set(in_flight as f64);
+        prom.last_handle_seconds.set(last_handle_ms as f64 / 1000.0);
+        prom.max_handle_seconds.set(max_handle_ms as f64 / 1000.0);
+        prom.mailbox_depth.set(mailbox_depth as f64);
 
-    if last_handle_unix_ms == 0 {
-        prom.idle_seconds.set(0.0);
-    } else if let Ok(now_ms) = unix_now_ms() {
-        prom.idle_seconds.set((now_ms.saturating_sub(last_handle_unix_ms)) as f64 / 1000.0);
-    }
+        if last_handle_unix_ms == 0 {
+            prom.idle_seconds.set(0.0);
+        } else if let Ok(now_ms) = unix_now_ms() {
+            prom.idle_seconds.set((now_ms.saturating_sub(last_handle_unix_ms)) as f64 / 1000.0);
+        }
+    });
 }
 
 pub(crate) fn observe_handle_duration(prom: &PromActorMetrics, elapsed: Duration) {
-    prom.handle_duration.observe(elapsed.as_secs_f64());
+    metrics_try("observe_handle_duration", || {
+        prom.handle_duration.observe(elapsed.as_secs_f64());
+    });
 }
 
 pub fn unix_now_ms() -> Result<u64, std::time::SystemTimeError> {
@@ -878,26 +895,30 @@ pub struct ConsistencyOpSnapshot {
 
 /// Record a supervised child restart.
 pub fn record_supervisor_restart(child: &str, strategy: RestartStrategy) {
-    let node = global_node();
-    let strategy = restart_strategy_label(strategy);
-    if let Ok(counter) = METRICS
-        .supervisor_restarts
-        .get_metric_with_label_values(&[child, strategy, &node])
-    {
-        counter.inc();
-    }
+    metrics_try("record_supervisor_restart", || {
+        let node = global_node();
+        let strategy = restart_strategy_label(strategy);
+        if let Ok(counter) = METRICS
+            .supervisor_restarts
+            .get_metric_with_label_values(&[child, strategy, &node])
+        {
+            counter.inc();
+        }
+    });
 }
 
 /// Record restart-intensity limit breach.
 pub fn record_intensity_exceeded(action: IntensityAction) {
-    let node = global_node();
-    let action = intensity_action_label(action);
-    if let Ok(counter) = METRICS
-        .supervisor_intensity_exceeded
-        .get_metric_with_label_values(&[action, &node])
-    {
-        counter.inc();
-    }
+    metrics_try("record_intensity_exceeded", || {
+        let node = global_node();
+        let action = intensity_action_label(action);
+        if let Ok(counter) = METRICS
+            .supervisor_intensity_exceeded
+            .get_metric_with_label_values(&[action, &node])
+        {
+            counter.inc();
+        }
+    });
 }
 
 /// Update supervisor scrape gauges (call from the supervisor loop).
@@ -915,17 +936,23 @@ pub fn sync_supervisor_scrape(
 
 /// Set [`ChildRegistry`] generation gauge for a named child.
 pub fn set_child_generation(child: &str, generation: u64) {
-    let node = global_node();
-    if let Ok(gauge) = METRICS
-        .supervisor_child_generation
-        .get_metric_with_label_values(&[child, &node])
-    {
-        gauge.set(generation as f64);
-    }
+    metrics_try("set_child_generation", || {
+        let node = global_node();
+        if let Ok(gauge) = METRICS
+            .supervisor_child_generation
+            .get_metric_with_label_values(&[child, &node])
+        {
+            gauge.set(generation as f64);
+        }
+    });
 }
 
 /// Diff storage cumulative counters into Prometheus counters on each scrape/sync.
 pub fn sync_storage_stats(snapshot: &StorageMetricsSnapshot) {
+    metrics_try("sync_storage_stats", || sync_storage_stats_inner(snapshot));
+}
+
+fn sync_storage_stats_inner(snapshot: &StorageMetricsSnapshot) {
     let mut last_map = STORAGE_LAST.lock().unwrap_or_else(|e| e.into_inner());
     let prev = last_map
         .entry(snapshot.node.clone())
@@ -1005,6 +1032,10 @@ fn inc_storage_delta(
 
 /// Record a mesh consistency operation.
 pub fn record_consistency_operation(op: &ConsistencyOpSnapshot) {
+    metrics_try("record_consistency_operation", || record_consistency_operation_inner(op));
+}
+
+fn record_consistency_operation_inner(op: &ConsistencyOpSnapshot) {
     let node = global_node();
     let result = if op.succeeded { "ok" } else { "err" };
     if let Ok(counter) = METRICS.consistency_operations.get_metric_with_label_values(&[
@@ -1039,60 +1070,68 @@ pub fn record_consistency_operation(op: &ConsistencyOpSnapshot) {
 }
 
 fn sync_supervisor_prometheus_gauges() {
-    let state = SUPERVISOR_SCRAPE
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let node = global_node();
-    if let Ok(gauge) = METRICS
-        .supervisor_children_alive
-        .get_metric_with_label_values(&[&node])
-    {
-        gauge.set(state.children_alive as f64);
-    }
-    if let Ok(gauge) = METRICS
-        .supervisor_intensity_remaining
-        .get_metric_with_label_values(&[&node])
-    {
-        gauge.set(
-            state
-                .max_restarts
-                .saturating_sub(state.restarts_in_window) as f64,
-        );
-    }
+    metrics_try("sync_supervisor_prometheus_gauges", || {
+        let state = SUPERVISOR_SCRAPE
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let node = global_node();
+        if let Ok(gauge) = METRICS
+            .supervisor_children_alive
+            .get_metric_with_label_values(&[&node])
+        {
+            gauge.set(state.children_alive as f64);
+        }
+        if let Ok(gauge) = METRICS
+            .supervisor_intensity_remaining
+            .get_metric_with_label_values(&[&node])
+        {
+            gauge.set(
+                state
+                    .max_restarts
+                    .saturating_sub(state.restarts_in_window) as f64,
+            );
+        }
+    });
 }
 
 /// Record a mesh invoke/read dispatch (call at the start of `invoke_consistent` / `read_consistent`).
 pub fn record_mesh_dispatch(service: &str) {
-    let node = global_node();
-    if let Ok(counter) = METRICS
-        .mesh_dispatches
-        .get_metric_with_label_values(&[service, &node])
-    {
-        counter.inc();
-    }
+    metrics_try("record_mesh_dispatch", || {
+        let node = global_node();
+        if let Ok(counter) = METRICS
+            .mesh_dispatches
+            .get_metric_with_label_values(&[service, &node])
+        {
+            counter.inc();
+        }
+    });
 }
 
 /// Record a remote actor send attempt.
 pub fn record_remote_send(target: &str, ok: bool) {
-    let node = global_node();
-    let result = if ok { "ok" } else { "err" };
-    if let Ok(counter) = METRICS
-        .remote_send
-        .get_metric_with_label_values(&[target, result, &node])
-    {
-        counter.inc();
-    }
+    metrics_try("record_remote_send", || {
+        let node = global_node();
+        let result = if ok { "ok" } else { "err" };
+        if let Ok(counter) = METRICS
+            .remote_send
+            .get_metric_with_label_values(&[target, result, &node])
+        {
+            counter.inc();
+        }
+    });
 }
 
 /// Record a `send_with_ack` timeout to a remote actor.
 pub fn record_remote_ack_timeout(target: &str) {
-    let node = global_node();
-    if let Ok(counter) = METRICS
-        .remote_ack_timeouts
-        .get_metric_with_label_values(&[target, &node])
-    {
-        counter.inc();
-    }
+    metrics_try("record_remote_ack_timeout", || {
+        let node = global_node();
+        if let Ok(counter) = METRICS
+            .remote_ack_timeouts
+            .get_metric_with_label_values(&[target, &node])
+        {
+            counter.inc();
+        }
+    });
 }
 
 /// Serve Prometheus text exposition over HTTP (`GET /metrics`, `GET /health`).
@@ -1108,9 +1147,13 @@ pub async fn serve_metrics_http(addr: std::net::SocketAddr) -> std::io::Result<(
             let n = stream.read(&mut buf).await.unwrap_or(0);
             let req = String::from_utf8_lossy(&buf[..n]);
             let (status, body) = if req.starts_with("GET /metrics") {
-                match render_prometheus_text() {
-                    Ok(text) => ("200 OK", text),
-                    Err(e) => ("500 Internal Server Error", format!("render error: {e}")),
+                match catch_unwind(AssertUnwindSafe(render_prometheus_text)) {
+                    Ok(Ok(text)) => ("200 OK", text),
+                    Ok(Err(e)) => ("500 Internal Server Error", format!("render error: {e}")),
+                    Err(_) => (
+                        "500 Internal Server Error",
+                        "metrics render panicked".into(),
+                    ),
                 }
             } else if req.starts_with("GET /health") {
                 ("200 OK", "ok".into())
@@ -1128,11 +1171,14 @@ pub async fn serve_metrics_http(addr: std::net::SocketAddr) -> std::io::Result<(
 
 /// Refresh scrape-time gauges, then render Prometheus text exposition format.
 pub fn render_prometheus_text() -> Result<String, prometheus::Error> {
-    ActorMonitor::global().sync_prometheus_gauges();
+    metrics_try("sync_prometheus_gauges", || {
+        ActorMonitor::global().sync_prometheus_gauges();
+    });
     sync_supervisor_prometheus_gauges();
     let text = METRICS.render()?;
     if let Some(cb) = GLOBAL_CONFIG.get().and_then(|c| c.on_scrape.clone()) {
-        cb(&text);
+        let text_for_cb = text.clone();
+        metrics_try("on_scrape", || cb(&text_for_cb));
     }
     Ok(text)
 }

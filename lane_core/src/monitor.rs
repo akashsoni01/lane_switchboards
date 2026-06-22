@@ -17,13 +17,39 @@
 //!
 //! Counters and histograms are pre-bound per actor at [`ActorMonitor::register`].
 //! Call [`crate::metrics::render_prometheus_text`] to export Grafana-ready text.
+//!
+//! # Fault isolation
+//!
+//! Monitor updates run inside `catch_unwind`; a panic in stats or Prometheus code is
+//! logged and dropped so observability never takes down actors or the rest of the service.
+//! [`RwLock`] poison from a prior panic is recovered via `into_inner()`.
 
 use crate::actor::{ActorId, ExitReason};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use std::panic::{catch_unwind, AssertUnwindSafe};
+
+/// Run monitor work; panics are caught so stats never crash actors or supervisors.
+fn monitor_try<F: FnOnce()>(op: &'static str, f: F) {
+    if catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::warn!(op, "ActorMonitor panicked; stats update dropped");
+    }
+}
+
+/// Like [`monitor_try`] but returns `None` when the closure panics.
+fn monitor_try_value<T, F: FnOnce() -> T>(op: &'static str, f: F) -> Option<T> {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            tracing::warn!(op, "ActorMonitor panicked; stats read dropped");
+            None
+        }
+    }
+}
 
 #[cfg(feature = "metrics")]
 use crate::metrics::PromActorMetrics;
@@ -224,8 +250,28 @@ impl ActorMonitor {
         &MONITOR
     }
 
+    fn cells_read(&self) -> RwLockReadGuard<'_, HashMap<ActorId, Arc<ActorCell>>> {
+        self.cells.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn cells_write(&self) -> RwLockWriteGuard<'_, HashMap<ActorId, Arc<ActorCell>>> {
+        self.cells.write().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn post_mortem_read(&self) -> RwLockReadGuard<'_, HashMap<ActorId, ActorStats>> {
+        self.post_mortem.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn post_mortem_write(&self) -> RwLockWriteGuard<'_, HashMap<ActorId, ActorStats>> {
+        self.post_mortem.write().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn register(&self, id: ActorId, meta: ActorMeta, mailbox_capacity: usize) {
-        self.post_mortem.write().unwrap().remove(&id);
+        monitor_try("register", || self.register_inner(id, meta, mailbox_capacity));
+    }
+
+    fn register_inner(&self, id: ActorId, meta: ActorMeta, mailbox_capacity: usize) {
+        self.post_mortem_write().remove(&id);
         #[cfg(feature = "metrics")]
         let prom = crate::metrics::bind_actor_metrics(&meta, mailbox_capacity);
         #[cfg(not(feature = "metrics"))]
@@ -240,11 +286,15 @@ impl ActorMonitor {
             #[cfg(feature = "metrics")]
             prom,
         });
-        self.cells.write().unwrap().insert(id, cell);
+        self.cells_write().insert(id, cell);
     }
 
     pub fn unregister(&self, id: ActorId, reason: Option<&ExitReason>) {
-        if let Some(cell) = self.cells.write().unwrap().remove(&id) {
+        monitor_try("unregister", || self.unregister_inner(id, reason));
+    }
+
+    fn unregister_inner(&self, id: ActorId, reason: Option<&ExitReason>) {
+        if let Some(cell) = self.cells_write().remove(&id) {
             #[cfg(feature = "metrics")]
             if let (Some(prom), Some(reason)) = (&cell.prom, reason) {
                 crate::metrics::record_exit(prom, reason);
@@ -252,17 +302,20 @@ impl ActorMonitor {
             let mut snapshot = cell.cell_snapshot(id);
             snapshot.in_flight = 0;
             snapshot.mailbox_depth = 0;
-            self.post_mortem.write().unwrap().insert(id, snapshot);
+            self.post_mortem_write().insert(id, snapshot);
         }
     }
 
     pub fn snapshot_and_unregister(&self, id: ActorId) -> Option<ActorStats> {
-        self.post_mortem
-            .write()
-            .unwrap()
+        monitor_try_value("snapshot_and_unregister", || self.snapshot_and_unregister_inner(id))
+            .flatten()
+    }
+
+    fn snapshot_and_unregister_inner(&self, id: ActorId) -> Option<ActorStats> {
+        self.post_mortem_write()
             .remove(&id)
             .or_else(|| {
-                self.cells.write().unwrap().remove(&id).map(|cell| {
+                self.cells_write().remove(&id).map(|cell| {
                     let mut snapshot = cell.cell_snapshot(id);
                     snapshot.in_flight = 0;
                     snapshot.mailbox_depth = 0;
@@ -272,21 +325,29 @@ impl ActorMonitor {
     }
 
     pub fn purge(&self, id: ActorId) {
-        self.post_mortem.write().unwrap().remove(&id);
+        monitor_try("purge", || {
+            self.post_mortem_write().remove(&id);
+        });
     }
 
     pub fn get(&self, id: ActorId) -> Option<ActorStats> {
-        if let Some(cell) = self.cells.read().unwrap().get(&id).cloned() {
+        monitor_try_value("get", || self.get_inner(id)).flatten()
+    }
+
+    fn get_inner(&self, id: ActorId) -> Option<ActorStats> {
+        if let Some(cell) = self.cells_read().get(&id).cloned() {
             return Some(cell.cell_snapshot(id));
         }
-        self.post_mortem.read().unwrap().get(&id).cloned()
+        self.post_mortem_read().get(&id).cloned()
     }
 
     pub fn all(&self) -> Vec<ActorStats> {
+        monitor_try_value("all", || self.all_inner()).unwrap_or_default()
+    }
+
+    fn all_inner(&self) -> Vec<ActorStats> {
         let mut out: Vec<_> = self
-            .cells
-            .read()
-            .unwrap()
+            .cells_read()
             .iter()
             .map(|(&id, cell)| cell.cell_snapshot(id))
             .collect();
@@ -296,24 +357,34 @@ impl ActorMonitor {
 
     /// Increment approximate mailbox queue depth (called after a successful enqueue).
     pub(crate) fn record_mailbox_enqueue(&self, id: ActorId) {
-        if let Some(cell) = self.cell(id) {
-            cell.mailbox_queued.fetch_add(1, Ordering::Relaxed);
-        }
+        monitor_try("record_mailbox_enqueue", || {
+            if let Some(cell) = self.cell(id) {
+                cell.mailbox_queued.fetch_add(1, Ordering::Relaxed);
+            }
+        });
     }
 
     /// Decrement approximate mailbox queue depth (called when the actor dequeues).
     pub(crate) fn record_mailbox_dequeue(&self, id: ActorId) {
-        if let Some(cell) = self.cell(id) {
-            cell.mailbox_queued
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    Some(v.saturating_sub(1))
-                })
-                .ok();
-        }
+        monitor_try("record_mailbox_dequeue", || {
+            if let Some(cell) = self.cell(id) {
+                cell.mailbox_queued
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+            }
+        });
     }
 
     /// Record a rejected mailbox send (full channel or actor exited).
     pub(crate) fn record_mailbox_send_rejected(&self, id: ActorId) {
+        monitor_try("record_mailbox_send_rejected", || {
+            self.record_mailbox_send_rejected_inner(id);
+        });
+    }
+
+    fn record_mailbox_send_rejected_inner(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
             #[cfg(feature = "metrics")]
             if let Some(prom) = &cell.prom {
@@ -325,6 +396,12 @@ impl ActorMonitor {
 
     /// Record an async mailbox send that waited on a full channel.
     pub(crate) fn record_mailbox_send_blocked(&self, id: ActorId) {
+        monitor_try("record_mailbox_send_blocked", || {
+            self.record_mailbox_send_blocked_inner(id);
+        });
+    }
+
+    fn record_mailbox_send_blocked_inner(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
             #[cfg(feature = "metrics")]
             if let Some(prom) = &cell.prom {
@@ -337,24 +414,31 @@ impl ActorMonitor {
     /// Refresh Prometheus gauges from live actor cells (call before scrape).
     #[cfg(feature = "metrics")]
     pub fn sync_prometheus_gauges(&self) {
-        let cells: Vec<_> = self.cells.read().unwrap().values().cloned().collect();
+        monitor_try("sync_prometheus_gauges", || self.sync_prometheus_gauges_inner());
+    }
+
+    #[cfg(feature = "metrics")]
+    fn sync_prometheus_gauges_inner(&self) {
+        let cells: Vec<_> = self.cells_read().values().cloned().collect();
         for cell in cells {
-            let Some(prom) = &cell.prom else { continue };
-            let stats = cell.cell_snapshot(ActorId(0));
-            crate::metrics::sync_scrape_gauges(
-                cell.registered_at,
-                cell.last_handle_unix_ms.load(Ordering::Relaxed),
-                prom,
-                stats.in_flight,
-                stats.last_handle_ms,
-                stats.max_handle_ms,
-                stats.mailbox_depth,
-            );
+            monitor_try("sync_prometheus_gauges_cell", || {
+                let Some(prom) = &cell.prom else { return };
+                let stats = cell.cell_snapshot(ActorId(0));
+                crate::metrics::sync_scrape_gauges(
+                    cell.registered_at,
+                    cell.last_handle_unix_ms.load(Ordering::Relaxed),
+                    prom,
+                    stats.in_flight,
+                    stats.last_handle_ms,
+                    stats.max_handle_ms,
+                    stats.mailbox_depth,
+                );
+            });
         }
     }
 
     fn cell(&self, id: ActorId) -> Option<Arc<ActorCell>> {
-        self.cells.read().unwrap().get(&id).cloned()
+        self.cells_read().get(&id).cloned()
     }
 
     fn sync_in_flight_gauge(cell: &ActorCell) {
@@ -372,6 +456,10 @@ impl ActorMonitor {
     }
 
     pub(crate) fn begin_handle(&self, id: ActorId, mailbox_wait: Duration) {
+        monitor_try("begin_handle", || self.begin_handle_inner(id, mailbox_wait));
+    }
+
+    fn begin_handle_inner(&self, id: ActorId, mailbox_wait: Duration) {
         let Some(cell) = self.cell(id) else { return };
         inc_counter(&cell, &cell.stats.in_flight, "in_flight", id);
         Self::sync_in_flight_gauge(&cell);
@@ -382,6 +470,17 @@ impl ActorMonitor {
     }
 
     pub(crate) fn finish_handle(
+        &self,
+        id: ActorId,
+        elapsed: Duration,
+        slow_threshold: Option<Duration>,
+    ) {
+        monitor_try("finish_handle", || {
+            self.finish_handle_inner(id, elapsed, slow_threshold);
+        });
+    }
+
+    fn finish_handle_inner(
         &self,
         id: ActorId,
         elapsed: Duration,
@@ -439,6 +538,10 @@ impl ActorMonitor {
     }
 
     pub(crate) fn record_error(&self, id: ActorId) {
+        monitor_try("record_error", || self.record_error_inner(id));
+    }
+
+    fn record_error_inner(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
             inc_counter(&cell, &cell.stats.handle_errors, "handle_errors", id);
             cell.stats.dec_in_flight();
@@ -451,6 +554,10 @@ impl ActorMonitor {
     }
 
     pub(crate) fn record_panic(&self, id: ActorId) {
+        monitor_try("record_panic", || self.record_panic_inner(id));
+    }
+
+    fn record_panic_inner(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
             inc_counter(&cell, &cell.stats.panics, "panics", id);
             cell.stats.dec_in_flight();
@@ -463,6 +570,10 @@ impl ActorMonitor {
     }
 
     pub(crate) fn record_timeout(&self, id: ActorId, elapsed: Duration) {
+        monitor_try("record_timeout", || self.record_timeout_inner(id, elapsed));
+    }
+
+    fn record_timeout_inner(&self, id: ActorId, elapsed: Duration) {
         if let Some(cell) = self.cell(id) {
             inc_counter(&cell, &cell.stats.handle_timeouts, "handle_timeouts", id);
             inc_counter(&cell, &cell.stats.messages_handled, "messages_handled", id);
@@ -575,5 +686,10 @@ mod tests {
         );
         let stats = mon.get(id).expect("stats");
         assert_eq!(stats.meta.name.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn monitor_try_swallows_panic_without_propagating() {
+        monitor_try("test_panic", || panic!("monitor must not take down callers"));
     }
 }
