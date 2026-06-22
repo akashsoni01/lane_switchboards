@@ -81,6 +81,18 @@ bug or panic in stats/Prometheus code cannot crash actors or the rest of the ser
 
 Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { features = ["metrics"] }`.
 
+Metrics are split under `lane_core/src/metrics/`:
+
+| Module | Registry | When registered |
+|--------|----------|-----------------|
+| `actor` | `ActorMetricsRegistry` | Always (spawn hot path) |
+| `supervisor` | `SupervisorMetricsRegistry` | First supervisor metric call |
+| `mesh` | `MeshMetricsRegistry` | First mesh/consistency call |
+| `remote` | `RemoteMetricsRegistry` | First remote send call |
+| `storage` | `StorageMetricsRegistry` | First storage sync call |
+
+All domains share one Prometheus [`Registry`](https://docs.rs/prometheus) via `MetricsHub`; optional domains use lazy `OnceCell` init so actor-only binaries only pay for actor series at startup.
+
 | API | Role |
 |-----|------|
 | `ActorConfig::monitor_meta` | Set `actor_name`, `actor_type`, etc. at spawn |
