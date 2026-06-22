@@ -39,7 +39,7 @@ Core OTP actor primitives for the **lane_switchboards** runtime.
 
 | Type | Role |
 |------|------|
-| `ActorConfig` | `mailbox_capacity`, `handle_timeout`, `slow_handle_threshold` |
+| `ActorConfig` | `mailbox_capacity`, `handle_timeout`, `slow_handle_threshold`, `monitor_enabled` |
 | `DistributedConfig` | gRPC/distributed tuning (ack timeout, TLS) |
 | `DedicatedRuntime` | Owned multi-thread Tokio runtime for actor isolation |
 | `RuntimeOptions` | `worker_threads` for `DedicatedRuntime` |
@@ -100,6 +100,8 @@ lane_core = { path = "lane_core", features = ["monitor"] }
 lane_switchboards = { path = ".", features = ["metrics"] }
 ```
 
+Per-actor opt-out (`monitor_enabled: false` or `.without_monitor()`) skips counters and enqueue timestamps for that actor only.
+
 Metrics are split under `lane_core/src/metrics/`:
 
 | Module | Registry | When registered |
@@ -114,6 +116,7 @@ All domains share one Prometheus [`Registry`](https://docs.rs/prometheus) via `M
 
 | API | Role |
 |-----|------|
+| `monitor_enabled` | Per-actor opt-out when `monitor` feature is on (default `true`) |
 | `ActorConfig::monitor_meta` | Set `actor_name`, `actor_type`, etc. at spawn |
 | `init_metrics(MetricsConfig)` | Process-wide `node` / `dc` labels |
 | `render_prometheus_text()` | Grafana-ready text exposition |

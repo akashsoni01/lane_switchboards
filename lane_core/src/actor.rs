@@ -18,11 +18,15 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-/// Compile-time no-op when the `monitor` feature is disabled.
-macro_rules! if_monitor {
-    ($($body:tt)*) => {
+/// Per-actor monitor hook — no-op when `monitor` feature is off or `$enabled` is false.
+macro_rules! if_actor_monitor {
+    ($enabled:expr, $($body:tt)*) => {
         #[cfg(feature = "monitor")]
-        { $($body)* }
+        {
+            if $enabled {
+                $($body)*
+            }
+        }
     };
 }
 
@@ -42,21 +46,40 @@ impl<M: Send + Sync + 'static> MailboxItem<M> {
     }
 }
 
+/// Mailbox queue element: tracked (stats on) or plain envelope (stats off).
 #[cfg(feature = "monitor")]
-type QueueItem<M> = MailboxItem<M>;
+pub(crate) enum QueueItem<M: Send + Sync + 'static> {
+    Tracked(MailboxItem<M>),
+    Plain(Envelope<M>),
+}
+
 #[cfg(not(feature = "monitor"))]
 type QueueItem<M> = Envelope<M>;
 
 #[cfg(not(feature = "monitor"))]
 #[inline(always)]
-fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>) -> QueueItem<M> {
+fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>, _track: bool) -> QueueItem<M> {
     envelope
 }
 
 #[cfg(feature = "monitor")]
 #[inline(always)]
-fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>) -> QueueItem<M> {
-    MailboxItem::new(envelope)
+fn queue_item<M: Send + Sync + 'static>(envelope: Envelope<M>, track: bool) -> QueueItem<M> {
+    if track {
+        QueueItem::Tracked(MailboxItem::new(envelope))
+    } else {
+        QueueItem::Plain(envelope)
+    }
+}
+
+#[cfg(feature = "monitor")]
+fn split_queue_item<M: Send + Sync + 'static>(
+    item: QueueItem<M>,
+) -> (Envelope<M>, Duration) {
+    match item {
+        QueueItem::Tracked(t) => (t.envelope, t.enqueued_at.elapsed()),
+        QueueItem::Plain(e) => (e, Duration::ZERO),
+    }
 }
 
 static ACTOR_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -261,6 +284,7 @@ where
 pub struct ActorRef<M: Send + Sync + 'static> {
     pub id: ActorId,
     tx: mpsc::Sender<QueueItem<M>>,
+    track_stats: bool,
 }
 
 impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
@@ -268,31 +292,32 @@ impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
         Self {
             id: self.id,
             tx: self.tx.clone(),
+            track_stats: self.track_stats,
         }
     }
 }
 
 impl<M: Send + Sync + 'static> ActorRef<M> {
     fn on_mailbox_enqueue_ok(&self) {
-        if_monitor! {
+        if_actor_monitor!(self.track_stats, {
             ActorMonitor::global().record_mailbox_enqueue(self.id);
-        }
+        });
     }
 
     fn on_mailbox_send_failed(&self) {
-        if_monitor! {
+        if_actor_monitor!(self.track_stats, {
             ActorMonitor::global().record_mailbox_send_rejected(self.id);
-        }
+        });
     }
 
     async fn mailbox_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
         #[cfg(feature = "metrics")]
-        if self.tx.capacity() == 0 {
-            if_monitor! {
+        if self.track_stats && self.tx.capacity() == 0 {
+            if_actor_monitor!(true, {
                 ActorMonitor::global().record_mailbox_send_blocked(self.id);
-            }
+            });
         }
-        match self.tx.send(queue_item(envelope)).await {
+        match self.tx.send(queue_item(envelope, self.track_stats)).await {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();
                 Ok(())
@@ -305,7 +330,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     }
 
     fn mailbox_try_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
-        match self.tx.try_send(queue_item(envelope)) {
+        match self.tx.try_send(queue_item(envelope, self.track_stats)) {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();
                 Ok(())
@@ -419,14 +444,19 @@ where
     A: Actor<M> + Send + Sync + 'static,
 {
     let id = ActorId::new();
+    let track_stats = config.tracks_monitor_stats();
     let (tx, rx) = mpsc::channel::<QueueItem<M>>(config.mailbox_capacity);
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(config.mailbox_capacity);
-    let actor_ref = ActorRef { id, tx: tx.clone() };
+    let actor_ref = ActorRef {
+        id,
+        tx: tx.clone(),
+        track_stats,
+    };
 
     register_actor(id, control_tx, supervisor_tx);
-    if_monitor! {
+    if_actor_monitor!(track_stats, {
         ActorMonitor::global().register(id, config.monitor_meta.clone(), config.mailbox_capacity);
-    }
+    });
 
     let boxed = into_dyn_actor(actor);
     let config = config.clone();
@@ -498,15 +528,16 @@ async fn run_actor<M: Send + Sync + 'static>(
     let mut monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)> = Vec::new();
     let mut exit_reason = ExitReason::Normal;
     let mut actor_version: u32 = 0;
+    let track_stats = config.tracks_monitor_stats();
 
     if let Err(e) = actor.dyn_pre_start().await {
         tracing::error!(%id, error = %e, "pre_start failed");
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         unregister_actor(id);
-        if_monitor! {
+        if_actor_monitor!(track_stats, {
             ActorMonitor::global().unregister(id, Some(&reason));
-        }
+        });
         return;
     }
 
@@ -534,17 +565,17 @@ async fn run_actor<M: Send + Sync + 'static>(
             }
             envelope = rx.recv() => {
                 let Some(item) = envelope else { break 'actor_loop };
-                if_monitor! {
+                if_actor_monitor!(track_stats, {
                     ActorMonitor::global().record_mailbox_dequeue(id);
-                }
+                });
                 #[cfg(feature = "monitor")]
                 {
-                    let mailbox_wait = item.enqueued_at.elapsed();
-                    match item.envelope {
+                    let (envelope, mailbox_wait) = split_queue_item(item);
+                    match envelope {
                         Envelope::Msg(m) => {
-                            if let Some(reason) =
-                                handle_message(id, &mut actor, m, &config, mailbox_wait).await
-                            {
+                            if let Some(reason) = handle_message(
+                                id, &mut actor, m, &config, mailbox_wait, track_stats,
+                            ).await {
                                 exit_reason = reason;
                                 break 'actor_loop;
                             }
@@ -565,7 +596,7 @@ async fn run_actor<M: Send + Sync + 'static>(
                     match item {
                         Envelope::Msg(m) => {
                             if let Some(reason) = handle_message(
-                                id, &mut actor, m, &config, Duration::ZERO,
+                                id, &mut actor, m, &config, Duration::ZERO, false,
                             ).await {
                                 exit_reason = reason;
                                 break 'actor_loop;
@@ -586,7 +617,7 @@ async fn run_actor<M: Send + Sync + 'static>(
         }
     }
 
-    finish_actor(id, actor, exit_reason, &links, monitors).await;
+    finish_actor(id, actor, exit_reason, &links, monitors, track_stats).await;
 }
 
 async fn handle_message<M: Send + Sync + 'static>(
@@ -594,20 +625,20 @@ async fn handle_message<M: Send + Sync + 'static>(
     actor: &mut Box<dyn DynActor<M>>,
     msg: M,
     config: &ActorConfig,
-    #[cfg_attr(not(feature = "monitor"), allow(unused_variables))]
     mailbox_wait: Duration,
+    track_stats: bool,
 ) -> Option<ExitReason> {
     let started = Instant::now();
-    if_monitor! {
+    if_actor_monitor!(track_stats, {
         ActorMonitor::global().begin_handle(id, mailbox_wait);
-    }
+    });
 
     // NOTE: on_handle_begin failure is fatal — it terminates the actor.
     // If you want non-fatal journaling, return Ok(()) and log internally.
     if let Err(e) = actor.dyn_on_handle_begin(&msg).await {
-        if_monitor! {
+        if_actor_monitor!(track_stats, {
             ActorMonitor::global().record_error(id);
-        }
+        });
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         return Some(reason);
@@ -623,9 +654,9 @@ async fn handle_message<M: Send + Sync + 'static>(
             Ok(inner) => inner,
             Err(_) => {
                 let elapsed = started.elapsed();
-                if_monitor! {
+                if_actor_monitor!(track_stats, {
                     ActorMonitor::global().record_timeout(id, elapsed);
-                }
+                });
                 let ctx = HandleStuckContext {
                     actor_id: id,
                     elapsed,
@@ -648,27 +679,27 @@ async fn handle_message<M: Send + Sync + 'static>(
 
     match handle_result {
         Ok(Ok(())) => {
-            if_monitor! {
+            if_actor_monitor!(track_stats, {
                 ActorMonitor::global().finish_handle(
                     id,
                     started.elapsed(),
                     config.effective_slow_threshold(),
                 );
-            }
+            });
             None
         }
         Ok(Err(e)) => {
-            if_monitor! {
+            if_actor_monitor!(track_stats, {
                 ActorMonitor::global().record_error(id);
-            }
+            });
             let reason = ExitReason::Error(e.to_string());
             notify_supervisor(id, &reason).await;
             Some(reason)
         }
         Err(_) => {
-            if_monitor! {
+            if_actor_monitor!(track_stats, {
                 ActorMonitor::global().record_panic(id);
-            }
+            });
             let reason = ExitReason::Error("panic in handle".into());
             notify_supervisor(id, &reason).await;
             Some(reason)
@@ -682,6 +713,7 @@ async fn finish_actor<M: Send + Sync + 'static>(
     exit_reason: ExitReason,
     links: &HashSet<ActorId>,
     monitors: Vec<(ActorId, oneshot::Sender<ExitReason>)>,
+    track_stats: bool,
 ) {
     let _ = actor.dyn_post_stop().await;
     for (_, notify) in monitors {
@@ -691,9 +723,9 @@ async fn finish_actor<M: Send + Sync + 'static>(
         propagate_linked_exit(id, &exit_reason, links).await;
     }
     unregister_actor(id);
-    if_monitor! {
+    if_actor_monitor!(track_stats, {
         ActorMonitor::global().unregister(id, Some(&exit_reason));
-    }
+    });
 }
 
 fn should_propagate_linked_exit(reason: &ExitReason) -> bool {

@@ -16,6 +16,10 @@ pub struct ActorConfig {
     /// Log + count handles that finish successfully but exceed this duration.
     /// Defaults to `handle_timeout` when set; `None` disables slow-handle warnings.
     pub slow_handle_threshold: Option<Duration>,
+    /// When `false`, skip [`crate::monitor::ActorMonitor`] on this actor's hot path
+    /// (no counter updates, no per-message enqueue timestamps). Only applies when the
+    /// `monitor` Cargo feature is enabled; ignored otherwise.
+    pub monitor_enabled: bool,
     /// Labels for [`crate::monitor::ActorMonitor`] / Prometheus export.
     pub monitor_meta: crate::monitor::ActorMeta,
 }
@@ -26,6 +30,7 @@ impl Default for ActorConfig {
             mailbox_capacity: 64,
             handle_timeout: None,
             slow_handle_threshold: None,
+            monitor_enabled: true,
             monitor_meta: crate::monitor::ActorMeta::default(),
         }
     }
@@ -35,6 +40,18 @@ impl ActorConfig {
     /// Threshold used when recording slow successful handles.
     pub fn effective_slow_threshold(&self) -> Option<Duration> {
         self.slow_handle_threshold.or(self.handle_timeout)
+    }
+
+    /// Disable in-process stats for this actor (requires `monitor` feature).
+    pub fn without_monitor(mut self) -> Self {
+        self.monitor_enabled = false;
+        self
+    }
+
+    /// Whether this actor should update [`crate::monitor::ActorMonitor`].
+    #[inline(always)]
+    pub fn tracks_monitor_stats(&self) -> bool {
+        cfg!(feature = "monitor") && self.monitor_enabled
     }
 }
 

@@ -277,3 +277,34 @@ async fn handle_timeout_triggers_stuck_recovery_and_stats() {
 
     join.await.expect("join");
 }
+
+#[tokio::test]
+#[cfg(feature = "monitor")]
+async fn monitor_disabled_actor_skips_stats() {
+    use lane_switchboards::actor::{spawn_with_config, Actor, ActorProcessingErr};
+    use lane_switchboards::config::ActorConfig;
+    use lane_switchboards::monitor::ActorMonitor;
+
+    struct Nop;
+
+    #[async_trait::async_trait]
+    impl Actor<()> for Nop {
+        async fn handle(&mut self, (): ()) -> Result<(), ActorProcessingErr> {
+            Ok(())
+        }
+    }
+
+    let config = ActorConfig::default().without_monitor();
+    let (actor, join) = spawn_with_config(Nop, None, &config)
+        .await
+        .expect("spawn");
+
+    actor.send(()).await.expect("send");
+    assert!(
+        ActorMonitor::global().get(actor.id).is_none(),
+        "monitor_enabled=false should not register stats"
+    );
+
+    actor.stop().await.expect("stop");
+    join.await.expect("join");
+}
