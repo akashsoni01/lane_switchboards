@@ -19,4 +19,8 @@ pub mod metrics;
 pub use monitor::{ActorMeta, ActorMonitor, ActorStats};
 
 #[cfg(feature = "metrics")]
-pub use metrics::{exit_reason_label, init_metrics, render_prometheus_text, MetricsConfig};
+pub use metrics::{
+    exit_reason_label, init_metrics, record_consistency_operation, render_prometheus_text,
+    restart_strategy_label, set_child_generation, sync_storage_stats, ConsistencyOpSnapshot,
+    MetricsConfig, StorageMetricsSnapshot,
+};

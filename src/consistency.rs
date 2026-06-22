@@ -449,6 +449,12 @@ pub(crate) fn emit_metrics(
             succeeded,
         });
     }
+    crate::metrics::record_consistency_operation(&crate::metrics::ConsistencyOpSnapshot {
+        service: service.to_string(),
+        consistency_level: format!("{consistency_level:?}"),
+        succeeded,
+        duration_ms: duration.as_millis() as u64,
+    });
 }
 
 #[cfg(test)]

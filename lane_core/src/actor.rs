@@ -231,11 +231,25 @@ impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
 }
 
 impl<M: Send + Sync + 'static> ActorRef<M> {
+    fn on_mailbox_enqueue_ok(&self) {
+        ActorMonitor::global().record_mailbox_enqueue(self.id);
+    }
+
+    fn on_mailbox_send_failed(&self) {
+        ActorMonitor::global().record_mailbox_send_rejected(self.id);
+    }
+
     pub async fn send(&self, msg: M) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Msg(msg))
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        match self.tx.send(Envelope::Msg(msg)).await {
+            Ok(()) => {
+                self.on_mailbox_enqueue_ok();
+                Ok(())
+            }
+            Err(e) => {
+                self.on_mailbox_send_failed();
+                Err(Box::new(e) as ActorProcessingErr)
+            }
+        }
     }
 
     /// Enqueue a message without `.await` — for sync callers.
@@ -243,9 +257,16 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     /// Uses [`mpsc::Sender::try_send`]: returns immediately, or with an error if
     /// the mailbox is full or the actor has exited.
     pub fn send_sync(&self, msg: M) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .try_send(Envelope::Msg(msg))
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        match self.tx.try_send(Envelope::Msg(msg)) {
+            Ok(()) => {
+                self.on_mailbox_enqueue_ok();
+                Ok(())
+            }
+            Err(e) => {
+                self.on_mailbox_send_failed();
+                Err(Box::new(e) as ActorProcessingErr)
+            }
+        }
     }
 
     pub async fn stop(&self) -> Result<(), ActorProcessingErr> {
@@ -419,6 +440,7 @@ async fn run_actor<M: Send + Sync + 'static>(
             }
             envelope = rx.recv() => {
                 let Some(envelope) = envelope else { break 'actor_loop };
+                ActorMonitor::global().record_mailbox_dequeue(id);
                 match envelope {
                     Envelope::Msg(m) => {
                         if let Some(reason) = handle_message(id, &mut actor, m, &config).await {

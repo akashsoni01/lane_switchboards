@@ -1,0 +1,137 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "targets": [
+        {
+          "expr": "sum(rate(lane_actor_messages_handled_total[5m]))",
+          "legendFormat": "messages/sec",
+          "refId": "A"
+        }
+      ],
+      "title": "Actor message rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le, actor_name))",
+          "legendFormat": "p95 {{actor_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Handle latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [
+        {
+          "expr": "sum(lane_actor_in_flight)",
+          "legendFormat": "in flight",
+          "refId": "A"
+        }
+      ],
+      "title": "In-flight handles",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "id": 4,
+      "targets": [
+        {
+          "expr": "sum(lane_actor_mailbox_depth)",
+          "legendFormat": "queue depth",
+          "refId": "A"
+        }
+      ],
+      "title": "Mailbox depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "id": 5,
+      "targets": [
+        {
+          "expr": "sum(rate(lane_actor_handle_timeouts_total[5m]))",
+          "legendFormat": "timeouts/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(lane_actor_panics_total[5m]))",
+          "legendFormat": "panics/sec",
+          "refId": "B"
+        }
+      ],
+      "title": "Failures",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 6,
+      "targets": [
+        {
+          "expr": "sum(rate(lane_supervisor_restarts_total[15m])) by (child)",
+          "legendFormat": "{{child}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Supervisor restarts",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 7,
+      "targets": [
+        {
+          "expr": "lane_supervisor_restart_intensity_remaining",
+          "legendFormat": "remaining",
+          "refId": "A"
+        },
+        {
+          "expr": "lane_supervisor_children_alive",
+          "legendFormat": "children alive",
+          "refId": "B"
+        }
+      ],
+      "title": "Supervisor health",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["lane", "actors"],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "Prometheus", "value": "Prometheus" }
+      }
+    ]
+  },
+  "time": { "from": "now-15m", "to": "now" },
+  "title": "Lane Actor Runtime",
+  "uid": "lane-actor-runtime",
+  "version": 1
+}

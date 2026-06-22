@@ -122,6 +122,9 @@ pub struct ActorStats {
     /// `0` when no messages have been handled yet.
     pub mean_handle_ms: usize,
     pub slow_handles: usize,
+    /// Approximate messages waiting in the actor mailbox.
+    pub mailbox_depth: usize,
+    pub mailbox_capacity: usize,
 }
 
 struct StatsCell {
@@ -168,6 +171,8 @@ impl StatsCell {
             total_handle_ms,
             mean_handle_ms,
             slow_handles: self.slow_handles.load(Ordering::Relaxed),
+            mailbox_depth: 0,
+            mailbox_capacity: 0,
         }
     }
 
@@ -186,7 +191,7 @@ struct ActorCell {
     registered_at: Instant,
     last_handle_unix_ms: AtomicU64,
     mailbox_capacity: usize,
-    #[allow(dead_code)]
+    mailbox_queued: AtomicUsize,
     #[cfg(feature = "metrics")]
     prom: Option<PromActorMetrics>,
 }
@@ -196,6 +201,15 @@ struct ActorCell {
 pub struct ActorMonitor {
     cells: Arc<RwLock<HashMap<ActorId, Arc<ActorCell>>>>,
     post_mortem: Arc<RwLock<HashMap<ActorId, ActorStats>>>,
+}
+
+impl ActorCell {
+    fn cell_snapshot(&self, id: ActorId) -> ActorStats {
+        let mut snapshot = self.stats.snapshot(id, &self.meta);
+        snapshot.mailbox_depth = self.mailbox_queued.load(Ordering::Relaxed);
+        snapshot.mailbox_capacity = self.mailbox_capacity;
+        snapshot
+    }
 }
 
 impl ActorMonitor {
@@ -222,6 +236,7 @@ impl ActorMonitor {
             registered_at: Instant::now(),
             last_handle_unix_ms: AtomicU64::new(0),
             mailbox_capacity,
+            mailbox_queued: AtomicUsize::new(0),
             #[cfg(feature = "metrics")]
             prom,
         });
@@ -234,8 +249,9 @@ impl ActorMonitor {
             if let (Some(prom), Some(reason)) = (&cell.prom, reason) {
                 crate::metrics::record_exit(prom, reason);
             }
-            let mut snapshot = cell.stats.snapshot(id, &cell.meta);
+            let mut snapshot = cell.cell_snapshot(id);
             snapshot.in_flight = 0;
+            snapshot.mailbox_depth = 0;
             self.post_mortem.write().unwrap().insert(id, snapshot);
         }
     }
@@ -247,8 +263,9 @@ impl ActorMonitor {
             .remove(&id)
             .or_else(|| {
                 self.cells.write().unwrap().remove(&id).map(|cell| {
-                    let mut snapshot = cell.stats.snapshot(id, &cell.meta);
+                    let mut snapshot = cell.cell_snapshot(id);
                     snapshot.in_flight = 0;
+                    snapshot.mailbox_depth = 0;
                     snapshot
                 })
             })
@@ -260,7 +277,7 @@ impl ActorMonitor {
 
     pub fn get(&self, id: ActorId) -> Option<ActorStats> {
         if let Some(cell) = self.cells.read().unwrap().get(&id).cloned() {
-            return Some(cell.stats.snapshot(id, &cell.meta));
+            return Some(cell.cell_snapshot(id));
         }
         self.post_mortem.read().unwrap().get(&id).cloned()
     }
@@ -271,10 +288,39 @@ impl ActorMonitor {
             .read()
             .unwrap()
             .iter()
-            .map(|(&id, cell)| cell.stats.snapshot(id, &cell.meta))
+            .map(|(&id, cell)| cell.cell_snapshot(id))
             .collect();
         out.sort_by_key(|s| s.actor_id.0);
         out
+    }
+
+    /// Increment approximate mailbox queue depth (called after a successful enqueue).
+    pub(crate) fn record_mailbox_enqueue(&self, id: ActorId) {
+        if let Some(cell) = self.cell(id) {
+            cell.mailbox_queued.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Decrement approximate mailbox queue depth (called when the actor dequeues).
+    pub(crate) fn record_mailbox_dequeue(&self, id: ActorId) {
+        if let Some(cell) = self.cell(id) {
+            cell.mailbox_queued
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(1))
+                })
+                .ok();
+        }
+    }
+
+    /// Record a rejected mailbox send (full channel or actor exited).
+    pub(crate) fn record_mailbox_send_rejected(&self, id: ActorId) {
+        if let Some(cell) = self.cell(id) {
+            #[cfg(feature = "metrics")]
+            if let Some(prom) = &cell.prom {
+                prom.mailbox_send_rejected.inc();
+            }
+            let _ = cell;
+        }
     }
 
     /// Refresh Prometheus gauges from live actor cells (call before scrape).
@@ -283,7 +329,7 @@ impl ActorMonitor {
         let cells: Vec<_> = self.cells.read().unwrap().values().cloned().collect();
         for cell in cells {
             let Some(prom) = &cell.prom else { continue };
-            let stats = cell.stats.snapshot(ActorId(0), &cell.meta);
+            let stats = cell.cell_snapshot(ActorId(0));
             crate::metrics::sync_scrape_gauges(
                 cell.registered_at,
                 cell.last_handle_unix_ms.load(Ordering::Relaxed),
@@ -291,7 +337,7 @@ impl ActorMonitor {
                 stats.in_flight,
                 stats.last_handle_ms,
                 stats.max_handle_ms,
-                0,
+                stats.mailbox_depth,
             );
         }
     }
@@ -465,6 +511,7 @@ mod tests {
             registered_at: Instant::now(),
             last_handle_unix_ms: AtomicU64::new(0),
             mailbox_capacity: 64,
+            mailbox_queued: AtomicUsize::new(0),
             #[cfg(feature = "metrics")]
             prom: None,
         });
@@ -488,6 +535,18 @@ mod tests {
         let cell = StatsCell::new();
         cell.dec_in_flight();
         assert_eq!(cell.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn mailbox_depth_tracks_enqueue_dequeue() {
+        let mon = ActorMonitor::new();
+        let id = ActorId(5);
+        mon.register(id, ActorMeta::default(), 8);
+        mon.record_mailbox_enqueue(id);
+        mon.record_mailbox_enqueue(id);
+        assert_eq!(mon.get(id).expect("stats").mailbox_depth, 2);
+        mon.record_mailbox_dequeue(id);
+        assert_eq!(mon.get(id).expect("stats").mailbox_depth, 1);
     }
 
     #[test]

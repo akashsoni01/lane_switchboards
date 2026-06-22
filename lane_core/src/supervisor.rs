@@ -334,7 +334,14 @@ where
                 .clone()
                 .with_name(format!("{name:?}"));
             let (actor_ref, _) = spawn_on_runtime(&handle, build(), Some(sup_tx), &cfg).await?;
+            let name_for_gen = name.clone();
             registry.track_and_bump(name, actor_ref.clone()).await;
+            #[cfg(feature = "metrics")]
+            {
+                let child_label = format!("{name_for_gen:?}");
+                let gen = registry.generation(&name_for_gen).await;
+                crate::metrics::set_child_generation(&child_label, gen);
+            }
             Ok(actor_ref)
         })
     })
@@ -429,6 +436,9 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
             tokio::time::sleep(settle).await;
         }
 
+        #[cfg(feature = "metrics")]
+        crate::metrics::sync_supervisor_scrape(0, config.max_restarts, initial_refs.len());
+
         let config_clone = config.clone();
         let mut current_refs = initial_refs.clone();
 
@@ -458,6 +468,10 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                             match config_clone.intensity_action {
                                 IntensityAction::ShutdownSupervisor => {
                                     tracing::error!("supervisor restart intensity exceeded — shutting down");
+                                    #[cfg(feature = "metrics")]
+                                    crate::metrics::record_intensity_exceeded(
+                                        IntensityAction::ShutdownSupervisor,
+                                    );
                                     for actor_ref in current_refs.iter().rev() {
                                         let _ = actor_ref.stop().await;
                                     }
@@ -465,6 +479,10 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                 }
                                 IntensityAction::AbandonChild => {
                                     tracing::warn!(child = %signal.child_id, "abandoning child after intensity breach");
+                                    #[cfg(feature = "metrics")]
+                                    crate::metrics::record_intensity_exceeded(
+                                        IntensityAction::AbandonChild,
+                                    );
                                     if let Some(slot) = slots.iter_mut().find(|s| s.id() == signal.child_id) {
                                         slot.set_id(ActorId::DEAD);
                                     }
@@ -482,6 +500,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                         idx,
                                         &tx,
                                         &actor_config_loop,
+                                        config_clone.strategy,
                                     )
                                     .await;
                                 }
@@ -494,6 +513,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                         idx,
                                         &tx,
                                         &actor_config_loop,
+                                        config_clone.strategy,
                                     )
                                     .await;
                                 }
@@ -512,12 +532,20 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                             idx,
                                             &tx,
                                             &actor_config_loop,
+                                            config_clone.strategy,
                                         )
                                         .await;
                                     }
                                 }
                             }
                         }
+
+                        #[cfg(feature = "metrics")]
+                        crate::metrics::sync_supervisor_scrape(
+                            restart_log.len(),
+                            config_clone.max_restarts,
+                            current_refs.len(),
+                        );
                     }
                 }
             }
@@ -538,6 +566,7 @@ async fn restart_child<M: Send + Sync + 'static>(
     idx: usize,
     tx: &mpsc::Sender<RestartSignal>,
     actor_config: &ActorConfig,
+    strategy: RestartStrategy,
 ) {
     let child_id = slots[idx].id();
     let sup_tx = tx.clone();
@@ -546,6 +575,15 @@ async fn restart_child<M: Send + Sync + 'static>(
             slots[idx].set_id(actor_ref.id);
             current_refs[idx] = actor_ref.clone();
             tracing::info!(child = %actor_ref.id, "supervisor restarted child");
+            #[cfg(feature = "metrics")]
+            {
+                use crate::monitor::ActorMonitor;
+                let child = ActorMonitor::global()
+                    .get(actor_ref.id)
+                    .and_then(|s| s.meta.name)
+                    .unwrap_or_else(|| actor_ref.id.to_string());
+                crate::metrics::record_supervisor_restart(&child, strategy);
+            }
         }
         Err(e) => {
             tracing::error!(

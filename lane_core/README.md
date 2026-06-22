@@ -83,6 +83,10 @@ Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { f
 | `ActorConfig::monitor_meta` | Set `actor_name`, `actor_type`, etc. at spawn |
 | `init_metrics(MetricsConfig)` | Process-wide `node` / `dc` labels |
 | `render_prometheus_text()` | Grafana-ready text exposition |
+| `record_supervisor_restart` / `sync_supervisor_scrape` | Supervisor restart + intensity gauges |
+| `set_child_generation` | `ChildRegistry` generation gauge |
+| `sync_storage_stats` | Diff `StorageStats` into Prometheus counters |
+| `record_consistency_operation` | Mesh consistency (auto via `emit_metrics`) |
 
 ```bash
 cargo run --example metrics_exporter --features metrics

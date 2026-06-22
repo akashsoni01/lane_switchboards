@@ -5,11 +5,14 @@
 
 use crate::actor::ExitReason;
 use crate::monitor::{ActorMeta, ActorMonitor};
+use crate::supervisor::{IntensityAction, RestartStrategy};
 use once_cell::sync::{Lazy, OnceCell};
 use prometheus::{
     Encoder, Gauge, Histogram, IntCounter, Opts, Registry, TextEncoder,
     HistogramOpts, HistogramVec, IntCounterVec,
 };
+use std::collections::HashMap;
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Process-wide label defaults applied when [`ActorMeta`] fields are unset.
@@ -57,6 +60,7 @@ pub(crate) struct PromActorMetrics {
     pub max_handle_seconds: Gauge,
     pub mailbox_capacity: Gauge,
     pub mailbox_depth: Gauge,
+    pub mailbox_send_rejected: IntCounter,
     pub handle_duration: Histogram,
     pub uptime_seconds: Gauge,
     pub idle_seconds: Gauge,
@@ -83,6 +87,25 @@ struct MetricsRegistry {
     uptime_seconds: prometheus::GaugeVec,
     idle_seconds: prometheus::GaugeVec,
     alive: prometheus::GaugeVec,
+    mailbox_send_rejected: IntCounterVec,
+    // --- supervisor ---
+    supervisor_restarts: IntCounterVec,
+    supervisor_intensity_exceeded: IntCounterVec,
+    supervisor_children_alive: prometheus::GaugeVec,
+    supervisor_intensity_remaining: prometheus::GaugeVec,
+    supervisor_child_generation: prometheus::GaugeVec,
+    // --- storage (counters synced from snapshots) ---
+    storage_puts: IntCounterVec,
+    storage_gets: IntCounterVec,
+    storage_deletes: IntCounterVec,
+    storage_read_repairs: IntCounterVec,
+    storage_paxos_writes: IntCounterVec,
+    storage_quorum_failures: IntCounterVec,
+    storage_wal_bytes: IntCounterVec,
+    storage_tombstones: prometheus::GaugeVec,
+    // --- consistency ---
+    consistency_operations: IntCounterVec,
+    consistency_duration: HistogramVec,
 }
 
 static METRICS: Lazy<MetricsRegistry> = Lazy::new(MetricsRegistry::new);
@@ -250,6 +273,183 @@ impl MetricsRegistry {
             .register(Box::new(alive.clone()))
             .expect("register alive");
 
+        let mailbox_send_rejected = IntCounterVec::new(
+            Opts::new(
+                "lane_actor_mailbox_send_rejected_total",
+                "Mailbox sends rejected (full or actor exited)",
+            ),
+            ACTOR_LABEL_NAMES,
+        )
+        .expect("lane_actor_mailbox_send_rejected_total");
+        registry
+            .register(Box::new(mailbox_send_rejected.clone()))
+            .expect("register mailbox_send_rejected");
+
+        let node_label = &["node"];
+        let supervisor_restarts = IntCounterVec::new(
+            Opts::new(
+                "lane_supervisor_restarts_total",
+                "Supervised child restarts",
+            ),
+            &["child", "strategy", "node"],
+        )
+        .expect("lane_supervisor_restarts_total");
+        registry
+            .register(Box::new(supervisor_restarts.clone()))
+            .expect("register supervisor_restarts");
+
+        let supervisor_intensity_exceeded = IntCounterVec::new(
+            Opts::new(
+                "lane_supervisor_intensity_exceeded_total",
+                "Restart intensity limit breached",
+            ),
+            &["action", "node"],
+        )
+        .expect("lane_supervisor_intensity_exceeded_total");
+        registry
+            .register(Box::new(supervisor_intensity_exceeded.clone()))
+            .expect("register supervisor_intensity_exceeded");
+
+        let supervisor_children_alive = prometheus::GaugeVec::new(
+            Opts::new(
+                "lane_supervisor_children_alive",
+                "Currently live children under the supervisor",
+            ),
+            node_label,
+        )
+        .expect("lane_supervisor_children_alive");
+        registry
+            .register(Box::new(supervisor_children_alive.clone()))
+            .expect("register supervisor_children_alive");
+
+        let supervisor_intensity_remaining = prometheus::GaugeVec::new(
+            Opts::new(
+                "lane_supervisor_restart_intensity_remaining",
+                "Restart budget remaining in the current window",
+            ),
+            node_label,
+        )
+        .expect("lane_supervisor_restart_intensity_remaining");
+        registry
+            .register(Box::new(supervisor_intensity_remaining.clone()))
+            .expect("register supervisor_intensity_remaining");
+
+        let supervisor_child_generation = prometheus::GaugeVec::new(
+            Opts::new(
+                "lane_supervisor_child_generation",
+                "Child restart generation from ChildRegistry",
+            ),
+            &["child", "node"],
+        )
+        .expect("lane_supervisor_child_generation");
+        registry
+            .register(Box::new(supervisor_child_generation.clone()))
+            .expect("register supervisor_child_generation");
+
+        let storage_node_label = &["node"];
+        let storage_puts = IntCounterVec::new(
+            Opts::new("lane_storage_puts_total", "Storage put operations"),
+            storage_node_label,
+        )
+        .expect("lane_storage_puts_total");
+        registry
+            .register(Box::new(storage_puts.clone()))
+            .expect("register storage_puts");
+
+        let storage_gets = IntCounterVec::new(
+            Opts::new("lane_storage_gets_total", "Storage get operations"),
+            storage_node_label,
+        )
+        .expect("lane_storage_gets_total");
+        registry
+            .register(Box::new(storage_gets.clone()))
+            .expect("register storage_gets");
+
+        let storage_deletes = IntCounterVec::new(
+            Opts::new("lane_storage_deletes_total", "Storage delete operations"),
+            storage_node_label,
+        )
+        .expect("lane_storage_deletes_total");
+        registry
+            .register(Box::new(storage_deletes.clone()))
+            .expect("register storage_deletes");
+
+        let storage_read_repairs = IntCounterVec::new(
+            Opts::new("lane_storage_read_repairs_total", "Read repair operations"),
+            storage_node_label,
+        )
+        .expect("lane_storage_read_repairs_total");
+        registry
+            .register(Box::new(storage_read_repairs.clone()))
+            .expect("register storage_read_repairs");
+
+        let storage_paxos_writes = IntCounterVec::new(
+            Opts::new("lane_storage_paxos_writes_total", "Paxos write rounds"),
+            storage_node_label,
+        )
+        .expect("lane_storage_paxos_writes_total");
+        registry
+            .register(Box::new(storage_paxos_writes.clone()))
+            .expect("register storage_paxos_writes");
+
+        let storage_quorum_failures = IntCounterVec::new(
+            Opts::new(
+                "lane_storage_quorum_failures_total",
+                "Quorum failures on storage operations",
+            ),
+            storage_node_label,
+        )
+        .expect("lane_storage_quorum_failures_total");
+        registry
+            .register(Box::new(storage_quorum_failures.clone()))
+            .expect("register storage_quorum_failures");
+
+        let storage_wal_bytes = IntCounterVec::new(
+            Opts::new(
+                "lane_storage_wal_bytes_written_total",
+                "WAL bytes appended",
+            ),
+            storage_node_label,
+        )
+        .expect("lane_storage_wal_bytes_written_total");
+        registry
+            .register(Box::new(storage_wal_bytes.clone()))
+            .expect("register storage_wal_bytes");
+
+        let storage_tombstones = prometheus::GaugeVec::new(
+            Opts::new("lane_storage_tombstone_count", "Live tombstone records"),
+            storage_node_label,
+        )
+        .expect("lane_storage_tombstone_count");
+        registry
+            .register(Box::new(storage_tombstones.clone()))
+            .expect("register storage_tombstones");
+
+        let consistency_operations = IntCounterVec::new(
+            Opts::new(
+                "lane_consistency_operations_total",
+                "Mesh consistency operations",
+            ),
+            &["service", "level", "result", "node"],
+        )
+        .expect("lane_consistency_operations_total");
+        registry
+            .register(Box::new(consistency_operations.clone()))
+            .expect("register consistency_operations");
+
+        let consistency_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "lane_consistency_duration_seconds",
+                "Mesh consistency operation wall time",
+            )
+            .buckets(vec![0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]),
+            &["service", "level", "node"],
+        )
+        .expect("lane_consistency_duration_seconds");
+        registry
+            .register(Box::new(consistency_duration.clone()))
+            .expect("register consistency_duration");
+
         Self {
             registry,
             messages_handled,
@@ -268,6 +468,22 @@ impl MetricsRegistry {
             uptime_seconds,
             idle_seconds,
             alive,
+            mailbox_send_rejected,
+            supervisor_restarts,
+            supervisor_intensity_exceeded,
+            supervisor_children_alive,
+            supervisor_intensity_remaining,
+            supervisor_child_generation,
+            storage_puts,
+            storage_gets,
+            storage_deletes,
+            storage_read_repairs,
+            storage_paxos_writes,
+            storage_quorum_failures,
+            storage_wal_bytes,
+            storage_tombstones,
+            consistency_operations,
+            consistency_duration,
         }
     }
 
@@ -323,6 +539,10 @@ impl MetricsRegistry {
                 .ok()?,
             mailbox_depth: self
                 .mailbox_depth
+                .get_metric_with_label_values(&label_refs)
+                .ok()?,
+            mailbox_send_rejected: self
+                .mailbox_send_rejected
                 .get_metric_with_label_values(&label_refs)
                 .ok()?,
             handle_duration: self
@@ -464,9 +684,226 @@ pub fn exit_reason_label(reason: &ExitReason) -> &'static str {
     }
 }
 
+/// Map [`RestartStrategy`] to a bounded Prometheus label.
+pub fn restart_strategy_label(strategy: RestartStrategy) -> &'static str {
+    match strategy {
+        RestartStrategy::OneForOne => "one_for_one",
+        RestartStrategy::OneForAll => "one_for_all",
+        RestartStrategy::RestForOne => "rest_for_one",
+    }
+}
+
+fn intensity_action_label(action: IntensityAction) -> &'static str {
+    match action {
+        IntensityAction::ShutdownSupervisor => "shutdown_supervisor",
+        IntensityAction::AbandonChild => "abandon_child",
+    }
+}
+
+#[derive(Default, Clone)]
+struct SupervisorScrapeState {
+    restarts_in_window: usize,
+    max_restarts: usize,
+    children_alive: usize,
+}
+
+static SUPERVISOR_SCRAPE: Lazy<RwLock<SupervisorScrapeState>> =
+    Lazy::new(|| RwLock::new(SupervisorScrapeState::default()));
+
+#[derive(Debug, Clone, Default)]
+pub struct StorageMetricsSnapshot {
+    pub node: String,
+    pub puts_total: u64,
+    pub gets_total: u64,
+    pub deletes_total: u64,
+    pub read_repairs: u64,
+    pub paxos_writes: u64,
+    pub quorum_failures: u64,
+    pub wal_bytes_written: u64,
+    pub tombstone_count: u64,
+}
+
+static STORAGE_LAST: Lazy<Mutex<HashMap<String, StorageMetricsSnapshot>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot of a mesh consistency operation for Prometheus export.
+#[derive(Debug, Clone)]
+pub struct ConsistencyOpSnapshot {
+    pub service: String,
+    pub consistency_level: String,
+    pub succeeded: bool,
+    pub duration_ms: u64,
+}
+
+/// Record a supervised child restart.
+pub fn record_supervisor_restart(child: &str, strategy: RestartStrategy) {
+    let node = global_node();
+    let strategy = restart_strategy_label(strategy);
+    if let Ok(counter) = METRICS
+        .supervisor_restarts
+        .get_metric_with_label_values(&[child, strategy, &node])
+    {
+        counter.inc();
+    }
+}
+
+/// Record restart-intensity limit breach.
+pub fn record_intensity_exceeded(action: IntensityAction) {
+    let node = global_node();
+    let action = intensity_action_label(action);
+    if let Ok(counter) = METRICS
+        .supervisor_intensity_exceeded
+        .get_metric_with_label_values(&[action, &node])
+    {
+        counter.inc();
+    }
+}
+
+/// Update supervisor scrape gauges (call from the supervisor loop).
+pub fn sync_supervisor_scrape(
+    restarts_in_window: usize,
+    max_restarts: usize,
+    children_alive: usize,
+) {
+    if let Ok(mut state) = SUPERVISOR_SCRAPE.write() {
+        state.restarts_in_window = restarts_in_window;
+        state.max_restarts = max_restarts;
+        state.children_alive = children_alive;
+    }
+}
+
+/// Set [`ChildRegistry`] generation gauge for a named child.
+pub fn set_child_generation(child: &str, generation: u64) {
+    let node = global_node();
+    if let Ok(gauge) = METRICS
+        .supervisor_child_generation
+        .get_metric_with_label_values(&[child, &node])
+    {
+        gauge.set(generation as f64);
+    }
+}
+
+/// Diff storage cumulative counters into Prometheus counters on each scrape/sync.
+pub fn sync_storage_stats(snapshot: &StorageMetricsSnapshot) {
+    let mut last_map = STORAGE_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = last_map
+        .entry(snapshot.node.clone())
+        .or_insert_with(|| snapshot.clone());
+    let node = &snapshot.node;
+
+    inc_storage_delta(
+        &METRICS.storage_puts,
+        node,
+        snapshot.puts_total,
+        &mut prev.puts_total,
+    );
+    inc_storage_delta(
+        &METRICS.storage_gets,
+        node,
+        snapshot.gets_total,
+        &mut prev.gets_total,
+    );
+    inc_storage_delta(
+        &METRICS.storage_deletes,
+        node,
+        snapshot.deletes_total,
+        &mut prev.deletes_total,
+    );
+    inc_storage_delta(
+        &METRICS.storage_read_repairs,
+        node,
+        snapshot.read_repairs,
+        &mut prev.read_repairs,
+    );
+    inc_storage_delta(
+        &METRICS.storage_paxos_writes,
+        node,
+        snapshot.paxos_writes,
+        &mut prev.paxos_writes,
+    );
+    inc_storage_delta(
+        &METRICS.storage_quorum_failures,
+        node,
+        snapshot.quorum_failures,
+        &mut prev.quorum_failures,
+    );
+    inc_storage_delta(
+        &METRICS.storage_wal_bytes,
+        node,
+        snapshot.wal_bytes_written,
+        &mut prev.wal_bytes_written,
+    );
+
+    if let Ok(gauge) = METRICS
+        .storage_tombstones
+        .get_metric_with_label_values(&[node.as_str()])
+    {
+        gauge.set(snapshot.tombstone_count as f64);
+    }
+}
+
+fn inc_storage_delta(
+    vec: &IntCounterVec,
+    node: &str,
+    current: u64,
+    prev: &mut u64,
+) {
+    if current > *prev {
+        if let Ok(counter) = vec.get_metric_with_label_values(&[node]) {
+            counter.inc_by(current - *prev);
+        }
+        *prev = current;
+    }
+}
+
+/// Record a mesh consistency operation.
+pub fn record_consistency_operation(op: &ConsistencyOpSnapshot) {
+    let node = global_node();
+    let result = if op.succeeded { "ok" } else { "err" };
+    if let Ok(counter) = METRICS.consistency_operations.get_metric_with_label_values(&[
+        &op.service,
+        &op.consistency_level,
+        result,
+        &node,
+    ]) {
+        counter.inc();
+    }
+    if let Ok(hist) = METRICS.consistency_duration.get_metric_with_label_values(&[
+        &op.service,
+        &op.consistency_level,
+        &node,
+    ]) {
+        hist.observe(op.duration_ms as f64 / 1000.0);
+    }
+}
+
+fn sync_supervisor_prometheus_gauges() {
+    let state = SUPERVISOR_SCRAPE
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let node = global_node();
+    if let Ok(gauge) = METRICS
+        .supervisor_children_alive
+        .get_metric_with_label_values(&[&node])
+    {
+        gauge.set(state.children_alive as f64);
+    }
+    if let Ok(gauge) = METRICS
+        .supervisor_intensity_remaining
+        .get_metric_with_label_values(&[&node])
+    {
+        gauge.set(
+            state
+                .max_restarts
+                .saturating_sub(state.restarts_in_window) as f64,
+        );
+    }
+}
+
 /// Refresh scrape-time gauges, then render Prometheus text exposition format.
 pub fn render_prometheus_text() -> Result<String, prometheus::Error> {
     ActorMonitor::global().sync_prometheus_gauges();
+    sync_supervisor_prometheus_gauges();
     METRICS.render()
 }
 
@@ -487,9 +924,9 @@ mod tests {
     }
 
     #[test]
-    fn render_prometheus_text_contains_help() {
+    fn render_prometheus_text_contains_supervisor_series() {
+        record_supervisor_restart("worker", RestartStrategy::OneForOne);
         let body = render_prometheus_text().expect("render");
-        assert!(body.contains("lane_actor_messages_handled_total"));
-        assert!(body.contains("# HELP"));
+        assert!(body.contains("lane_supervisor_restarts_total"));
     }
 }
