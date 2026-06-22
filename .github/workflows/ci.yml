@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Default features
+        run: cargo test --workspace
+      - name: Metrics feature
+        run: |
+          cargo test --workspace --features metrics
+          cargo test --features metrics --test metrics_export
+          cargo check --examples --features metrics -p lane_switchboards
+
+  promtool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Prometheus alert rules
+        run: |
+          docker run --rm -v "${{ github.workspace }}/docs/grafana:/etc/prometheus" \
+            prom/prometheus:v2.54.1 \
+            promtool check rules /etc/prometheus/alerts.yml

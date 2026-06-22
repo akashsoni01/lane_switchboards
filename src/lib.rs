@@ -61,10 +61,10 @@ pub use monitor::{ActorMeta, ActorMonitor, ActorStats};
 pub use lane_core::metrics;
 #[cfg(feature = "metrics")]
 pub use metrics::{
-    exit_reason_label, init_metrics, record_consistency_operation, record_remote_ack_timeout,
-    record_remote_send, render_prometheus_text, restart_strategy_label, serve_metrics_http,
-    set_child_generation, sync_storage_stats, ConsistencyOpSnapshot, MetricsConfig,
-    StorageMetricsSnapshot,
+    exit_reason_label, init_metrics, record_consistency_operation, record_mesh_dispatch,
+    record_remote_ack_timeout, record_remote_send, render_prometheus_text, restart_strategy_label,
+    serve_metrics_http, set_child_generation, sync_storage_stats, ConsistencyOpSnapshot,
+    MetricsConfig, StorageMetricsSnapshot,
 };
 pub use distributed::{
     serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime, Cluster, ClusterMember,

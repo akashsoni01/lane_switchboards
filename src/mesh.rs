@@ -295,6 +295,9 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     where
         M: Clone,
     {
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_mesh_dispatch(service);
+
         let config = self.config_for(service);
         let start = std::time::Instant::now();
         let span = tracing::info_span!(
@@ -426,6 +429,9 @@ impl<M: RemoteMessage> ServiceMesh<M> {
     where
         M: Clone,
     {
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_mesh_dispatch(service);
+
         let config = self.config_for(service);
         let start = std::time::Instant::now();
         let span = tracing::info_span!(

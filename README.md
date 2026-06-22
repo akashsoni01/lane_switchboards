@@ -320,6 +320,30 @@ Optional **rustls** via [`TlsConfig`](src/config.rs) PEM fields. Plain HTTP/2 is
 
 See [`tls_distributed.md`](examples/tls_distributed.md) (`cargo run --example tls_distributed --features tls`) and [`docs/wire_protocol.md`](docs/wire_protocol.md).
 
+## Grafana / Prometheus (`feature = "metrics"`)
+
+Optional Prometheus text exposition for [`ActorMonitor`](lane_core/src/monitor.rs) counters, supervisor restarts, mesh consistency, storage, and remote actor dispatches.
+
+| Piece | Location |
+|-------|----------|
+| Export API | `lane_core/src/metrics.rs` — `render_prometheus_text()`, `serve_metrics_http()` |
+| Example exporter | `cargo run --example metrics_exporter --features metrics` → `http://127.0.0.1:9090/metrics` |
+| Dashboard JSON | [`docs/grafana/actor-runtime.json`](docs/grafana/actor-runtime.json) |
+| Docker stack | `docker compose -f docs/grafana/docker-compose.yml up` — Prometheus **:9091**, Grafana **:3000** |
+| Alert rules | [`docs/grafana/alerts.yml`](docs/grafana/alerts.yml) |
+| Series mapping | [`lane_core/README.md`](lane_core/README.md#prometheus-series-mapping) |
+
+Set process labels once at startup:
+
+```rust
+use lane_switchboards::metrics::{init_metrics, MetricsConfig};
+
+init_metrics(MetricsConfig {
+    node: Some("node-a".into()),
+    ..Default::default()
+});
+```
+
 ## gRPC service mesh
 
 Microservices over gRPC with a **control plane** (`MeshRegistry`) and **data plane** (`ActorMessaging` bidi `Deliver` streams).

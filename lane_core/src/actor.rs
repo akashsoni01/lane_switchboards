@@ -255,6 +255,9 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     }
 
     async fn mailbox_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
+        if self.tx.capacity() == 0 {
+            ActorMonitor::global().record_mailbox_send_blocked(self.id);
+        }
         match self.tx.send(MailboxItem::new(envelope)).await {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();

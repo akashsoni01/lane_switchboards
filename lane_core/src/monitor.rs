@@ -323,6 +323,17 @@ impl ActorMonitor {
         }
     }
 
+    /// Record an async mailbox send that waited on a full channel.
+    pub(crate) fn record_mailbox_send_blocked(&self, id: ActorId) {
+        if let Some(cell) = self.cell(id) {
+            #[cfg(feature = "metrics")]
+            if let Some(prom) = &cell.prom {
+                prom.mailbox_send_blocked.inc();
+            }
+            let _ = cell;
+        }
+    }
+
     /// Refresh Prometheus gauges from live actor cells (call before scrape).
     #[cfg(feature = "metrics")]
     pub fn sync_prometheus_gauges(&self) {

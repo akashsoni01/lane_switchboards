@@ -454,6 +454,8 @@ pub(crate) fn emit_metrics(
         consistency_level: format!("{consistency_level:?}"),
         succeeded,
         duration_ms: duration.as_millis() as u64,
+        acks_required,
+        acks_received,
     });
 }
 

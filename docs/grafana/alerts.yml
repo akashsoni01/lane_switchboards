@@ -8,7 +8,7 @@ groups:
           severity: warning
         annotations:
           summary: Actor handle may be deadlocked
-          description: One or more actors have in_flight > 0 for 30s.
+          description: See examples/handle_timeout_calculator_timer.md — check in_flight and handle_timeout settings.
 
       - alert: LaneActorHandleTimeouts
         expr: sum(rate(lane_actor_handle_timeouts_total[5m])) > 0
@@ -45,3 +45,4 @@ groups:
           severity: warning
         annotations:
           summary: Actor stat counter hit usize::MAX
+          description: See examples/resilient_monitor.md — counters are saturating; investigate runaway loops.

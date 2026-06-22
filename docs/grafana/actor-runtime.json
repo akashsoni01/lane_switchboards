@@ -1,15 +1,49 @@
 {
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "enable": true,
+        "expr": "ALERTS{alertname=~\"Lane.*\"}",
+        "iconColor": "red",
+        "name": "Lane alerts",
+        "tagKeys": "alertname,severity",
+        "titleFormat": "{{alertname}}"
+      }
+    ]
+  },
   "editable": true,
   "fiscalYearStartMonth": 0,
-  "graphTooltip": 0,
+  "graphTooltip": 1,
   "id": null,
-  "links": [],
+  "links": [
+    {
+      "title": "resilient_monitor runbook",
+      "type": "link",
+      "url": "https://github.com/didl/lane_switchboards/blob/main/examples/resilient_monitor.md",
+      "targetBlank": true
+    },
+    {
+      "title": "handle_timeout runbook",
+      "type": "link",
+      "url": "https://github.com/didl/lane_switchboards/blob/main/examples/handle_timeout_calculator_timer.md",
+      "targetBlank": true
+    }
+  ],
   "panels": [
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
       "id": 1,
       "targets": [
         {
@@ -23,27 +57,55 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
-      "id": 2,
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "max": 1, "min": 0 },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "id": 8,
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le, actor_name))",
-          "legendFormat": "p95 {{actor_name}}",
+          "expr": "sum(rate(lane_actor_handle_errors_total[5m]) + rate(lane_actor_panics_total[5m]) + rate(lane_actor_handle_timeouts_total[5m])) / clamp_min(sum(rate(lane_actor_messages_handled_total[5m])), 1e-9)",
+          "legendFormat": "error ratio",
           "refId": "A"
         }
       ],
-      "title": "Handle latency p95",
+      "title": "Handle error ratio",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "id": 2,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le, actor_name))",
+          "legendFormat": "p50 {{actor_name}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le, actor_name))",
+          "legendFormat": "p95 {{actor_name}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le, actor_name))",
+          "legendFormat": "p99 {{actor_name}}",
+          "refId": "C"
+        }
+      ],
+      "title": "Handle latency percentiles",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
       "id": 3,
       "targets": [
         {
-          "expr": "sum(lane_actor_in_flight)",
-          "legendFormat": "in flight",
+          "expr": "sum(lane_actor_in_flight) by (actor_name)",
+          "legendFormat": "{{actor_name}}",
           "refId": "A"
         }
       ],
@@ -52,21 +114,40 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 8 },
       "id": 4,
       "targets": [
         {
-          "expr": "sum(lane_actor_mailbox_depth)",
-          "legendFormat": "queue depth",
+          "expr": "lane_actor_mailbox_depth / clamp_min(lane_actor_mailbox_capacity, 1)",
+          "legendFormat": "{{actor_name}}",
           "refId": "A"
         }
       ],
-      "title": "Mailbox depth",
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "max": 1 },
+        "overrides": []
+      },
+      "title": "Mailbox depth % of capacity",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "id": 9,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lane_actor_mailbox_wait_seconds_bucket[5m])) by (le, actor_name))",
+          "legendFormat": "p95 {{actor_name}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mailbox wait p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
       "id": 5,
       "targets": [
         {
@@ -78,14 +159,19 @@
           "expr": "sum(rate(lane_actor_panics_total[5m]))",
           "legendFormat": "panics/sec",
           "refId": "B"
+        },
+        {
+          "expr": "sum(rate(lane_actor_slow_handles_total[5m]))",
+          "legendFormat": "slow/sec",
+          "refId": "C"
         }
       ],
-      "title": "Failures",
+      "title": "Failures & slow handles",
       "type": "timeseries"
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
       "id": 6,
       "targets": [
         {
@@ -99,7 +185,7 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
       "id": 7,
       "targets": [
         {
@@ -114,6 +200,69 @@
         }
       ],
       "title": "Supervisor health",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "id": 10,
+      "targets": [
+        {
+          "expr": "sum(increase(lane_actor_exits_total[1h])) by (reason)",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "options": { "legend": { "displayMode": "list", "placement": "right" } },
+      "title": "Exit reasons (1h)",
+      "type": "piechart"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
+      "id": 11,
+      "targets": [
+        {
+          "expr": "sum(rate(lane_mesh_dispatches_total[5m])) by (service)",
+          "legendFormat": "{{service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Mesh dispatch rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
+      "id": 12,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(lane_consistency_duration_seconds_bucket[5m])) by (le, service))",
+          "legendFormat": "p95 {{service}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Consistency op latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "id": 13,
+      "targets": [
+        {
+          "expr": "sum(rate(lane_storage_quorum_failures_total[5m]))",
+          "legendFormat": "quorum failures/sec",
+          "refId": "A"
+        },
+        {
+          "expr": "rate(lane_storage_wal_bytes_written_total[5m])",
+          "legendFormat": "WAL bytes/sec",
+          "refId": "B"
+        }
+      ],
+      "title": "Storage quorum & WAL",
       "type": "timeseries"
     }
   ],
@@ -133,5 +282,5 @@
   "time": { "from": "now-15m", "to": "now" },
   "title": "Lane Actor Runtime",
   "uid": "lane-actor-runtime",
-  "version": 1
+  "version": 2
 }

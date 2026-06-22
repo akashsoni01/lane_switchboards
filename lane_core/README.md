@@ -89,12 +89,39 @@ Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { f
 | `StorageNode::export_prometheus_stats` | Convenience wrapper in `lane_switchboards` |
 | `record_consistency_operation` | Mesh consistency (auto via `emit_metrics`) |
 | `record_remote_send` / `record_remote_ack_timeout` | gRPC remote actor dispatches |
+| `record_mesh_dispatch` | Mesh `invoke_consistent` / `read_consistent` entry |
 | `serve_metrics_http(addr)` | Standalone `/metrics` HTTP server |
+| `MetricsConfig::on_scrape` | Optional callback after each scrape render |
 
 ```bash
 cargo run --example metrics_exporter --features metrics
 # scrape http://127.0.0.1:9090/metrics
 ```
+
+Import [`docs/grafana/actor-runtime.json`](../docs/grafana/actor-runtime.json) into Grafana, or run `docker compose -f docs/grafana/docker-compose.yml up` (Prometheus on host **9091**, Grafana on **3000**).
+
+### Prometheus series mapping
+
+| `ActorStats` field | Prometheus series |
+|--------------------|-------------------|
+| `messages_handled` | `lane_actor_messages_handled_total` |
+| `handle_errors` | `lane_actor_handle_errors_total` |
+| `panics` | `lane_actor_panics_total` |
+| `handle_timeouts` | `lane_actor_handle_timeouts_total` |
+| `slow_handles` | `lane_actor_slow_handles_total` |
+| `in_flight` | `lane_actor_in_flight` (gauge) |
+| `last_handle_ms` | `lane_actor_last_handle_seconds` |
+| `max_handle_ms` | `lane_actor_max_handle_seconds` |
+| `mailbox_depth` | `lane_actor_mailbox_depth` |
+| `mailbox_capacity` | `lane_actor_mailbox_capacity` |
+| (on exit) | `lane_actor_exits_total{reason}` |
+| (saturate) | `lane_actor_counter_saturated_total{field}` |
+| handle wall time | `lane_actor_handle_duration_seconds` (histogram) |
+| mailbox queue wait | `lane_actor_mailbox_wait_seconds` (histogram) |
+| full-channel async send | `lane_actor_mailbox_send_blocked_total` |
+| rejected try_send | `lane_actor_mailbox_send_rejected_total` |
+
+Use histogram quantiles in Grafana — not `mean_handle_ms` — for latency SLOs.
 
 See [`docs/todo.md`](../docs/todo.md) for the full Grafana roadmap.
 

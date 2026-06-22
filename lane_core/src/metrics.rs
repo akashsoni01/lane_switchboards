@@ -16,11 +16,24 @@ use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Process-wide label defaults applied when [`ActorMeta`] fields are unset.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct MetricsConfig {
     pub node: Option<String>,
     pub dc: Option<String>,
     pub environment: Option<String>,
+    /// Optional hook invoked after each successful [`render_prometheus_text`] (push sinks, logging).
+    pub on_scrape: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for MetricsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsConfig")
+            .field("node", &self.node)
+            .field("dc", &self.dc)
+            .field("environment", &self.environment)
+            .field("on_scrape", &self.on_scrape.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
 }
 
 static GLOBAL_CONFIG: OnceCell<MetricsConfig> = OnceCell::new();
@@ -61,6 +74,7 @@ pub(crate) struct PromActorMetrics {
     pub mailbox_capacity: Gauge,
     pub mailbox_depth: Gauge,
     pub mailbox_send_rejected: IntCounter,
+    pub mailbox_send_blocked: IntCounter,
     pub mailbox_wait: Histogram,
     pub handle_duration: Histogram,
     pub uptime_seconds: Gauge,
@@ -89,7 +103,10 @@ struct MetricsRegistry {
     idle_seconds: prometheus::GaugeVec,
     alive: prometheus::GaugeVec,
     mailbox_send_rejected: IntCounterVec,
+    mailbox_send_blocked: IntCounterVec,
     mailbox_wait: HistogramVec,
+    // --- mesh ---
+    mesh_dispatches: IntCounterVec,
     // --- remote ---
     remote_send: IntCounterVec,
     remote_ack_timeouts: IntCounterVec,
@@ -111,6 +128,8 @@ struct MetricsRegistry {
     // --- consistency ---
     consistency_operations: IntCounterVec,
     consistency_duration: HistogramVec,
+    consistency_acks_required: HistogramVec,
+    consistency_acks_received: HistogramVec,
 }
 
 static METRICS: Lazy<MetricsRegistry> = Lazy::new(MetricsRegistry::new);
@@ -290,6 +309,18 @@ impl MetricsRegistry {
             .register(Box::new(mailbox_send_rejected.clone()))
             .expect("register mailbox_send_rejected");
 
+        let mailbox_send_blocked = IntCounterVec::new(
+            Opts::new(
+                "lane_actor_mailbox_send_blocked_total",
+                "Async mailbox sends that waited on a full channel",
+            ),
+            ACTOR_LABEL_NAMES,
+        )
+        .expect("lane_actor_mailbox_send_blocked_total");
+        registry
+            .register(Box::new(mailbox_send_blocked.clone()))
+            .expect("register mailbox_send_blocked");
+
         let mailbox_wait = HistogramVec::new(
             HistogramOpts::new(
                 "lane_actor_mailbox_wait_seconds",
@@ -304,6 +335,18 @@ impl MetricsRegistry {
         registry
             .register(Box::new(mailbox_wait.clone()))
             .expect("register mailbox_wait");
+
+        let mesh_dispatches = IntCounterVec::new(
+            Opts::new(
+                "lane_mesh_dispatches_total",
+                "Mesh invoke_consistent / read_consistent dispatches",
+            ),
+            &["service", "node"],
+        )
+        .expect("lane_mesh_dispatches_total");
+        registry
+            .register(Box::new(mesh_dispatches.clone()))
+            .expect("register mesh_dispatches");
 
         let remote_send = IntCounterVec::new(
             Opts::new(
@@ -503,6 +546,32 @@ impl MetricsRegistry {
             .register(Box::new(consistency_duration.clone()))
             .expect("register consistency_duration");
 
+        let consistency_acks_required = HistogramVec::new(
+            HistogramOpts::new(
+                "lane_consistency_acks_required",
+                "Acknowledgements required per consistency operation",
+            )
+            .buckets(vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0, 15.0, 31.0]),
+            &["service", "level", "node"],
+        )
+        .expect("lane_consistency_acks_required");
+        registry
+            .register(Box::new(consistency_acks_required.clone()))
+            .expect("register consistency_acks_required");
+
+        let consistency_acks_received = HistogramVec::new(
+            HistogramOpts::new(
+                "lane_consistency_acks_received",
+                "Acknowledgements received per consistency operation",
+            )
+            .buckets(vec![0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 9.0, 15.0, 31.0]),
+            &["service", "level", "node"],
+        )
+        .expect("lane_consistency_acks_received");
+        registry
+            .register(Box::new(consistency_acks_received.clone()))
+            .expect("register consistency_acks_received");
+
         Self {
             registry,
             messages_handled,
@@ -522,7 +591,9 @@ impl MetricsRegistry {
             idle_seconds,
             alive,
             mailbox_send_rejected,
+            mailbox_send_blocked,
             mailbox_wait,
+            mesh_dispatches,
             remote_send,
             remote_ack_timeouts,
             supervisor_restarts,
@@ -541,6 +612,8 @@ impl MetricsRegistry {
             storage_live_records,
             consistency_operations,
             consistency_duration,
+            consistency_acks_required,
+            consistency_acks_received,
         }
     }
 
@@ -600,6 +673,10 @@ impl MetricsRegistry {
                 .ok()?,
             mailbox_send_rejected: self
                 .mailbox_send_rejected
+                .get_metric_with_label_values(&label_refs)
+                .ok()?,
+            mailbox_send_blocked: self
+                .mailbox_send_blocked
                 .get_metric_with_label_values(&label_refs)
                 .ok()?,
             mailbox_wait: self
@@ -795,6 +872,8 @@ pub struct ConsistencyOpSnapshot {
     pub consistency_level: String,
     pub succeeded: bool,
     pub duration_ms: u64,
+    pub acks_required: usize,
+    pub acks_received: usize,
 }
 
 /// Record a supervised child restart.
@@ -943,6 +1022,20 @@ pub fn record_consistency_operation(op: &ConsistencyOpSnapshot) {
     ]) {
         hist.observe(op.duration_ms as f64 / 1000.0);
     }
+    if let Ok(hist) = METRICS.consistency_acks_required.get_metric_with_label_values(&[
+        &op.service,
+        &op.consistency_level,
+        &node,
+    ]) {
+        hist.observe(op.acks_required as f64);
+    }
+    if let Ok(hist) = METRICS.consistency_acks_received.get_metric_with_label_values(&[
+        &op.service,
+        &op.consistency_level,
+        &node,
+    ]) {
+        hist.observe(op.acks_received as f64);
+    }
 }
 
 fn sync_supervisor_prometheus_gauges() {
@@ -965,6 +1058,17 @@ fn sync_supervisor_prometheus_gauges() {
                 .max_restarts
                 .saturating_sub(state.restarts_in_window) as f64,
         );
+    }
+}
+
+/// Record a mesh invoke/read dispatch (call at the start of `invoke_consistent` / `read_consistent`).
+pub fn record_mesh_dispatch(service: &str) {
+    let node = global_node();
+    if let Ok(counter) = METRICS
+        .mesh_dispatches
+        .get_metric_with_label_values(&[service, &node])
+    {
+        counter.inc();
     }
 }
 
@@ -1026,7 +1130,11 @@ pub async fn serve_metrics_http(addr: std::net::SocketAddr) -> std::io::Result<(
 pub fn render_prometheus_text() -> Result<String, prometheus::Error> {
     ActorMonitor::global().sync_prometheus_gauges();
     sync_supervisor_prometheus_gauges();
-    METRICS.render()
+    let text = METRICS.render()?;
+    if let Some(cb) = GLOBAL_CONFIG.get().and_then(|c| c.on_scrape.clone()) {
+        cb(&text);
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -1050,5 +1158,12 @@ mod tests {
         record_supervisor_restart("worker", RestartStrategy::OneForOne);
         let body = render_prometheus_text().expect("render");
         assert!(body.contains("lane_supervisor_restarts_total"));
+    }
+
+    #[test]
+    fn render_prometheus_text_contains_mesh_dispatch_series() {
+        record_mesh_dispatch("orders");
+        let body = render_prometheus_text().expect("render");
+        assert!(body.contains("lane_mesh_dispatches_total"));
     }
 }
