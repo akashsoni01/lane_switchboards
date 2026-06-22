@@ -1,0 +1,47 @@
+groups:
+  - name: lane_actor_alerts
+    rules:
+      - alert: LaneActorInFlightStuck
+        expr: sum(lane_actor_in_flight) > 0
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: Actor handle may be deadlocked
+          description: One or more actors have in_flight > 0 for 30s.
+
+      - alert: LaneActorHandleTimeouts
+        expr: sum(rate(lane_actor_handle_timeouts_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Sustained actor handle timeouts
+
+      - alert: LaneSupervisorRestartStorm
+        expr: sum(rate(lane_supervisor_restarts_total[15m])) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Supervisor restart storm
+
+      - alert: LaneMailboxBackpressure
+        expr: |
+          sum(lane_actor_mailbox_depth)
+          /
+          clamp_min(sum(lane_actor_mailbox_capacity), 1)
+          > 0.9
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Actor mailbox over 90% full
+
+      - alert: LaneCounterSaturated
+        expr: sum(rate(lane_actor_counter_saturated_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: Actor stat counter hit usize::MAX

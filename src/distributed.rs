@@ -216,18 +216,26 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
                 guard.as_ref().map(|s| s.request_tx.clone())
             };
             let Some(tx) = tx else {
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_remote_send(&self.target, false);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotConnected,
                     "deliver stream unavailable",
                 ));
             };
             match tx.send(request.clone()).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_remote_send(&self.target, true);
+                    return Ok(());
+                }
                 Err(_) if attempt == 0 => {
                     self.invalidate_stream().await;
                     continue;
                 }
                 Err(_) => {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_remote_send(&self.target, false);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::NotConnected,
                         "deliver stream closed",
@@ -235,6 +243,8 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
                 }
             }
         }
+        #[cfg(feature = "metrics")]
+        crate::metrics::record_remote_send(&self.target, false);
         Err(std::io::Error::new(
             std::io::ErrorKind::NotConnected,
             "deliver send failed",
@@ -306,13 +316,28 @@ impl<M: RemoteMessage> RemoteActorRef<M> {
             }
 
             return match tokio::time::timeout(timeout, ack_rx).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(ConsistencyError::NotEnoughAcks {
-                    required: 1,
-                    received: 0,
-                    dc: None,
-                }),
-                Err(_) => Err(ConsistencyError::Timeout { after: timeout }),
+                Ok(Ok(result)) => {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_remote_send(&self.target, result.is_ok());
+                    result
+                }
+                Ok(Err(_)) => {
+                    #[cfg(feature = "metrics")]
+                    crate::metrics::record_remote_send(&self.target, false);
+                    Err(ConsistencyError::NotEnoughAcks {
+                        required: 1,
+                        received: 0,
+                        dc: None,
+                    })
+                }
+                Err(_) => {
+                    #[cfg(feature = "metrics")]
+                    {
+                        crate::metrics::record_remote_send(&self.target, false);
+                        crate::metrics::record_remote_ack_timeout(&self.target);
+                    }
+                    Err(ConsistencyError::Timeout { after: timeout })
+                }
             };
         }
 

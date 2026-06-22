@@ -75,6 +75,21 @@ pub struct HandleStuckContext {
     pub limit: Duration,
 }
 
+/// Item in the actor mailbox queue (carries enqueue time for wait metrics).
+pub(crate) struct MailboxItem<M: Send + Sync + 'static> {
+    pub envelope: Envelope<M>,
+    pub enqueued_at: Instant,
+}
+
+impl<M: Send + Sync + 'static> MailboxItem<M> {
+    fn new(envelope: Envelope<M>) -> Self {
+        Self {
+            envelope,
+            enqueued_at: Instant::now(),
+        }
+    }
+}
+
 /// Messages delivered to the actor mailbox.
 pub enum Envelope<M: Send + Sync + 'static> {
     Msg(M),
@@ -218,7 +233,7 @@ where
 /// Handle to a running actor.
 pub struct ActorRef<M: Send + Sync + 'static> {
     pub id: ActorId,
-    tx: mpsc::Sender<Envelope<M>>,
+    tx: mpsc::Sender<MailboxItem<M>>,
 }
 
 impl<M: Send + Sync + 'static> Clone for ActorRef<M> {
@@ -239,8 +254,8 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
         ActorMonitor::global().record_mailbox_send_rejected(self.id);
     }
 
-    pub async fn send(&self, msg: M) -> Result<(), ActorProcessingErr> {
-        match self.tx.send(Envelope::Msg(msg)).await {
+    async fn mailbox_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
+        match self.tx.send(MailboxItem::new(envelope)).await {
             Ok(()) => {
                 self.on_mailbox_enqueue_ok();
                 Ok(())
@@ -250,6 +265,23 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
                 Err(Box::new(e) as ActorProcessingErr)
             }
         }
+    }
+
+    fn mailbox_try_send(&self, envelope: Envelope<M>) -> Result<(), ActorProcessingErr> {
+        match self.tx.try_send(MailboxItem::new(envelope)) {
+            Ok(()) => {
+                self.on_mailbox_enqueue_ok();
+                Ok(())
+            }
+            Err(e) => {
+                self.on_mailbox_send_failed();
+                Err(Box::new(e) as ActorProcessingErr)
+            }
+        }
+    }
+
+    pub async fn send(&self, msg: M) -> Result<(), ActorProcessingErr> {
+        self.mailbox_send(Envelope::Msg(msg)).await
     }
 
     /// Enqueue a message without `.await` — for sync callers.
@@ -257,44 +289,23 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     /// Uses [`mpsc::Sender::try_send`]: returns immediately, or with an error if
     /// the mailbox is full or the actor has exited.
     pub fn send_sync(&self, msg: M) -> Result<(), ActorProcessingErr> {
-        match self.tx.try_send(Envelope::Msg(msg)) {
-            Ok(()) => {
-                self.on_mailbox_enqueue_ok();
-                Ok(())
-            }
-            Err(e) => {
-                self.on_mailbox_send_failed();
-                Err(Box::new(e) as ActorProcessingErr)
-            }
-        }
+        self.mailbox_try_send(Envelope::Msg(msg))
     }
 
     pub async fn stop(&self) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Stop)
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Stop).await
     }
 
     pub async fn kill(&self) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Kill)
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Kill).await
     }
 
     pub async fn link(&self, other: ActorId) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Link(other))
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Link(other)).await
     }
 
     pub async fn unlink(&self, other: ActorId) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Unlink(other))
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Unlink(other)).await
     }
 
     pub async fn upgrade(
@@ -302,17 +313,13 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
         new_impl: impl Actor<M> + 'static,
     ) -> Result<(), ActorProcessingErr> {
         let boxed = into_dyn_actor(new_impl);
-        self.tx
-            .send(Envelope::Upgrade(boxed))
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Upgrade(boxed)).await
     }
 
     pub async fn monitor(&self, observer_id: ActorId) -> oneshot::Receiver<ExitReason> {
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .tx
-            .send(Envelope::Monitor {
+            .mailbox_send(Envelope::Monitor {
                 observer: observer_id,
                 notify: tx,
             })
@@ -321,10 +328,7 @@ impl<M: Send + Sync + 'static> ActorRef<M> {
     }
 
     pub async fn demonitor(&self, observer_id: ActorId) -> Result<(), ActorProcessingErr> {
-        self.tx
-            .send(Envelope::Demonitor(observer_id))
-            .await
-            .map_err(|e| Box::new(e) as ActorProcessingErr)
+        self.mailbox_send(Envelope::Demonitor(observer_id)).await
     }
 }
 
@@ -378,7 +382,7 @@ where
     A: Actor<M> + Send + Sync + 'static,
 {
     let id = ActorId::new();
-    let (tx, rx) = mpsc::channel::<Envelope<M>>(config.mailbox_capacity);
+    let (tx, rx) = mpsc::channel::<MailboxItem<M>>(config.mailbox_capacity);
     let (control_tx, control_rx) = mpsc::channel::<ControlMsg>(config.mailbox_capacity);
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
@@ -397,7 +401,7 @@ where
 
 async fn run_actor<M: Send + Sync + 'static>(
     id: ActorId,
-    mut rx: mpsc::Receiver<Envelope<M>>,
+    mut rx: mpsc::Receiver<MailboxItem<M>>,
     mut control_rx: mpsc::Receiver<ControlMsg>,
     mut actor: Box<dyn DynActor<M>>,
     config: ActorConfig,
@@ -439,11 +443,14 @@ async fn run_actor<M: Send + Sync + 'static>(
                 }
             }
             envelope = rx.recv() => {
-                let Some(envelope) = envelope else { break 'actor_loop };
+                let Some(item) = envelope else { break 'actor_loop };
                 ActorMonitor::global().record_mailbox_dequeue(id);
-                match envelope {
+                match item.envelope {
                     Envelope::Msg(m) => {
-                        if let Some(reason) = handle_message(id, &mut actor, m, &config).await {
+                        let mailbox_wait = item.enqueued_at.elapsed();
+                        if let Some(reason) =
+                            handle_message(id, &mut actor, m, &config, mailbox_wait).await
+                        {
                             exit_reason = reason;
                             break 'actor_loop;
                         }
@@ -492,10 +499,11 @@ async fn handle_message<M: Send + Sync + 'static>(
     actor: &mut Box<dyn DynActor<M>>,
     msg: M,
     config: &ActorConfig,
+    mailbox_wait: Duration,
 ) -> Option<ExitReason> {
     let monitor = ActorMonitor::global();
     let started = Instant::now();
-    monitor.begin_handle(id);
+    monitor.begin_handle(id, mailbox_wait);
 
     // NOTE: on_handle_begin failure is fatal — it terminates the actor.
     // If you want non-fatal journaling, return Ok(()) and log internally.

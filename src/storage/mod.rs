@@ -943,6 +943,24 @@ impl StorageNode {
         self.stats.snapshot(tombstones)
     }
 
+    /// Push storage counters into Prometheus (`metrics` feature).
+    #[cfg(feature = "metrics")]
+    pub fn export_prometheus_stats(&self) {
+        let stats = self.stats();
+        crate::metrics::sync_storage_stats(&crate::metrics::StorageMetricsSnapshot {
+            node: self.id.clone(),
+            puts_total: stats.puts_total,
+            gets_total: stats.gets_total,
+            deletes_total: stats.deletes_total,
+            read_repairs: stats.read_repairs,
+            paxos_writes: stats.paxos_writes,
+            quorum_failures: stats.quorum_failures,
+            wal_bytes_written: stats.wal_bytes_written,
+            tombstone_count: stats.tombstone_count,
+            live_records: self.table.len() as u64,
+        });
+    }
+
     /// Lightweight health summary.
     pub fn health(&self) -> StorageHealth {
         let record_count = self.table.len();

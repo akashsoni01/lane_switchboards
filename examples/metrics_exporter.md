@@ -27,9 +27,18 @@ Tag actors via [`ActorConfig::monitor_meta`](../lane_core/src/config.rs).
 
 ## Prometheus → Grafana
 
-1. Add a scrape target pointing at `host:9090`, path `/metrics`.
-2. Import [`docs/grafana/actor-runtime.json`](../docs/grafana/actor-runtime.json).
-3. Useful PromQL:
+1. Run the exporter: `cargo run --example metrics_exporter --features metrics` (host port **9090**).
+2. Start the observability stack:
+
+```bash
+docker compose -f docs/grafana/docker-compose.yml up
+```
+
+3. Grafana: http://localhost:3000 (admin / admin) — add Prometheus datasource `http://prometheus:9090`.
+4. Import [`docs/grafana/actor-runtime.json`](../docs/grafana/actor-runtime.json).
+5. Prometheus UI: http://localhost:9091 (alert rules in [`alerts.yml`](../docs/grafana/alerts.yml)).
+
+Useful PromQL:
    - `rate(lane_actor_messages_handled_total[5m])`
    - `histogram_quantile(0.95, sum(rate(lane_actor_handle_duration_seconds_bucket[5m])) by (le))`
    - `lane_actor_mailbox_depth / lane_actor_mailbox_capacity`

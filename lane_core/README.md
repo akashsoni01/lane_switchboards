@@ -86,7 +86,10 @@ Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { f
 | `record_supervisor_restart` / `sync_supervisor_scrape` | Supervisor restart + intensity gauges |
 | `set_child_generation` | `ChildRegistry` generation gauge |
 | `sync_storage_stats` | Diff `StorageStats` into Prometheus counters |
+| `StorageNode::export_prometheus_stats` | Convenience wrapper in `lane_switchboards` |
 | `record_consistency_operation` | Mesh consistency (auto via `emit_metrics`) |
+| `record_remote_send` / `record_remote_ack_timeout` | gRPC remote actor dispatches |
+| `serve_metrics_http(addr)` | Standalone `/metrics` HTTP server |
 
 ```bash
 cargo run --example metrics_exporter --features metrics

@@ -1,0 +1,33 @@
+# Prometheus + Grafana for local Lane metrics development.
+#
+# 1. Start the exporter on the host:
+#      cargo run --example metrics_exporter --features metrics
+# 2. Start the stack:
+#      docker compose -f docs/grafana/docker-compose.yml up
+# 3. Grafana: http://localhost:3000 (admin / admin)
+# 4. Import docs/grafana/actor-runtime.json
+# 5. Prometheus: http://localhost:9091
+
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./actor-runtime.json:/var/lib/grafana/dashboards/actor-runtime.json:ro
+    depends_on:
+      - prometheus

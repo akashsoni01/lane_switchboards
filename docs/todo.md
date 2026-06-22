@@ -350,3 +350,4 @@ Deliver as JSON in repo (e.g. `docs/grafana/actor-runtime.json`).
 |------|-------|-------|
 | 2026-06-11 | 0–2, 5 (partial) | `metrics` feature, `lane_core/src/metrics.rs`, `ActorMeta`, Prometheus counters/histogram/gauges, `render_prometheus_text()`, `examples/metrics_exporter.rs` |
 | 2026-06-11 | 3, 4, 6a/6b (partial), 7 (starter) | Supervisor metrics, mailbox depth, storage/consistency export, `docs/grafana/actor-runtime.json` |
+| 2026-06-11 | 4, 5, 6c, 7, 8, 9 (partial) | Mailbox wait histogram, `serve_metrics_http`, remote metrics, docker-compose, alerts, `tests/metrics_export.rs` |

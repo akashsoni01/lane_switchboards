@@ -221,6 +221,11 @@ name = "metrics_exporter"
 path = "examples/metrics_exporter.rs"
 required-features = ["metrics"]
 
+[[test]]
+name = "metrics_export"
+path = "tests/metrics_export.rs"
+required-features = ["metrics"]
+
 [[example]]
 name = "distributed_key_value"
 path = "examples/distributed_key_value.rs"

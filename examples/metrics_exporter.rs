@@ -9,12 +9,11 @@
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
 use lane_switchboards::config::ActorConfig;
-use lane_switchboards::metrics::{init_metrics, render_prometheus_text, MetricsConfig};
+use lane_switchboards::metrics::{init_metrics, render_prometheus_text, serve_metrics_http, MetricsConfig};
 use lane_switchboards::monitor::{ActorMeta, ActorMonitor};
 use lane_switchboards::supervisor::{supervise_actor_with_config, SupervisorConfig};
+use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 
 enum WorkMsg {
     Ping,
@@ -32,33 +31,6 @@ impl Actor<WorkMsg> for Worker {
             }
         }
         Ok(())
-    }
-}
-
-async fn serve_metrics(listener: TcpListener) -> std::io::Result<()> {
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let (status, body) = if req.starts_with("GET /metrics") {
-                match render_prometheus_text() {
-                    Ok(text) => ("200 OK", text),
-                    Err(e) => ("500 Internal Server Error", format!("render error: {e}")),
-                }
-            } else if req.starts_with("GET /health") {
-                ("200 OK", "ok".into())
-            } else {
-                ("404 Not Found", "not found".into())
-            };
-
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-        });
     }
 }
 
@@ -87,11 +59,12 @@ async fn main() -> anyhow::Result<()> {
     .await
     .expect("supervise worker");
 
-    let listener = TcpListener::bind("127.0.0.1:9090").await?;
-    println!("metrics_exporter listening on http://127.0.0.1:9090/metrics");
+    let addr: SocketAddr = "127.0.0.1:9090".parse()?;
+    println!("metrics_exporter listening on http://{addr}/metrics");
     println!("PromQL example: rate(lane_actor_messages_handled_total[1m])");
+    println!("Docker stack: docs/grafana/docker-compose.yml");
 
-    let metrics_task = tokio::spawn(serve_metrics(listener));
+    let metrics_task = tokio::spawn(serve_metrics_http(addr));
 
     for _ in 0..20 {
         worker
@@ -103,12 +76,13 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(stats) = ActorMonitor::global().get(worker.id) {
         println!(
-            "local stats: handled={} mean_ms={}",
-            stats.messages_handled, stats.mean_handle_ms
+            "local stats: handled={} mailbox_depth={} mean_ms={}",
+            stats.messages_handled, stats.mailbox_depth, stats.mean_handle_ms
         );
     }
 
     let sample = render_prometheus_text()?;
+    assert!(sample.contains("lane_actor_mailbox_wait_seconds"));
     let lines: usize = sample.lines().filter(|l| !l.starts_with('#')).count();
     println!("prometheus sample lines (non-comment): {lines}");
 

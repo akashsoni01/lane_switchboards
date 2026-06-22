@@ -61,6 +61,7 @@ pub(crate) struct PromActorMetrics {
     pub mailbox_capacity: Gauge,
     pub mailbox_depth: Gauge,
     pub mailbox_send_rejected: IntCounter,
+    pub mailbox_wait: Histogram,
     pub handle_duration: Histogram,
     pub uptime_seconds: Gauge,
     pub idle_seconds: Gauge,
@@ -88,7 +89,10 @@ struct MetricsRegistry {
     idle_seconds: prometheus::GaugeVec,
     alive: prometheus::GaugeVec,
     mailbox_send_rejected: IntCounterVec,
-    // --- supervisor ---
+    mailbox_wait: HistogramVec,
+    // --- remote ---
+    remote_send: IntCounterVec,
+    remote_ack_timeouts: IntCounterVec,
     supervisor_restarts: IntCounterVec,
     supervisor_intensity_exceeded: IntCounterVec,
     supervisor_children_alive: prometheus::GaugeVec,
@@ -103,6 +107,7 @@ struct MetricsRegistry {
     storage_quorum_failures: IntCounterVec,
     storage_wal_bytes: IntCounterVec,
     storage_tombstones: prometheus::GaugeVec,
+    storage_live_records: prometheus::GaugeVec,
     // --- consistency ---
     consistency_operations: IntCounterVec,
     consistency_duration: HistogramVec,
@@ -285,6 +290,45 @@ impl MetricsRegistry {
             .register(Box::new(mailbox_send_rejected.clone()))
             .expect("register mailbox_send_rejected");
 
+        let mailbox_wait = HistogramVec::new(
+            HistogramOpts::new(
+                "lane_actor_mailbox_wait_seconds",
+                "Time from enqueue to begin_handle for actor messages",
+            )
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0,
+            ]),
+            ACTOR_LABEL_NAMES,
+        )
+        .expect("lane_actor_mailbox_wait_seconds");
+        registry
+            .register(Box::new(mailbox_wait.clone()))
+            .expect("register mailbox_wait");
+
+        let remote_send = IntCounterVec::new(
+            Opts::new(
+                "lane_remote_send_total",
+                "Remote actor frame dispatches over gRPC",
+            ),
+            &["target", "result", "node"],
+        )
+        .expect("lane_remote_send_total");
+        registry
+            .register(Box::new(remote_send.clone()))
+            .expect("register remote_send");
+
+        let remote_ack_timeouts = IntCounterVec::new(
+            Opts::new(
+                "lane_remote_ack_timeouts_total",
+                "Remote send_with_ack timeouts",
+            ),
+            &["target", "node"],
+        )
+        .expect("lane_remote_ack_timeouts_total");
+        registry
+            .register(Box::new(remote_ack_timeouts.clone()))
+            .expect("register remote_ack_timeouts");
+
         let node_label = &["node"];
         let supervisor_restarts = IntCounterVec::new(
             Opts::new(
@@ -425,6 +469,15 @@ impl MetricsRegistry {
             .register(Box::new(storage_tombstones.clone()))
             .expect("register storage_tombstones");
 
+        let storage_live_records = prometheus::GaugeVec::new(
+            Opts::new("lane_storage_live_records", "Live records in the MemTable"),
+            storage_node_label,
+        )
+        .expect("lane_storage_live_records");
+        registry
+            .register(Box::new(storage_live_records.clone()))
+            .expect("register storage_live_records");
+
         let consistency_operations = IntCounterVec::new(
             Opts::new(
                 "lane_consistency_operations_total",
@@ -469,6 +522,9 @@ impl MetricsRegistry {
             idle_seconds,
             alive,
             mailbox_send_rejected,
+            mailbox_wait,
+            remote_send,
+            remote_ack_timeouts,
             supervisor_restarts,
             supervisor_intensity_exceeded,
             supervisor_children_alive,
@@ -482,6 +538,7 @@ impl MetricsRegistry {
             storage_quorum_failures,
             storage_wal_bytes,
             storage_tombstones,
+            storage_live_records,
             consistency_operations,
             consistency_duration,
         }
@@ -543,6 +600,10 @@ impl MetricsRegistry {
                 .ok()?,
             mailbox_send_rejected: self
                 .mailbox_send_rejected
+                .get_metric_with_label_values(&label_refs)
+                .ok()?,
+            mailbox_wait: self
+                .mailbox_wait
                 .get_metric_with_label_values(&label_refs)
                 .ok()?,
             handle_duration: self
@@ -721,6 +782,7 @@ pub struct StorageMetricsSnapshot {
     pub quorum_failures: u64,
     pub wal_bytes_written: u64,
     pub tombstone_count: u64,
+    pub live_records: u64,
 }
 
 static STORAGE_LAST: Lazy<Mutex<HashMap<String, StorageMetricsSnapshot>>> =
@@ -840,6 +902,12 @@ pub fn sync_storage_stats(snapshot: &StorageMetricsSnapshot) {
     {
         gauge.set(snapshot.tombstone_count as f64);
     }
+    if let Ok(gauge) = METRICS
+        .storage_live_records
+        .get_metric_with_label_values(&[node.as_str()])
+    {
+        gauge.set(snapshot.live_records as f64);
+    }
 }
 
 fn inc_storage_delta(
@@ -897,6 +965,60 @@ fn sync_supervisor_prometheus_gauges() {
                 .max_restarts
                 .saturating_sub(state.restarts_in_window) as f64,
         );
+    }
+}
+
+/// Record a remote actor send attempt.
+pub fn record_remote_send(target: &str, ok: bool) {
+    let node = global_node();
+    let result = if ok { "ok" } else { "err" };
+    if let Ok(counter) = METRICS
+        .remote_send
+        .get_metric_with_label_values(&[target, result, &node])
+    {
+        counter.inc();
+    }
+}
+
+/// Record a `send_with_ack` timeout to a remote actor.
+pub fn record_remote_ack_timeout(target: &str) {
+    let node = global_node();
+    if let Ok(counter) = METRICS
+        .remote_ack_timeouts
+        .get_metric_with_label_values(&[target, &node])
+    {
+        counter.inc();
+    }
+}
+
+/// Serve Prometheus text exposition over HTTP (`GET /metrics`, `GET /health`).
+pub async fn serve_metrics_http(addr: std::net::SocketAddr) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind(addr).await?;
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let (status, body) = if req.starts_with("GET /metrics") {
+                match render_prometheus_text() {
+                    Ok(text) => ("200 OK", text),
+                    Err(e) => ("500 Internal Server Error", format!("render error: {e}")),
+                }
+            } else if req.starts_with("GET /health") {
+                ("200 OK", "ok".into())
+            } else {
+                ("404 Not Found", "not found".into())
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
     }
 }
 

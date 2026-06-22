@@ -360,10 +360,14 @@ impl ActorMonitor {
         }
     }
 
-    pub(crate) fn begin_handle(&self, id: ActorId) {
+    pub(crate) fn begin_handle(&self, id: ActorId, mailbox_wait: Duration) {
         let Some(cell) = self.cell(id) else { return };
         inc_counter(&cell, &cell.stats.in_flight, "in_flight", id);
         Self::sync_in_flight_gauge(&cell);
+        #[cfg(feature = "metrics")]
+        if let Some(prom) = &cell.prom {
+            prom.mailbox_wait.observe(mailbox_wait.as_secs_f64());
+        }
     }
 
     pub(crate) fn finish_handle(
