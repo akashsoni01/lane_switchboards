@@ -55,20 +55,24 @@ Core OTP actor primitives for the **lane_switchboards** runtime.
 | `.snapshot_and_unregister(id)` | Consume final snapshot once and evict from post-mortem |
 | `.purge(id)` | Discard a post-mortem entry |
 
-`ActorStats` fields:
+`ActorStats` fields (all [`usize`]; counters saturate at [`usize::MAX`] with a warning on overflow):
 
-| Field | Meaning |
-|-------|---------|
-| `messages_handled` | Successful `handle()` completions |
-| `handle_errors` | `handle()` returned `Err` |
-| `panics` | `handle()` panicked (caught by `catch_unwind`) |
-| `handle_timeouts` | `handle_timeout` fired before `handle()` finished |
-| `slow_handles` | `handle()` completed but exceeded `slow_handle_threshold` |
-| `in_flight` | Handles started but not yet finished (0 for stopped actors) |
-| `last_handle_ms` | Duration of the most recent handle call |
-| `max_handle_ms` | Longest handle call ever recorded |
-| `total_handle_ms` | Sum of all successful handle durations |
-| `mean_handle_ms` | `total_handle_ms / messages_handled`; `0` when no messages handled yet |
+| Field | Type | Meaning |
+|-------|------|---------|
+| `messages_handled` | `usize` | Successful `handle()` completions |
+| `handle_errors` | `usize` | `handle()` returned `Err` |
+| `panics` | `usize` | `handle()` panicked (caught by `catch_unwind`) |
+| `handle_timeouts` | `usize` | `handle_timeout` fired before `handle()` finished |
+| `slow_handles` | `usize` | `handle()` completed but exceeded `slow_handle_threshold` |
+| `in_flight` | `usize` | Handles started but not yet finished (0 for stopped actors) |
+| `last_handle_ms` | `usize` | Duration of the most recent handle call |
+| `max_handle_ms` | `usize` | Longest handle call ever recorded |
+| `total_handle_ms` | `usize` | Sum of all successful handle durations |
+| `mean_handle_ms` | `usize` | `total_handle_ms / messages_handled`; `0` when no messages handled yet |
+
+Counter updates use saturating arithmetic — values never wrap. When an increment would
+exceed [`usize::MAX`], the counter is clamped and `tracing::warn!` records the field
+and actor id.
 
 ### `supervisor`
 
@@ -175,7 +179,7 @@ They show where monitoring fits on the cost ladder.
 | Operation (×100 000 iterations) | Estimated wall time | Notes |
 |----------------------------------|--------------------:|-------|
 | `i64` additions (sum loop) | ~0.05 ms | ~0.5 ns / op — pure ALU |
-| `AtomicU64::fetch_add` | ~0.4 ms | ~4 ns / op — L1 cache hit |
+| `AtomicUsize::fetch_add` | ~0.4 ms | ~4 ns / op — L1 cache hit |
 | Monitor `begin + finish_handle` | ~15–25 ms | ~150–250 ns / op — lock + atomics |
 | `HashMap::insert` (pre-allocated) | ~10–15 ms | ~100–150 ns / op — hash + store |
 | `HashMap::insert` (with growth) | ~20–40 ms | ~200–400 ns / op — realloc hits |

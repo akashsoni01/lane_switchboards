@@ -174,7 +174,7 @@ let _ = b_join.await;
 
 ### Runtime observability
 
-[`ActorMonitor::global()`](src/monitor.rs) tracks every spawned actor:
+[`ActorMonitor::global()`](src/monitor.rs) tracks every spawned actor. All counters are [`usize`] and saturate at [`usize::MAX`] with a warning on overflow:
 
 ```rust
 use lane_switchboards::ActorMonitor;
@@ -415,7 +415,7 @@ Stuck or slow `handle()` calls are bounded via [`ActorConfig`](src/config.rs):
 | `on_handle_stuck(ctx)` | After timeout — persist journal / stuck action |
 | `handle(msg)` | Normal processing |
 
-**Monitor:** `ActorMonitor::global().get(actor_id)` / `.all()` — messages handled, panics, timeouts, in-flight, last/max handle ms.
+**Monitor:** `ActorMonitor::global().get(actor_id)` / `.all()` — messages handled, panics, timeouts, in-flight, last/max handle ms. All counters are [`usize`] and saturate at [`usize::MAX`] (with a warning) rather than wrapping.
 
 ```rust
 use lane_switchboards::{ActorConfig, ActorMonitor, spawn_with_config};
@@ -428,6 +428,7 @@ let config = ActorConfig {
 let (actor, _) = spawn_with_config(MyWorker, None, &config).await?;
 // ...
 let stats = ActorMonitor::global().get(actor.id);
+// stats.messages_handled, stats.handle_timeouts, stats.last_handle_ms — all usize
 ```
 
 ### Latest latency snapshot (sequential runtime)

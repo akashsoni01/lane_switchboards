@@ -373,4 +373,4 @@ path, actors for the control plane.
 | [`examples/distributed_key_value.md`](./examples/distributed_key_value.md) | 7 Mermaid diagrams: write fan-out, read repair, Paxos phases, WAL actor, node join, resilience model, roadmap |
 | [`examples/distributed_key_value.rs`](./examples/distributed_key_value.rs) | Runnable 9-demo example (`cargo run --example distributed_key_value`) |
 | [`READMEv0.0.9.md`](./READMEv0.0.9.md) | Previous release — `ArcSwap` `ChildRegistry`, supervision type guide |
-| [`lane_core/README.md`](./lane_core/README.md) | `ActorMonitor`, `ActorStats`, `mean_handle_ms`, handle overhead estimates |
+| [`lane_core/README.md`](./lane_core/README.md) | `ActorMonitor`, `ActorStats` (`usize` counters, saturating), `mean_handle_ms`, handle overhead estimates |

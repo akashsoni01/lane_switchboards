@@ -30,7 +30,7 @@ Channel sizing and concurrency are no longer bundled into one struct. Each subsy
 | `on_handle_begin(&msg)` | Snapshot pending work before handle |
 | `on_handle_stuck(ctx)` | Persist stuck action on timeout |
 | `ExitReason::HandleTimeout` | Actor exit reason + supervisor notification |
-| `ActorMonitor` / `ActorStats` | Global stats: timeouts, panics, in-flight, handle ms |
+| `ActorMonitor` / `ActorStats` | Global stats: timeouts, panics, in-flight, handle ms — all `usize`, saturating |
 
 Integration test: `handle_timeout_triggers_stuck_recovery_and_stats` in `tests/integration.rs`.
 

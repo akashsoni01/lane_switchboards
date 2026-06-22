@@ -10,6 +10,9 @@
 //!   3. Panic             — `panics` counter; post-mortem snapshot survives actor exit
 //!   4. Handle timeout    — `handle_timeouts` counter; post-mortem on timeout exit
 //!   5. Global snapshot   — `ActorMonitor::global().all()` lists every live actor
+//!
+//! All `ActorStats` counters are [`usize`] and saturate at [`usize::MAX`] with a warning
+//! on overflow — they never wrap.
 
 use lane_switchboards::actor::{Actor, ActorId, ActorProcessingErr, ActorRef, HandleStuckContext};
 use lane_switchboards::config::ActorConfig;

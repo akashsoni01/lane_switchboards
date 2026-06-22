@@ -6,65 +6,109 @@
 //! The read lock is held only long enough to clone the `Arc<StatsCell>`;
 //! all counter updates happen on the `Arc` afterwards — no lock held on the hot path.
 //! Writes (`register`, `unregister`) take the write lock briefly and do no I/O inside it.
+//!
+//! # Counter limits
+//!
+//! All counters and millisecond fields use [`usize`]. Hot-path updates use
+//! saturating arithmetic; when a value would exceed [`usize::MAX`], it is clamped
+//! and a `tracing::warn!` is emitted once per overflow attempt (field + actor id).
 
 use crate::actor::ActorId;
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 static MONITOR: Lazy<ActorMonitor> = Lazy::new(ActorMonitor::new);
 
-/// Clamp a `Duration` to milliseconds that fit in `u64`.
+/// Clamp a `Duration` to milliseconds that fit in [`usize`].
 #[inline(always)]
-fn duration_ms(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
+fn duration_ms(d: Duration) -> usize {
+    usize::try_from(d.as_millis()).unwrap_or(usize::MAX)
+}
+
+/// Saturating add to `counter`; warn when `prev + delta` would overflow [`usize`].
+fn fetch_add_saturating(
+    counter: &AtomicUsize,
+    delta: usize,
+    field: &'static str,
+    id: ActorId,
+) {
+    loop {
+        let prev = counter.load(Ordering::Relaxed);
+        if prev == usize::MAX {
+            return;
+        }
+        let next = match prev.checked_add(delta) {
+            Some(n) => n,
+            None => {
+                tracing::warn!(
+                    %id,
+                    field,
+                    prev,
+                    delta,
+                    "actor stat counter overflow; clamped to usize::MAX"
+                );
+                usize::MAX
+            }
+        };
+        if counter
+            .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+fn inc_counter(counter: &AtomicUsize, field: &'static str, id: ActorId) {
+    fetch_add_saturating(counter, 1, field, id);
 }
 
 /// Snapshot of one actor's runtime counters (deadlock / slow-handle detection).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorStats {
     pub actor_id: ActorId,
-    pub messages_handled: u64,
-    pub handle_errors: u64,
-    pub panics: u64,
-    pub handle_timeouts: u64,
-    pub in_flight: u64,
-    pub last_handle_ms: u64,
-    pub max_handle_ms: u64,
+    pub messages_handled: usize,
+    pub handle_errors: usize,
+    pub panics: usize,
+    pub handle_timeouts: usize,
+    pub in_flight: usize,
+    pub last_handle_ms: usize,
+    pub max_handle_ms: usize,
     /// Sum of all successful handle durations.
-    pub total_handle_ms: u64,
+    pub total_handle_ms: usize,
     /// Mean duration per successful handle call (`total_handle_ms / messages_handled`).
     /// `0` when no messages have been handled yet.
-    pub mean_handle_ms: u64,
-    pub slow_handles: u64,
+    pub mean_handle_ms: usize,
+    pub slow_handles: usize,
 }
 
 struct StatsCell {
-    messages_handled: AtomicU64,
-    handle_errors: AtomicU64,
-    panics: AtomicU64,
-    handle_timeouts: AtomicU64,
-    in_flight: AtomicU64,
-    last_handle_ms: AtomicU64,
-    max_handle_ms: AtomicU64,
-    total_handle_ms: AtomicU64,
-    slow_handles: AtomicU64,
+    messages_handled: AtomicUsize,
+    handle_errors: AtomicUsize,
+    panics: AtomicUsize,
+    handle_timeouts: AtomicUsize,
+    in_flight: AtomicUsize,
+    last_handle_ms: AtomicUsize,
+    max_handle_ms: AtomicUsize,
+    total_handle_ms: AtomicUsize,
+    slow_handles: AtomicUsize,
 }
 
 impl StatsCell {
     fn new() -> Self {
         Self {
-            messages_handled: AtomicU64::new(0),
-            handle_errors: AtomicU64::new(0),
-            panics: AtomicU64::new(0),
-            handle_timeouts: AtomicU64::new(0),
-            in_flight: AtomicU64::new(0),
-            last_handle_ms: AtomicU64::new(0),
-            max_handle_ms: AtomicU64::new(0),
-            total_handle_ms: AtomicU64::new(0),
-            slow_handles: AtomicU64::new(0),
+            messages_handled: AtomicUsize::new(0),
+            handle_errors: AtomicUsize::new(0),
+            panics: AtomicUsize::new(0),
+            handle_timeouts: AtomicUsize::new(0),
+            in_flight: AtomicUsize::new(0),
+            last_handle_ms: AtomicUsize::new(0),
+            max_handle_ms: AtomicUsize::new(0),
+            total_handle_ms: AtomicUsize::new(0),
+            slow_handles: AtomicUsize::new(0),
         }
     }
 
@@ -87,7 +131,7 @@ impl StatsCell {
         }
     }
 
-    /// Saturating decrement of `in_flight` — never wraps to `u64::MAX`.
+    /// Saturating decrement of `in_flight` — never wraps to [`usize::MAX`].
     fn dec_in_flight(&self) {
         self.in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -194,7 +238,7 @@ impl ActorMonitor {
 
     pub(crate) fn begin_handle(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
-            cell.in_flight.fetch_add(1, Ordering::Relaxed);
+            inc_counter(&cell.in_flight, "in_flight", id);
         }
     }
 
@@ -207,9 +251,9 @@ impl ActorMonitor {
         let Some(cell) = self.cell(id) else { return };
         let ms = duration_ms(elapsed);
         cell.dec_in_flight();
-        cell.messages_handled.fetch_add(1, Ordering::Relaxed);
+        inc_counter(&cell.messages_handled, "messages_handled", id);
         cell.last_handle_ms.store(ms, Ordering::Relaxed);
-        cell.total_handle_ms.fetch_add(ms, Ordering::Relaxed);
+        fetch_add_saturating(&cell.total_handle_ms, ms, "total_handle_ms", id);
 
         // Spin to update the running maximum. compare_exchange_weak avoids an
         // extra barrier; Acquire on failure ensures the reload of `prev` sees
@@ -230,7 +274,7 @@ impl ActorMonitor {
 
         if let Some(threshold) = slow_threshold {
             if elapsed > threshold {
-                cell.slow_handles.fetch_add(1, Ordering::Relaxed);
+                inc_counter(&cell.slow_handles, "slow_handles", id);
                 tracing::warn!(
                     %id,
                     handle_ms = ms,
@@ -243,29 +287,28 @@ impl ActorMonitor {
 
     pub(crate) fn record_error(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
-            cell.handle_errors.fetch_add(1, Ordering::Relaxed);
+            inc_counter(&cell.handle_errors, "handle_errors", id);
             cell.dec_in_flight();
         }
     }
 
     pub(crate) fn record_panic(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
-            cell.panics.fetch_add(1, Ordering::Relaxed);
+            inc_counter(&cell.panics, "panics", id);
             cell.dec_in_flight();
         }
     }
 
     pub(crate) fn record_timeout(&self, id: ActorId, elapsed: Duration) {
         if let Some(cell) = self.cell(id) {
-            cell.handle_timeouts.fetch_add(1, Ordering::Relaxed);
+            inc_counter(&cell.handle_timeouts, "handle_timeouts", id);
             // Count as a handled message so messages_handled is consistent with
             // total_handle_ms (both include the timed-out call).
-            cell.messages_handled.fetch_add(1, Ordering::Relaxed);
+            inc_counter(&cell.messages_handled, "messages_handled", id);
             cell.dec_in_flight();
             let ms = duration_ms(elapsed);
             cell.last_handle_ms.store(ms, Ordering::Relaxed);
-            // Record wall time spent in the stuck handler so max/mean are accurate.
-            cell.total_handle_ms.fetch_add(ms, Ordering::Relaxed);
+            fetch_add_saturating(&cell.total_handle_ms, ms, "total_handle_ms", id);
             loop {
                 let prev = cell.max_handle_ms.load(Ordering::Relaxed);
                 if ms <= prev {
@@ -291,5 +334,45 @@ impl ActorMonitor {
 impl Default for ActorMonitor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_saturates_at_usize_max() {
+        let counter = AtomicUsize::new(usize::MAX - 1);
+        let id = ActorId(42);
+        inc_counter(&counter, "messages_handled", id);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX - 1 + 1);
+        inc_counter(&counter, "messages_handled", id);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+        inc_counter(&counter, "messages_handled", id);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn fetch_add_saturating_clamps_large_delta() {
+        let counter = AtomicUsize::new(usize::MAX - 5);
+        let id = ActorId(7);
+        fetch_add_saturating(&counter, 10, "total_handle_ms", id);
+        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
+    }
+
+    #[test]
+    fn snapshot_mean_handle_ms_zero_when_no_messages() {
+        let cell = StatsCell::new();
+        let stats = cell.snapshot(ActorId(1));
+        assert_eq!(stats.mean_handle_ms, 0);
+        assert_eq!(stats.messages_handled, 0);
+    }
+
+    #[test]
+    fn in_flight_never_wraps_on_decrement() {
+        let cell = StatsCell::new();
+        cell.dec_in_flight();
+        assert_eq!(cell.in_flight.load(Ordering::Relaxed), 0);
     }
 }

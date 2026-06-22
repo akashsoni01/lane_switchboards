@@ -10,18 +10,22 @@ cargo run --example resilient_monitor
 
 ## What `ActorMonitor` tracks
 
-| `ActorStats` field | When it increments |
-|--------------------|--------------------|
-| `messages_handled` | `handle()` completed successfully |
-| `handle_errors` | `handle()` returned `Err(…)` |
-| `panics` | `handle()` panicked (caught by `catch_unwind`) |
-| `handle_timeouts` | `handle_timeout` fired before `handle()` finished |
-| `slow_handles` | `handle()` finished but exceeded `slow_handle_threshold` |
-| `in_flight` | Handles started but not yet finished (0 for stopped actors) |
-| `last_handle_ms` | Duration of the most recent handle call |
-| `max_handle_ms` | Longest handle call ever recorded |
-| `total_handle_ms` | Sum of all successful handle durations |
-| `mean_handle_ms` | `total_handle_ms / messages_handled` — computed in `snapshot()`; `0` when no messages handled |
+All counters and millisecond fields in [`ActorStats`](../lane_core/src/monitor.rs) are [`usize`].
+Hot-path updates use saturating arithmetic — when a counter would exceed [`usize::MAX`], it is
+clamped and `tracing::warn!` records the field and actor id (counters never wrap).
+
+| `ActorStats` field | Type | When it increments |
+|--------------------|------|--------------------|
+| `messages_handled` | `usize` | `handle()` completed successfully |
+| `handle_errors` | `usize` | `handle()` returned `Err(…)` |
+| `panics` | `usize` | `handle()` panicked (caught by `catch_unwind`) |
+| `handle_timeouts` | `usize` | `handle_timeout` fired before `handle()` finished |
+| `slow_handles` | `usize` | `handle()` finished but exceeded `slow_handle_threshold` |
+| `in_flight` | `usize` | Handles started but not yet finished (0 for stopped actors) |
+| `last_handle_ms` | `usize` | Duration of the most recent handle call |
+| `max_handle_ms` | `usize` | Longest handle call ever recorded |
+| `total_handle_ms` | `usize` | Sum of all successful handle durations |
+| `mean_handle_ms` | `usize` | `total_handle_ms / messages_handled` — computed in `snapshot()`; `0` when no messages handled |
 
 Stats for a stopped actor are preserved as a **post-mortem snapshot** — readable via `ActorMonitor::global().get(id)` until `purge(id)` is called.
 
@@ -264,6 +268,13 @@ if let Some(stats) = ActorMonitor::global().snapshot_and_unregister(id) {
 // Returns stats for every running actor; sort/filter as needed
 let all: Vec<ActorStats> = ActorMonitor::global().all();
 ```
+
+### Counter limits
+
+Every numeric field in `ActorStats` is [`usize`]. Updates on the hot path use saturating
+arithmetic — counters clamp at [`usize::MAX`] and emit `tracing::warn!` when an increment
+would overflow. This prevents silent wrap-around on long-lived actors with very high message
+rates or accumulated handle time.
 
 ---
 

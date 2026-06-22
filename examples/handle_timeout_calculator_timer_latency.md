@@ -58,7 +58,7 @@ flowchart TD
 | Input snapshot | `on_handle_begin(&msg)` | Copy operands before `handle()` runs |
 | Stuck persistence | `on_handle_stuck(ctx)` | Push snapshot to shared stuck journal |
 | Process recovery | RestForOne supervisor | Restart calculator, timer, **and** ledger |
-| Observability | `ActorMonitor::global()` | `handle_timeouts`, `messages_handled`, handle ms |
+| Observability | `ActorMonitor::global()` | `handle_timeouts`, `messages_handled`, handle ms (`usize`, saturating) |
 
 Shared `Arc<Mutex<SharedState>>` holds `last_result` (survives restart) and `stuck_actions` (populated on every timeout).
 
