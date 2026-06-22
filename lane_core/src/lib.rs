@@ -4,12 +4,19 @@
 //! |--------|----------------|
 //! | [`actor`] | `Actor` trait, `ActorRef`, spawn, link, monitor, hot upgrade |
 //! | [`config`] | `ActorConfig`, `DistributedConfig`, `DedicatedRuntime` |
-//! | [`monitor`] | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
-//! | [`registry`] | Process-global control-channel and supervisor-channel index |
-//! | [`supervisor`] | OTP restart strategies, `ChildRegistry`, `ChildSlot` |
+//! | [`monitor`] | `ActorMonitor`, `ActorStats`, `ActorMeta` — per-actor runtime counters |
+//! | [`metrics`] | Prometheus export (`metrics` feature) |
 
 pub mod actor;
 pub mod config;
 pub mod monitor;
 pub mod registry;
 pub mod supervisor;
+
+#[cfg(feature = "metrics")]
+pub mod metrics;
+
+pub use monitor::{ActorMeta, ActorMonitor, ActorStats};
+
+#[cfg(feature = "metrics")]
+pub use metrics::{exit_reason_label, init_metrics, render_prometheus_text, MetricsConfig};

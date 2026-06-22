@@ -93,6 +93,7 @@ async fn one_for_all_restarts_children_in_order() {
         child_spec(order, move |sup_tx, actor_config| {
             let log = log.clone();
             let fail_flag = fail_flag.clone();
+            let cfg = actor_config.clone();
             Box::pin(async move {
                 log.lock().await.push(order);
                 let (actor_ref, _) = lane_switchboards::actor::spawn_on_runtime(
@@ -103,7 +104,7 @@ async fn one_for_all_restarts_children_in_order() {
                         fail: fail_flag.clone(),
                     },
                     Some(sup_tx),
-                    &actor_config,
+                    &cfg,
                 )
                 .await?;
                 Ok(actor_ref)

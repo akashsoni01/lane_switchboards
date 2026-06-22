@@ -74,6 +74,23 @@ Counter updates use saturating arithmetic — values never wrap. When an increme
 exceed [`usize::MAX`], the counter is clamped and `tracing::warn!` records the field
 and actor id.
 
+### Prometheus export (`metrics` feature)
+
+Enable with `lane_core = { features = ["metrics"] }` or `lane_switchboards = { features = ["metrics"] }`.
+
+| API | Role |
+|-----|------|
+| `ActorConfig::monitor_meta` | Set `actor_name`, `actor_type`, etc. at spawn |
+| `init_metrics(MetricsConfig)` | Process-wide `node` / `dc` labels |
+| `render_prometheus_text()` | Grafana-ready text exposition |
+
+```bash
+cargo run --example metrics_exporter --features metrics
+# scrape http://127.0.0.1:9090/metrics
+```
+
+See [`docs/todo.md`](../docs/todo.md) for the full Grafana roadmap.
+
 ### `supervisor`
 
 | Type / Function | Role |

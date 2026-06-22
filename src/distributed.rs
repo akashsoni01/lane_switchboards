@@ -861,7 +861,7 @@ where
 {
     let node_name = node_name.into();
     let target = target.into();
-    let actor_config = *actor_config;
+    let actor_config = actor_config.clone();
 
     let (actor_ref, _actor_join) = spawn_on_runtime(runtime, actor, None, &actor_config)
         .await

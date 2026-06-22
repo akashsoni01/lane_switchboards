@@ -56,7 +56,11 @@ pub use consistency::{
 };
 #[cfg(feature = "metrics")]
 pub use consistency::ConsistencyMetrics;
-pub use monitor::{ActorMonitor, ActorStats};
+pub use monitor::{ActorMeta, ActorMonitor, ActorStats};
+#[cfg(feature = "metrics")]
+pub use lane_core::metrics;
+#[cfg(feature = "metrics")]
+pub use metrics::{exit_reason_label, init_metrics, render_prometheus_text, MetricsConfig};
 pub use distributed::{
     serve_actor, serve_actor_on_current_runtime, serve_actor_on_runtime, Cluster, ClusterMember,
     Node, NodeHandle, RemoteActorRef, RemoteMessage, TlsAcceptor, TlsConnector,

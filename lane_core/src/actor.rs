@@ -362,10 +362,10 @@ where
     let actor_ref = ActorRef { id, tx: tx.clone() };
 
     register_actor(id, control_tx, supervisor_tx);
-    ActorMonitor::global().register(id);
+    ActorMonitor::global().register(id, config.monitor_meta.clone(), config.mailbox_capacity);
 
     let boxed = into_dyn_actor(actor);
-    let config = *config;
+    let config = config.clone();
     let runtime = runtime.clone();
     let join = spawn_on(Some(&runtime), async move {
         run_actor(id, rx, control_rx, boxed, config).await;
@@ -391,7 +391,7 @@ async fn run_actor<M: Send + Sync + 'static>(
         let reason = ExitReason::Error(e.to_string());
         notify_supervisor(id, &reason).await;
         unregister_actor(id);
-        ActorMonitor::global().unregister(id);
+        ActorMonitor::global().unregister(id, Some(&reason));
         return;
     }
 
@@ -550,7 +550,7 @@ async fn finish_actor<M: Send + Sync + 'static>(
         propagate_linked_exit(id, &exit_reason, links).await;
     }
     unregister_actor(id);
-    ActorMonitor::global().unregister(id);
+    ActorMonitor::global().unregister(id, Some(&exit_reason));
 }
 
 fn should_propagate_linked_exit(reason: &ExitReason) -> bool {

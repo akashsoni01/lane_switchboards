@@ -66,7 +66,7 @@ pub trait ChildSpec<M: Send + Sync + 'static>: Send + Sync {
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
-        actor_config: ActorConfig,
+        actor_config: &ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>;
     fn set_id(&mut self, id: ActorId);
 }
@@ -83,7 +83,7 @@ where
     M: Send + Sync + 'static,
     F: Fn(
             mpsc::Sender<RestartSignal>,
-            ActorConfig,
+            &ActorConfig,
         ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync,
@@ -99,7 +99,7 @@ where
     fn restart(
         &self,
         supervisor_tx: mpsc::Sender<RestartSignal>,
-        actor_config: ActorConfig,
+        actor_config: &ActorConfig,
     ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>> {
         (self.factory)(supervisor_tx, actor_config)
     }
@@ -115,7 +115,7 @@ where
     M: Send + Sync + 'static,
     F: Fn(
             mpsc::Sender<RestartSignal>,
-            ActorConfig,
+            &ActorConfig,
         ) -> Pin<Box<dyn Future<Output = Result<ActorRef<M>, ActorProcessingErr>> + Send>>
         + Send
         + Sync
@@ -294,9 +294,10 @@ impl<M: Send + Sync + 'static> ChildSlot<M> {
             let slot = slot.clone();
             let build = build.clone();
             let handle = handle.clone();
+            let cfg = actor_config.clone();
             Box::pin(async move {
                 let (actor_ref, _) =
-                    spawn_on_runtime(&handle, build(), Some(sup_tx), &actor_config).await?;
+                    spawn_on_runtime(&handle, build(), Some(sup_tx), &cfg).await?;
                 slot.current.store(Arc::new(Some(actor_ref.clone())));
                 Ok(actor_ref)
             })
@@ -313,7 +314,7 @@ pub fn spawn_child_spec<M, K, B, F>(
 ) -> Box<dyn ChildSpec<M>>
 where
     M: Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + std::fmt::Debug + 'static,
     B: Actor<M> + Send + Sync + 'static,
     F: Fn() -> B + Send + Sync + 'static,
 {
@@ -325,9 +326,14 @@ where
         let name = name.clone();
         let build = build.clone();
         let handle = handle.clone();
+        let base_cfg = actor_config.clone();
         Box::pin(async move {
-            let (actor_ref, _) =
-                spawn_on_runtime(&handle, build(), Some(sup_tx), &actor_config).await?;
+            let mut cfg = base_cfg;
+            cfg.monitor_meta = cfg
+                .monitor_meta
+                .clone()
+                .with_name(format!("{name:?}"));
+            let (actor_ref, _) = spawn_on_runtime(&handle, build(), Some(sup_tx), &cfg).await?;
             registry.track_and_bump(name, actor_ref.clone()).await;
             Ok(actor_ref)
         })
@@ -414,7 +420,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
         let mut initial_refs = Vec::with_capacity(slots.len());
         for spec in slots.iter_mut() {
             let sup_tx = tx.clone();
-            let actor_ref = spec.restart(sup_tx, actor_config).await?;
+            let actor_ref = spec.restart(sup_tx, &actor_config).await?;
             spec.set_id(actor_ref.id);
             initial_refs.push(actor_ref);
         }
@@ -426,6 +432,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
         let config_clone = config.clone();
         let mut current_refs = initial_refs.clone();
 
+        let actor_config_loop = actor_config.clone();
         let join = tokio::spawn(async move {
             let mut restart_log: VecDeque<Instant> = VecDeque::new();
 
@@ -474,7 +481,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                         &mut current_refs,
                                         idx,
                                         &tx,
-                                        actor_config,
+                                        &actor_config_loop,
                                     )
                                     .await;
                                 }
@@ -486,7 +493,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                         &mut current_refs,
                                         idx,
                                         &tx,
-                                        actor_config,
+                                        &actor_config_loop,
                                     )
                                     .await;
                                 }
@@ -504,7 +511,7 @@ impl<M: Send + Sync + 'static> Supervisor<M> {
                                             &mut current_refs,
                                             idx,
                                             &tx,
-                                            actor_config,
+                                            &actor_config_loop,
                                         )
                                         .await;
                                     }
@@ -530,7 +537,7 @@ async fn restart_child<M: Send + Sync + 'static>(
     current_refs: &mut [ActorRef<M>],
     idx: usize,
     tx: &mpsc::Sender<RestartSignal>,
-    actor_config: ActorConfig,
+    actor_config: &ActorConfig,
 ) {
     let child_id = slots[idx].id();
     let sup_tx = tx.clone();
@@ -564,7 +571,7 @@ pub async fn supervise_named_child<M, K, B, F>(
 ) -> Result<SupervisorHandle<M>, ActorProcessingErr>
 where
     M: Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + std::fmt::Debug + 'static,
     B: Actor<M> + Send + Sync + 'static,
     F: Fn() -> B + Send + Sync + 'static,
 {
@@ -581,7 +588,7 @@ pub async fn supervise_named_child_settled<M, K, B, F>(
 ) -> Result<SupervisorHandle<M>, ActorProcessingErr>
 where
     M: Send + Sync + 'static,
-    K: Eq + Hash + Clone + Send + Sync + 'static,
+    K: Eq + Hash + Clone + Send + Sync + std::fmt::Debug + 'static,
     B: Actor<M> + Send + Sync + 'static,
     F: Fn() -> B + Send + Sync + 'static,
 {
@@ -614,13 +621,14 @@ where
     A: Actor<M> + Send + Sync + Clone + 'static,
 {
     let actor_prototype = actor.clone();
-    let child_config = *actor_config;
+    let child_config = actor_config.clone();
     let handle = Handle::current();
     let spec = child_spec(0, move |sup_tx, actor_config| {
         let a = actor_prototype.clone();
         let handle = handle.clone();
+        let cfg = actor_config.clone();
         Box::pin(async move {
-            spawn_on_runtime(&handle, a, Some(sup_tx), &actor_config)
+            spawn_on_runtime(&handle, a, Some(sup_tx), &cfg)
                 .await
                 .map(|(r, _)| r)
         })

@@ -3,7 +3,7 @@
 //! # Locking discipline
 //!
 //! `cells` and `post_mortem` are guarded by a `RwLock<HashMap>`.
-//! The read lock is held only long enough to clone the `Arc<StatsCell>`;
+//! The read lock is held only long enough to clone the `Arc<ActorCell>`;
 //! all counter updates happen on the `Arc` afterwards — no lock held on the hot path.
 //! Writes (`register`, `unregister`) take the write lock briefly and do no I/O inside it.
 //!
@@ -12,15 +12,50 @@
 //! All counters and millisecond fields use [`usize`]. Hot-path updates use
 //! saturating arithmetic; when a value would exceed [`usize::MAX`], it is clamped
 //! and a `tracing::warn!` is emitted once per overflow attempt (field + actor id).
+//!
+//! # Prometheus (`metrics` feature)
+//!
+//! Counters and histograms are pre-bound per actor at [`ActorMonitor::register`].
+//! Call [`crate::metrics::render_prometheus_text`] to export Grafana-ready text.
 
-use crate::actor::ActorId;
+use crate::actor::{ActorId, ExitReason};
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "metrics")]
+use crate::metrics::PromActorMetrics;
 
 static MONITOR: Lazy<ActorMonitor> = Lazy::new(ActorMonitor::new);
+
+/// Grafana / Prometheus labels for an actor (set via [`crate::config::ActorConfig::monitor_meta`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActorMeta {
+    pub name: Option<String>,
+    pub actor_type: Option<String>,
+    pub supervisor_id: Option<ActorId>,
+    pub node: Option<String>,
+    pub service: Option<String>,
+}
+
+impl ActorMeta {
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    pub fn with_actor_type(mut self, actor_type: impl Into<String>) -> Self {
+        self.actor_type = Some(actor_type.into());
+        self
+    }
+
+    pub fn with_supervisor(mut self, id: ActorId) -> Self {
+        self.supervisor_id = Some(id);
+        self
+    }
+}
 
 /// Clamp a `Duration` to milliseconds that fit in [`usize`].
 #[inline(always)]
@@ -30,6 +65,7 @@ fn duration_ms(d: Duration) -> usize {
 
 /// Saturating add to `counter`; warn when `prev + delta` would overflow [`usize`].
 fn fetch_add_saturating(
+    cell: &ActorCell,
     counter: &AtomicUsize,
     delta: usize,
     field: &'static str,
@@ -50,6 +86,8 @@ fn fetch_add_saturating(
                     delta,
                     "actor stat counter overflow; clamped to usize::MAX"
                 );
+                #[cfg(feature = "metrics")]
+                crate::metrics::record_counter_saturated(field, &cell.meta);
                 usize::MAX
             }
         };
@@ -62,14 +100,15 @@ fn fetch_add_saturating(
     }
 }
 
-fn inc_counter(counter: &AtomicUsize, field: &'static str, id: ActorId) {
-    fetch_add_saturating(counter, 1, field, id);
+fn inc_counter(cell: &ActorCell, counter: &AtomicUsize, field: &'static str, id: ActorId) {
+    fetch_add_saturating(cell, counter, 1, field, id);
 }
 
 /// Snapshot of one actor's runtime counters (deadlock / slow-handle detection).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorStats {
     pub actor_id: ActorId,
+    pub meta: ActorMeta,
     pub messages_handled: usize,
     pub handle_errors: usize,
     pub panics: usize,
@@ -112,12 +151,13 @@ impl StatsCell {
         }
     }
 
-    fn snapshot(&self, id: ActorId) -> ActorStats {
+    fn snapshot(&self, id: ActorId, meta: &ActorMeta) -> ActorStats {
         let messages_handled = self.messages_handled.load(Ordering::Relaxed);
         let total_handle_ms = self.total_handle_ms.load(Ordering::Relaxed);
         let mean_handle_ms = total_handle_ms.checked_div(messages_handled).unwrap_or(0);
         ActorStats {
             actor_id: id,
+            meta: meta.clone(),
             messages_handled,
             handle_errors: self.handle_errors.load(Ordering::Relaxed),
             panics: self.panics.load(Ordering::Relaxed),
@@ -131,7 +171,6 @@ impl StatsCell {
         }
     }
 
-    /// Saturating decrement of `in_flight` — never wraps to [`usize::MAX`].
     fn dec_in_flight(&self) {
         self.in_flight
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -141,16 +180,21 @@ impl StatsCell {
     }
 }
 
+struct ActorCell {
+    stats: StatsCell,
+    meta: ActorMeta,
+    registered_at: Instant,
+    last_handle_unix_ms: AtomicU64,
+    mailbox_capacity: usize,
+    #[allow(dead_code)]
+    #[cfg(feature = "metrics")]
+    prom: Option<PromActorMetrics>,
+}
+
 /// Process-global actor monitor (stats for every registered actor).
-///
-/// Live stats are held in `cells` (one `Arc<StatsCell>` per running actor).  On exit
-/// the cell is removed and a final `ActorStats` snapshot is stored in `post_mortem`
-/// so callers can still read stats for a recently-stopped actor.
-/// Post-mortem entries are evicted by `purge` or when the same id re-registers
-/// (which never happens in practice — ids are monotonically assigned).
 #[derive(Clone)]
 pub struct ActorMonitor {
-    cells: Arc<RwLock<HashMap<ActorId, Arc<StatsCell>>>>,
+    cells: Arc<RwLock<HashMap<ActorId, Arc<ActorCell>>>>,
     post_mortem: Arc<RwLock<HashMap<ActorId, ActorStats>>>,
 }
 
@@ -166,54 +210,57 @@ impl ActorMonitor {
         &MONITOR
     }
 
-    pub fn register(&self, id: ActorId) {
+    pub fn register(&self, id: ActorId, meta: ActorMeta, mailbox_capacity: usize) {
         self.post_mortem.write().unwrap().remove(&id);
-        self.cells
-            .write()
-            .unwrap()
-            .entry(id)
-            .or_insert_with(|| Arc::new(StatsCell::new()));
+        #[cfg(feature = "metrics")]
+        let prom = crate::metrics::bind_actor_metrics(&meta, mailbox_capacity);
+        #[cfg(not(feature = "metrics"))]
+        let _ = (&meta, mailbox_capacity);
+        let cell = Arc::new(ActorCell {
+            stats: StatsCell::new(),
+            meta,
+            registered_at: Instant::now(),
+            last_handle_unix_ms: AtomicU64::new(0),
+            mailbox_capacity,
+            #[cfg(feature = "metrics")]
+            prom,
+        });
+        self.cells.write().unwrap().insert(id, cell);
     }
 
-    /// Capture a final snapshot into the post-mortem store, then drop the live cell.
-    ///
-    /// After this call `get(id)` returns the frozen snapshot; `in_flight` is
-    /// forced to 0 in the snapshot so external readers see a clean final state.
-    pub fn unregister(&self, id: ActorId) {
+    pub fn unregister(&self, id: ActorId, reason: Option<&ExitReason>) {
         if let Some(cell) = self.cells.write().unwrap().remove(&id) {
-            let mut snapshot = cell.snapshot(id);
+            #[cfg(feature = "metrics")]
+            if let (Some(prom), Some(reason)) = (&cell.prom, reason) {
+                crate::metrics::record_exit(prom, reason);
+            }
+            let mut snapshot = cell.stats.snapshot(id, &cell.meta);
             snapshot.in_flight = 0;
             self.post_mortem.write().unwrap().insert(id, snapshot);
         }
     }
 
-    /// Capture the final stats snapshot and remove both live and post-mortem entries.
-    ///
-    /// Use this when you want to consume the final stats exactly once (e.g. structured
-    /// logging on exit) without retaining a post-mortem entry.
     pub fn snapshot_and_unregister(&self, id: ActorId) -> Option<ActorStats> {
         self.post_mortem
             .write()
             .unwrap()
             .remove(&id)
             .or_else(|| {
-                self.cells
-                    .write()
-                    .unwrap()
-                    .remove(&id)
-                    .map(|cell| cell.snapshot(id))
+                self.cells.write().unwrap().remove(&id).map(|cell| {
+                    let mut snapshot = cell.stats.snapshot(id, &cell.meta);
+                    snapshot.in_flight = 0;
+                    snapshot
+                })
             })
     }
 
-    /// Remove the post-mortem entry for `id` once you have consumed the final snapshot.
     pub fn purge(&self, id: ActorId) {
         self.post_mortem.write().unwrap().remove(&id);
     }
 
-    /// Look up stats for a live *or* recently-stopped actor.
     pub fn get(&self, id: ActorId) -> Option<ActorStats> {
         if let Some(cell) = self.cells.read().unwrap().get(&id).cloned() {
-            return Some(cell.snapshot(id));
+            return Some(cell.stats.snapshot(id, &cell.meta));
         }
         self.post_mortem.read().unwrap().get(&id).cloned()
     }
@@ -224,22 +271,53 @@ impl ActorMonitor {
             .read()
             .unwrap()
             .iter()
-            .map(|(&id, cell)| cell.snapshot(id))
+            .map(|(&id, cell)| cell.stats.snapshot(id, &cell.meta))
             .collect();
         out.sort_by_key(|s| s.actor_id.0);
         out
     }
 
-    // --- hot-path helpers: clone Arc under brief read lock, then update lock-free ---
+    /// Refresh Prometheus gauges from live actor cells (call before scrape).
+    #[cfg(feature = "metrics")]
+    pub fn sync_prometheus_gauges(&self) {
+        let cells: Vec<_> = self.cells.read().unwrap().values().cloned().collect();
+        for cell in cells {
+            let Some(prom) = &cell.prom else { continue };
+            let stats = cell.stats.snapshot(ActorId(0), &cell.meta);
+            crate::metrics::sync_scrape_gauges(
+                cell.registered_at,
+                cell.last_handle_unix_ms.load(Ordering::Relaxed),
+                prom,
+                stats.in_flight,
+                stats.last_handle_ms,
+                stats.max_handle_ms,
+                0,
+            );
+        }
+    }
 
-    fn cell(&self, id: ActorId) -> Option<Arc<StatsCell>> {
+    fn cell(&self, id: ActorId) -> Option<Arc<ActorCell>> {
         self.cells.read().unwrap().get(&id).cloned()
     }
 
-    pub(crate) fn begin_handle(&self, id: ActorId) {
-        if let Some(cell) = self.cell(id) {
-            inc_counter(&cell.in_flight, "in_flight", id);
+    fn sync_in_flight_gauge(cell: &ActorCell) {
+        #[cfg(feature = "metrics")]
+        if let Some(prom) = &cell.prom {
+            prom.in_flight
+                .set(cell.stats.in_flight.load(Ordering::Relaxed) as f64);
         }
+    }
+
+    fn touch_last_handle(cell: &ActorCell) {
+        if let Ok(ms) = unix_now_ms() {
+            cell.last_handle_unix_ms.store(ms, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn begin_handle(&self, id: ActorId) {
+        let Some(cell) = self.cell(id) else { return };
+        inc_counter(&cell, &cell.stats.in_flight, "in_flight", id);
+        Self::sync_in_flight_gauge(&cell);
     }
 
     pub(crate) fn finish_handle(
@@ -250,20 +328,19 @@ impl ActorMonitor {
     ) {
         let Some(cell) = self.cell(id) else { return };
         let ms = duration_ms(elapsed);
-        cell.dec_in_flight();
-        inc_counter(&cell.messages_handled, "messages_handled", id);
-        cell.last_handle_ms.store(ms, Ordering::Relaxed);
-        fetch_add_saturating(&cell.total_handle_ms, ms, "total_handle_ms", id);
+        cell.stats.dec_in_flight();
+        inc_counter(&cell, &cell.stats.messages_handled, "messages_handled", id);
+        cell.stats.last_handle_ms.store(ms, Ordering::Relaxed);
+        fetch_add_saturating(&cell, &cell.stats.total_handle_ms, ms, "total_handle_ms", id);
+        Self::touch_last_handle(&cell);
 
-        // Spin to update the running maximum. compare_exchange_weak avoids an
-        // extra barrier; Acquire on failure ensures the reload of `prev` sees
-        // the latest stored value.
         loop {
-            let prev = cell.max_handle_ms.load(Ordering::Relaxed);
+            let prev = cell.stats.max_handle_ms.load(Ordering::Relaxed);
             if ms <= prev {
                 break;
             }
             if cell
+                .stats
                 .max_handle_ms
                 .compare_exchange_weak(prev, ms, Ordering::Relaxed, Ordering::Acquire)
                 .is_ok()
@@ -272,9 +349,11 @@ impl ActorMonitor {
             }
         }
 
+        let mut slow = false;
         if let Some(threshold) = slow_threshold {
             if elapsed > threshold {
-                inc_counter(&cell.slow_handles, "slow_handles", id);
+                slow = true;
+                inc_counter(&cell, &cell.stats.slow_handles, "slow_handles", id);
                 tracing::warn!(
                     %id,
                     handle_ms = ms,
@@ -283,38 +362,61 @@ impl ActorMonitor {
                 );
             }
         }
+
+        #[cfg(feature = "metrics")]
+        if let Some(prom) = &cell.prom {
+            prom.messages_handled.inc();
+            if slow {
+                prom.slow_handles.inc();
+            }
+            crate::metrics::observe_handle_duration(prom, elapsed);
+            prom.last_handle_seconds.set(elapsed.as_secs_f64());
+            let max_ms = cell.stats.max_handle_ms.load(Ordering::Relaxed);
+            prom.max_handle_seconds.set(max_ms as f64 / 1000.0);
+        }
+        Self::sync_in_flight_gauge(&cell);
     }
 
     pub(crate) fn record_error(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
-            inc_counter(&cell.handle_errors, "handle_errors", id);
-            cell.dec_in_flight();
+            inc_counter(&cell, &cell.stats.handle_errors, "handle_errors", id);
+            cell.stats.dec_in_flight();
+            #[cfg(feature = "metrics")]
+            if let Some(prom) = &cell.prom {
+                prom.handle_errors.inc();
+            }
+            Self::sync_in_flight_gauge(&cell);
         }
     }
 
     pub(crate) fn record_panic(&self, id: ActorId) {
         if let Some(cell) = self.cell(id) {
-            inc_counter(&cell.panics, "panics", id);
-            cell.dec_in_flight();
+            inc_counter(&cell, &cell.stats.panics, "panics", id);
+            cell.stats.dec_in_flight();
+            #[cfg(feature = "metrics")]
+            if let Some(prom) = &cell.prom {
+                prom.panics.inc();
+            }
+            Self::sync_in_flight_gauge(&cell);
         }
     }
 
     pub(crate) fn record_timeout(&self, id: ActorId, elapsed: Duration) {
         if let Some(cell) = self.cell(id) {
-            inc_counter(&cell.handle_timeouts, "handle_timeouts", id);
-            // Count as a handled message so messages_handled is consistent with
-            // total_handle_ms (both include the timed-out call).
-            inc_counter(&cell.messages_handled, "messages_handled", id);
-            cell.dec_in_flight();
+            inc_counter(&cell, &cell.stats.handle_timeouts, "handle_timeouts", id);
+            inc_counter(&cell, &cell.stats.messages_handled, "messages_handled", id);
+            cell.stats.dec_in_flight();
             let ms = duration_ms(elapsed);
-            cell.last_handle_ms.store(ms, Ordering::Relaxed);
-            fetch_add_saturating(&cell.total_handle_ms, ms, "total_handle_ms", id);
+            cell.stats.last_handle_ms.store(ms, Ordering::Relaxed);
+            fetch_add_saturating(&cell, &cell.stats.total_handle_ms, ms, "total_handle_ms", id);
+            Self::touch_last_handle(&cell);
             loop {
-                let prev = cell.max_handle_ms.load(Ordering::Relaxed);
+                let prev = cell.stats.max_handle_ms.load(Ordering::Relaxed);
                 if ms <= prev {
                     break;
                 }
                 if cell
+                    .stats
                     .max_handle_ms
                     .compare_exchange_weak(prev, ms, Ordering::Relaxed, Ordering::Acquire)
                     .is_ok()
@@ -322,6 +424,14 @@ impl ActorMonitor {
                     break;
                 }
             }
+            #[cfg(feature = "metrics")]
+            if let Some(prom) = &cell.prom {
+                prom.handle_timeouts.inc();
+                prom.messages_handled.inc();
+                crate::metrics::observe_handle_duration(prom, elapsed);
+                prom.last_handle_seconds.set(elapsed.as_secs_f64());
+            }
+            Self::sync_in_flight_gauge(&cell);
             tracing::error!(
                 %id,
                 handle_ms = ms,
@@ -337,34 +447,38 @@ impl Default for ActorMonitor {
     }
 }
 
+fn unix_now_ms() -> Result<u64, std::time::SystemTimeError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn counter_saturates_at_usize_max() {
-        let counter = AtomicUsize::new(usize::MAX - 1);
+        let cell = Arc::new(ActorCell {
+            stats: StatsCell::new(),
+            meta: ActorMeta::default(),
+            registered_at: Instant::now(),
+            last_handle_unix_ms: AtomicU64::new(0),
+            mailbox_capacity: 64,
+            #[cfg(feature = "metrics")]
+            prom: None,
+        });
+        let counter = &cell.stats.messages_handled;
         let id = ActorId(42);
-        inc_counter(&counter, "messages_handled", id);
-        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX - 1 + 1);
-        inc_counter(&counter, "messages_handled", id);
-        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
-        inc_counter(&counter, "messages_handled", id);
-        assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
-    }
-
-    #[test]
-    fn fetch_add_saturating_clamps_large_delta() {
-        let counter = AtomicUsize::new(usize::MAX - 5);
-        let id = ActorId(7);
-        fetch_add_saturating(&counter, 10, "total_handle_ms", id);
+        counter.store(usize::MAX - 1, Ordering::Relaxed);
+        inc_counter(&cell, counter, "messages_handled", id);
         assert_eq!(counter.load(Ordering::Relaxed), usize::MAX);
     }
 
     #[test]
     fn snapshot_mean_handle_ms_zero_when_no_messages() {
         let cell = StatsCell::new();
-        let stats = cell.snapshot(ActorId(1));
+        let stats = cell.snapshot(ActorId(1), &ActorMeta::default());
         assert_eq!(stats.mean_handle_ms, 0);
         assert_eq!(stats.messages_handled, 0);
     }
@@ -374,5 +488,18 @@ mod tests {
         let cell = StatsCell::new();
         cell.dec_in_flight();
         assert_eq!(cell.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn register_and_get_round_trip() {
+        let mon = ActorMonitor::new();
+        let id = ActorId(99);
+        mon.register(
+            id,
+            ActorMeta::default().with_name("worker"),
+            32,
+        );
+        let stats = mon.get(id).expect("stats");
+        assert_eq!(stats.meta.name.as_deref(), Some("worker"));
     }
 }

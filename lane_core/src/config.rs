@@ -7,7 +7,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 
 /// Actor mailbox sizing and deadlock / slow-handle limits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorConfig {
     pub mailbox_capacity: usize,
     /// Max wall time for one `handle()` call. Exceeded → `on_handle_stuck` then actor exit.
@@ -16,6 +16,8 @@ pub struct ActorConfig {
     /// Log + count handles that finish successfully but exceed this duration.
     /// Defaults to `handle_timeout` when set; `None` disables slow-handle warnings.
     pub slow_handle_threshold: Option<Duration>,
+    /// Labels for [`crate::monitor::ActorMonitor`] / Prometheus export.
+    pub monitor_meta: crate::monitor::ActorMeta,
 }
 
 impl Default for ActorConfig {
@@ -24,6 +26,7 @@ impl Default for ActorConfig {
             mailbox_capacity: 64,
             handle_timeout: None,
             slow_handle_threshold: None,
+            monitor_meta: crate::monitor::ActorMeta::default(),
         }
     }
 }

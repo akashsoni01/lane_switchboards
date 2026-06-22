@@ -47,7 +47,7 @@ webpki-roots = { version = "0.26", optional = true }
 
 [features]
 default = []
-metrics = []
+metrics = ["lane_core/metrics"]
 watch_sync = []
 tls = [
     "dep:rustls",
@@ -215,6 +215,11 @@ path = "examples/multi_dc_heartbeat_prod.rs"
 [[example]]
 name = "resilient_monitor"
 path = "examples/resilient_monitor.rs"
+
+[[example]]
+name = "metrics_exporter"
+path = "examples/metrics_exporter.rs"
+required-features = ["metrics"]
 
 [[example]]
 name = "distributed_key_value"
