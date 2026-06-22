@@ -160,6 +160,8 @@ Import [`docs/grafana/actor-runtime.json`](../docs/grafana/actor-runtime.json) i
 
 Use histogram quantiles in Grafana — not `mean_handle_ms` — for latency SLOs.
 
+See [`monitor.md`](monitor.md) for connecting `lane_core` to an existing Prometheus/Grafana stack, hot-actor tuning, and migrating from `resilient_monitor`.
+
 See [`docs/todo.md`](../docs/todo.md) for the full Grafana roadmap.
 
 ### `supervisor`
