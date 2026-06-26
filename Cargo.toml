@@ -48,7 +48,7 @@ webpki-roots = { version = "0.26", optional = true }
 [features]
 default = []
 monitor = ["lane_core/monitor"]
-metrics = ["lane_core/metrics"]
+metrics = ["lane_core/metrics", "monitor"]
 watch_sync = []
 tls = [
     "dep:rustls",

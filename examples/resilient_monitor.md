@@ -1,16 +1,110 @@
 # resilient_monitor — ActorMonitor in action
 
-[`resilient_monitor.rs`](./resilient_monitor.rs) walks through every counter in [`ActorMonitor`](../lane_core/src/monitor.rs) across five phases: normal work, slow handles, panics, handle timeouts, and a global snapshot.
+[`resilient_monitor.rs`](./resilient_monitor.rs) walks through every counter in [`ActorMonitor`](../lane_core/src/monitor/mod.rs) across five phases: normal work, slow handles, panics, handle timeouts, and a global snapshot.
+
+```bash
+# In-process stats only (stdout)
+cargo run --example resilient_monitor --features monitor
+
+# Same demo + Prometheus export on :9090 (for Grafana)
+cargo run --example resilient_monitor --features metrics
+```
+
+---
+
+## Run with Docker (Prometheus + Grafana)
+
+Use two terminals. Port **9090** on the host is the metrics exporter — run **one** example at a time.
+
+### Terminal 1 — observability stack
+
+```bash
+docker compose -f docs/grafana/docker-compose.yml up
+```
+
+| Service | URL |
+|---------|-----|
+| Grafana | http://localhost:3000 (`admin` / `admin`) |
+| Prometheus | http://localhost:9091 |
+
+Grafana auto-loads the **Lane Actor Runtime** dashboard (see [`docs/grafana/docker-compose.yml`](../docs/grafana/docker-compose.yml)).
+
+### Terminal 2 — monitor demo with metrics export
+
+```bash
+cargo run --example resilient_monitor --features metrics
+```
+
+The example:
+
+1. Prints all five phases to stdout (panics, slow handles, timeouts).
+2. Exposes `http://127.0.0.1:9090/metrics` for Prometheus to scrape.
+3. Waits for Ctrl-C after `Done.` so Grafana can read the final counters.
+
+While it runs, check Prometheus (http://localhost:9091):
+
+```promql
+rate(lane_actor_panics_total[5m])
+rate(lane_actor_slow_handles_total[5m])
+rate(lane_actor_handle_timeouts_total[5m])
+```
+
+Open Grafana → **Lane → Lane Actor Runtime** and set the time range to **Last 15 minutes**.
+
+### Alternative — steady traffic demo
+
+For continuous message rate instead of the phased tour, use [`metrics_exporter`](./metrics_exporter.md) in Terminal 2 instead (stop `resilient_monitor` first).
+
+---
+
+## Manual setup (no Docker)
+
+### 1. Run the example
+
+**Stdout only:**
 
 ```bash
 cargo run --example resilient_monitor --features monitor
 ```
 
+**With Prometheus export:**
+
+```bash
+cargo run --example resilient_monitor --features metrics
+```
+
+Leave the process running after `Done.` when using metrics (Ctrl-C to exit).
+
+### 2. Point Prometheus at the exporter
+
+Add to your `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: lane_resilient_monitor
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+```
+
+Reload Prometheus. Confirm **Targets** shows the job **UP** and:
+
+```bash
+curl -s http://127.0.0.1:9090/metrics | grep lane_actor_panics
+```
+
+### 3. Grafana (existing install)
+
+1. Add a Prometheus datasource pointing at your Prometheus server.
+2. Import [`docs/grafana/actor-runtime.json`](../docs/grafana/actor-runtime.json).
+3. Run the example with `--features metrics`, then query panels for panics, timeouts, and slow handles.
+
+See [`metrics_exporter.md`](./metrics_exporter.md) for full manual Prometheus + Grafana install steps (Homebrew, ports, import flow).
+
 ---
 
 ## What `ActorMonitor` tracks
 
-All counters and millisecond fields in [`ActorStats`](../lane_core/src/monitor.rs) are [`usize`].
+All counters and millisecond fields in [`ActorStats`](../lane_core/src/monitor/mod.rs) are [`usize`].
 Hot-path updates use saturating arithmetic — when a counter would exceed [`usize::MAX`], it is
 clamped and `tracing::warn!` records the field and actor id (counters never wrap).
 
@@ -29,7 +123,14 @@ clamped and `tracing::warn!` records the field and actor id (counters never wrap
 
 Stats for a stopped actor are preserved as a **post-mortem snapshot** — readable via `ActorMonitor::global().get(id)` until `purge(id)` is called.
 
-For Grafana dashboards, enable the `metrics` feature and see the [Prometheus series mapping](../lane_core/README.md#prometheus-series-mapping) in `lane_core/README.md`, or run [`metrics_exporter`](./metrics_exporter.md).
+For Grafana dashboards, use `--features metrics` or see the [Prometheus series mapping](../lane_core/README.md#prometheus-series-mapping) in `lane_core/README.md`.
+
+| Demo phase | Prometheus series (with `metrics` feature) |
+|------------|---------------------------------------------|
+| Normal work | `lane_actor_messages_handled_total` |
+| Slow handle | `lane_actor_slow_handles_total` |
+| Panic | `lane_actor_panics_total`, `lane_actor_exits_total{reason="panic"}` |
+| Handle timeout | `lane_actor_handle_timeouts_total`, `lane_actor_exits_total{reason="handle_timeout"}` |
 
 ---
 
@@ -70,6 +171,8 @@ ActorConfig {
     ..Default::default()
 }
 ```
+
+With `--features metrics`, `monitor_meta` is set automatically (`worker` / `MonitoredWorker` labels).
 
 ---
 
@@ -152,80 +255,17 @@ let all = ActorMonitor::global().all();
 
 === Phase 1: normal work (5 × add) ===
 
-  add(1, 1) = 2
-  add(2, 1) = 3
-  add(3, 1) = 4
-  add(4, 1) = 5
-  add(5, 1) = 6
   [actor#2  live]
     messages_handled : 5
-    panics           : 0
-    handle_timeouts  : 0
-    slow_handles     : 0
-    handle_errors    : 0
-    last_handle_ms   : 0
-    max_handle_ms    : 0
-    mean_handle_ms   : 0
-    in_flight        : 0
+    ...
 
 === Phase 2: slow handle (delay 25ms > threshold 15ms) ===
-
-  slow_work reply: done after 25ms
-  [actor#2  live — after slow work]
-    messages_handled : 6
-    panics           : 0
-    handle_timeouts  : 0
-    slow_handles     : 1
-    handle_errors    : 0
-    last_handle_ms   : 27
-    max_handle_ms    : 27
-    mean_handle_ms   : 4
-    in_flight        : 0
-
-=== Phase 3: panic → supervisor restart ===
-
-[worker] post_stop
-[worker] generation 2 starting
-  [actor#2  post-mortem (crashed)]
-    messages_handled : 6
-    panics           : 1
-    handle_timeouts  : 0
-    slow_handles     : 1
-    handle_errors    : 0
-    last_handle_ms   : 27
-    max_handle_ms    : 27
-    mean_handle_ms   : 4
-    in_flight        : 0
-
-  new actor after restart: actor#3
-  add(100, 1) = 101
-  [actor#3  live — fresh generation]
-    messages_handled : 1
-    panics           : 0
-    …
-
-=== Phase 4: handle timeout (hang forever, limit 80ms) ===
-
-[worker] stuck on Some("HangForever") — elapsed 81ms (limit 80ms)
-[worker] post_stop
-[worker] generation 3 starting
-  [actor#3  post-mortem (timed out)]
-    messages_handled : 1
-    handle_timeouts  : 1
-    last_handle_ms   : 81
-    in_flight        : 0
-
-  new actor after timeout restart: actor#4
-  add(7, 3) = 10
-
-=== Phase 5: ActorMonitor::global().all() ===
-
-  1 live actor(s):
-    actor#4  handled=1 panics=0 timeouts=0 slow=0 mean_ms=0
-
-  total actor generations (includes initial): 3
+  ...
 
 Done.
+
+Metrics exported — open Grafana (http://localhost:3000) and query panics/timeouts.
+Press Ctrl-C to stop the metrics server.
 ```
 
 Actor IDs are monotonically assigned at spawn time, so the exact numbers will vary across runs. What matters: each restart produces a **new id**, the old id's post-mortem is readable, and `in_flight` is always 0 in post-mortem snapshots.
@@ -282,7 +322,8 @@ rates or accumulated handle time.
 
 ## Related
 
+- [`metrics_exporter.md`](./metrics_exporter.md) — steady `/metrics` traffic + Docker/manual Grafana setup
+- [`lane_core/monitor.md`](../lane_core/monitor.md) — production integration guide
 - [`resilient_calculator.md`](./resilient_calculator.md) — supervised panic recovery without monitor focus
 - [`single_child_supervisor.md`](./single_child_supervisor.md) — `ChildSlot` + `handle_timeout` + stuck journal
-- [`handle_timeout_calculator_timer_latency.rs`](./handle_timeout_calculator_timer_latency.rs) — latency benchmark with monitor stats
 - [`lane_core/README.md`](../lane_core/README.md) — `ActorStats` field reference

@@ -5,12 +5,14 @@
 //! ```
 //!
 //! Scrape `http://127.0.0.1:9090/metrics` with Prometheus or curl.
-//! Import Grafana dashboards from `docs/grafana/` (see `docs/todo.md`).
+//! Import Grafana dashboards from `docs/grafana/` (see `examples/metrics_exporter.md`).
+//!
+//! Press Ctrl-C to stop. See the README for Docker + manual Prometheus/Grafana setup.
 
 use lane_switchboards::actor::{Actor, ActorProcessingErr};
 use lane_switchboards::config::ActorConfig;
-use lane_switchboards::metrics::{init_metrics, render_prometheus_text, serve_metrics_http, MetricsConfig};
-use lane_switchboards::monitor::{ActorMeta, ActorMonitor};
+use lane_switchboards::metrics::{init_metrics, serve_metrics_http, MetricsConfig};
+use lane_switchboards::monitor::ActorMeta;
 use lane_switchboards::supervisor::{supervise_actor_with_config, SupervisorConfig};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -62,30 +64,26 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = "127.0.0.1:9090".parse()?;
     println!("metrics_exporter listening on http://{addr}/metrics");
     println!("PromQL example: rate(lane_actor_messages_handled_total[1m])");
-    println!("Docker stack: docs/grafana/docker-compose.yml");
+    println!("Docker stack: docker compose -f docs/grafana/docker-compose.yml up");
+    println!("Press Ctrl-C to stop.");
 
-    let metrics_task = tokio::spawn(serve_metrics_http(addr));
+    tokio::spawn(serve_metrics_http(addr));
 
-    for _ in 0..20 {
-        worker
-            .send(WorkMsg::Ping)
-            .await
-            .expect("send ping");
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                if worker.send(WorkMsg::Ping).await.is_err() {
+                    eprintln!("worker send failed — stopping ping loop");
+                    break;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                println!("\nshutting down");
+                break;
+            }
+        }
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    if let Some(stats) = ActorMonitor::global().get(worker.id) {
-        println!(
-            "local stats: handled={} mailbox_depth={} mean_ms={}",
-            stats.messages_handled, stats.mailbox_depth, stats.mean_handle_ms
-        );
-    }
-
-    let sample = render_prometheus_text()?;
-    assert!(sample.contains("lane_actor_mailbox_wait_seconds"));
-    let lines: usize = sample.lines().filter(|l| !l.starts_with('#')).count();
-    println!("prometheus sample lines (non-comment): {lines}");
-
-    metrics_task.abort();
     Ok(())
 }

@@ -17,6 +17,10 @@
 use lane_switchboards::actor::{Actor, ActorId, ActorProcessingErr, ActorRef, HandleStuckContext};
 use lane_switchboards::config::ActorConfig;
 use lane_switchboards::monitor::{ActorMonitor, ActorStats};
+#[cfg(feature = "metrics")]
+use lane_switchboards::metrics::{init_metrics, serve_metrics_http, MetricsConfig};
+#[cfg(feature = "metrics")]
+use lane_switchboards::monitor::ActorMeta;
 use lane_switchboards::supervisor::{
     ChildSlot, RestartStrategy, Supervisor, SupervisorConfig, SupervisorHandle,
 };
@@ -144,6 +148,10 @@ impl WorkerApp {
         let actor_config = ActorConfig {
             handle_timeout: Some(Duration::from_millis(80)),
             slow_handle_threshold: Some(Duration::from_millis(15)),
+            #[cfg(feature = "metrics")]
+            monitor_meta: ActorMeta::default()
+                .with_name("worker")
+                .with_actor_type("MonitoredWorker"),
             ..Default::default()
         };
 
@@ -220,6 +228,17 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .init();
+
+    #[cfg(feature = "metrics")]
+    {
+        init_metrics(MetricsConfig {
+            node: Some("resilient_monitor".into()),
+            ..Default::default()
+        });
+        let metrics_addr: std::net::SocketAddr = "127.0.0.1:9090".parse().expect("metrics addr");
+        println!("Prometheus metrics on http://{metrics_addr}/metrics");
+        tokio::spawn(serve_metrics_http(metrics_addr));
+    }
 
     let restarts = Arc::new(AtomicU64::new(0));
     let app = WorkerApp::start(restarts.clone())
@@ -318,5 +337,16 @@ async fn main() -> anyhow::Result<()> {
     );
 
     println!("\nDone.");
+
+    #[cfg(feature = "metrics")]
+    {
+        println!(
+            "\nMetrics exported — open Grafana (http://localhost:3000) and query panics/timeouts."
+        );
+        println!("Press Ctrl-C to stop the metrics server.");
+        tokio::signal::ctrl_c().await?;
+        println!("shutting down");
+    }
+
     Ok(())
 }
