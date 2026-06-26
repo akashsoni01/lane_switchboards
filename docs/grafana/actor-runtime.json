@@ -151,19 +151,24 @@
       "id": 5,
       "targets": [
         {
-          "expr": "sum(rate(lane_actor_handle_timeouts_total[5m]))",
-          "legendFormat": "timeouts/sec",
+          "expr": "sum(increase(lane_actor_handle_timeouts_total[$__range]))",
+          "legendFormat": "timeouts (range)",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(lane_actor_panics_total[5m]))",
-          "legendFormat": "panics/sec",
+          "expr": "sum(increase(lane_actor_panics_total[$__range]))",
+          "legendFormat": "panics (range)",
           "refId": "B"
         },
         {
-          "expr": "sum(rate(lane_actor_slow_handles_total[5m]))",
-          "legendFormat": "slow/sec",
+          "expr": "sum(increase(lane_actor_slow_handles_total[$__range]))",
+          "legendFormat": "slow (range)",
           "refId": "C"
+        },
+        {
+          "expr": "sum(rate(lane_actor_panics_total[$__rate_interval]))",
+          "legendFormat": "panics/sec",
+          "refId": "D"
         }
       ],
       "title": "Failures & slow handles",

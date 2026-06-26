@@ -124,11 +124,65 @@ Same as [`metrics_exporter.md`](./metrics_exporter.md#manual-setup-no-docker):
 
 ---
 
+## Grafana: panics/sec looks flat?
+
+### 1. Port 9090 conflict (most common)
+
+Prometheus scrapes `host.docker.internal:9090`. If **`metrics_exporter`** or an old demo is still running, Grafana shows **that** process (often `node="metrics_exporter"`, `panics=0`) while your new demo prints correct stats locally.
+
+```bash
+lsof -i :9090          # find the PID
+kill <pid>             # stop the stale exporter
+```
+
+`observability_demo` now **fails at startup** if port 9090 is busy. Or use another port:
+
+```bash
+METRICS_ADDR=127.0.0.1:9092 cargo run --example observability_demo --features metrics
+# add host.docker.internal:9092 to docs/grafana/prometheus.yml and restart prometheus
+```
+
+### 2. `rate()` hides one-shot events
+
+The demo panics **once** in ~30s. `rate(lane_actor_panics_total[5m])` averages over 5 minutes → **~0 panics/sec** on the graph.
+
+The dashboard **Failures & slow handles** panel now includes:
+
+| Line | Query | What you should see |
+|------|-------|---------------------|
+| **panics (range)** | `increase(...[$__range])` | Spikes to **1** when you run the demo |
+| panics/sec | `rate(...[$__rate_interval])` | Near zero for a single panic (expected) |
+
+**Grafana checks:**
+
+1. Time range: **Last 5 minutes** (not Last 15m from an old run)
+2. Dashboard: **Lane → Lane Actor Runtime**
+3. Prometheus → **Explore**: `sum(increase(lane_actor_panics_total[15m]))` → should be ≥ 1
+
+### 3. Process exited before scrape
+
+With `OBSERVABILITY_AUTO_EXIT=1`, the `/metrics` server stops when the binary exits. Prometheus needs at least one scrape **while the process is still up** (default wait 30s). Use `OBSERVABILITY_KEEP_ALIVE_SECS=30` or higher.
+
+### 4. Recommended run order
+
+```bash
+# Terminal 1 — start FIRST, leave running
+docker compose -f docs/grafana/docker-compose.yml up
+
+# Terminal 2 — ensure 9090 is free, then run (no AUTO_EXIT while viewing Grafana)
+lsof -i :9090
+cargo run --example observability_demo --features metrics
+# leave running until you finish viewing Grafana, then Ctrl-C
+```
+
+---
+
 ## Environment variables
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `OBSERVABILITY_KEEP_ALIVE_SECS` | `25` | Wait before scrape verification |
+| `OBSERVABILITY_KEEP_ALIVE_SECS` | `30` | Wait before scrape verification (min 20) |
+| `METRICS_ADDR` | `127.0.0.1:9090` | Scrape listen address |
 | `OBSERVABILITY_AUTO_EXIT` | off | Set `1` to exit after verification (no Ctrl-C) |
 
 ---

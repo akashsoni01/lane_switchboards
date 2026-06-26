@@ -9,19 +9,12 @@
 //! cargo run --example observability_demo --features metrics
 //! ```
 //!
-//! See `examples/observability_demo.md` for manual Prometheus/Grafana setup and verification.
-
-/*
-# Terminal 1
-docker compose -f docs/grafana/docker-compose.yml up
-
-# Terminal 2
-cargo run --example observability_demo --features metrics
-
-# Scripted verify (no Ctrl-C)
-OBSERVABILITY_AUTO_EXIT=1 OBSERVABILITY_KEEP_ALIVE_SECS=12 \
-  cargo run --example observability_demo --features metrics
-*/
+//! # Scripted verify (no Ctrl-C)
+//! OBSERVABILITY_AUTO_EXIT=1 OBSERVABILITY_KEEP_ALIVE_SECS=30 \
+//!   cargo run --example observability_demo --features metrics
+//!
+//! **Port 9090** must be free — stop any other exporter first (`metrics_exporter`, prior demo).
+//! Override: `METRICS_ADDR=127.0.0.1:9092`
 use lane_switchboards::actor::{spawn_with_config, Actor, ActorId, ActorProcessingErr, ActorRef, HandleStuckContext};
 use lane_switchboards::config::ActorConfig;
 use lane_switchboards::metrics::{
@@ -444,6 +437,65 @@ fn export_optional_domain_metrics() {
     });
 }
 
+// ── metrics HTTP ─────────────────────────────────────────────────────────────
+
+fn metrics_addr_from_env() -> std::net::SocketAddr {
+    std::env::var("METRICS_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9090".into())
+        .parse()
+        .expect("METRICS_ADDR")
+}
+
+/// Fail fast if another process (e.g. `metrics_exporter`) already owns the scrape port.
+fn ensure_metrics_port_free(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    match std::net::TcpListener::bind(addr) {
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!(
+            "cannot bind {addr} ({e}).\n\
+             Another exporter is probably still running — Grafana will scrape the WRONG /metrics.\n\
+             Fix:\n\
+               lsof -i :{}\n\
+               kill <pid>    # stop metrics_exporter or an old observability_demo\n\
+             Or use a different port:\n\
+               METRICS_ADDR=127.0.0.1:9092 cargo run --example observability_demo --features metrics\n\
+             Then add target host.docker.internal:9092 to docs/grafana/prometheus.yml",
+            addr.port()
+        ),
+    }
+}
+
+/// Confirm Prometheus is scraping *this* process (not a stale exporter on the same port).
+fn verify_scrape_endpoint(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    let out = Command::new("curl")
+        .args(["-sf", &format!("http://{addr}/metrics")])
+        .output()
+        .map_err(|e| anyhow::anyhow!("curl failed: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("GET http://{addr}/metrics failed — metrics HTTP not reachable");
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let has_node = body.contains("node=\"observability_demo\"");
+    let panics = prom_counter_sum(&body, "lane_actor_panics_total", Some("observability_demo"));
+    if !has_node {
+        anyhow::bail!(
+            "http://{addr}/metrics has no node=\"observability_demo\" series.\n\
+             Prometheus/Grafana are likely scraping a different process on this port.\n\
+             Stop other exporters on port {} (see error above).",
+            addr.port()
+        );
+    }
+    if panics < 1.0 {
+        anyhow::bail!(
+            "http://{addr}/metrics shows lane_actor_panics_total=0 for observability_demo.\n\
+             Run the full demo phases before checking Grafana."
+        );
+    }
+    println!(
+        "\n  OK  scrape endpoint http://{addr}/metrics (node=observability_demo, panics={panics})"
+    );
+    Ok(())
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -458,9 +510,12 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     });
 
-    let metrics_addr: std::net::SocketAddr = "127.0.0.1:9090".parse().expect("metrics addr");
+    let metrics_addr = metrics_addr_from_env();
+    ensure_metrics_port_free(metrics_addr)?;
     tracing::info!(%metrics_addr, "metrics HTTP listening");
     tokio::spawn(serve_metrics_http(metrics_addr));
+    println!("Prometheus scrape: http://{metrics_addr}/metrics (node=observability_demo)");
+    println!("Grafana panel tip: use time range **Last 5 minutes** and refresh after phases finish.\n");
 
     let actor_config = ActorConfig {
         mailbox_capacity: 4,
@@ -604,10 +659,13 @@ async fn main() -> anyhow::Result<()> {
     let keep_alive = std::env::var("OBSERVABILITY_KEEP_ALIVE_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(25);
+        .unwrap_or(30)
+        .max(20);
     tracing::info!(keep_alive, "waiting for Prometheus scrape");
-    println!("\nWaiting {keep_alive}s for Prometheus/Grafana scrape…");
+    println!("\nWaiting {keep_alive}s for Prometheus to scrape (interval 10s)…");
     tokio::time::sleep(Duration::from_secs(keep_alive)).await;
+
+    verify_scrape_endpoint(metrics_addr)?;
 
     let body = render_prometheus_text()?;
     print_verification(&body);
@@ -630,6 +688,9 @@ async fn main() -> anyhow::Result<()> {
     print_remote_prometheus_checks();
 
     println!("\nGrafana: http://localhost:3000 → Lane → Lane Actor Runtime");
+    println!("  • Set time range: Last 5 minutes");
+    println!("  • Failures panel: panics (range) spikes to 1; panics/sec stays ~0 for a one-shot event");
+    println!("  • Explore query: sum(increase(lane_actor_panics_total[15m]))");
     if std::env::var("OBSERVABILITY_AUTO_EXIT").as_deref() == Ok("1") {
         println!("OBSERVABILITY_AUTO_EXIT=1 — exiting.");
     } else {
