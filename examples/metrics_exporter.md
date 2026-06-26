@@ -58,7 +58,7 @@ In a **third** terminal (stop `metrics_exporter` first — both use port 9090):
 cargo run --example resilient_monitor --features metrics
 ```
 
-This walks panics, slow handles, and timeouts, then keeps the metrics server alive until Ctrl-C. Refresh Grafana to see spikes on `lane_actor_panics_total`, `lane_actor_slow_handles_total`, etc.
+For **all** log types, alert demos, and built-in Prometheus verification, use [`observability_demo`](./observability_demo.md) instead.
 
 ---
 

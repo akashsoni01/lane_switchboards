@@ -223,6 +223,11 @@ name = "metrics_exporter"
 path = "examples/metrics_exporter.rs"
 required-features = ["metrics"]
 
+[[example]]
+name = "observability_demo"
+path = "examples/observability_demo.rs"
+required-features = ["metrics"]
+
 [[test]]
 name = "metrics_export"
 path = "tests/metrics_export.rs"

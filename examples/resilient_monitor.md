@@ -123,7 +123,7 @@ clamped and `tracing::warn!` records the field and actor id (counters never wrap
 
 Stats for a stopped actor are preserved as a **post-mortem snapshot** — readable via `ActorMonitor::global().get(id)` until `purge(id)` is called.
 
-For Grafana dashboards, use `--features metrics` or see the [Prometheus series mapping](../lane_core/README.md#prometheus-series-mapping) in `lane_core/README.md`.
+For Grafana dashboards, use `--features metrics` or run [`observability_demo`](./observability_demo.md) for the full logs + alerts tour.
 
 | Demo phase | Prometheus series (with `metrics` feature) |
 |------------|---------------------------------------------|
