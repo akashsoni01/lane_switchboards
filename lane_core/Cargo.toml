@@ -21,3 +21,7 @@ prometheus = { version = "0.13", optional = true }
 default = []
 monitor = []
 metrics = ["monitor", "dep:prometheus"]
+
+[dev-dependencies]
+anyhow = "1"
+tracing-subscriber = "0.3"
