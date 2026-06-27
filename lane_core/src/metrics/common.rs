@@ -1,4 +1,4 @@
-use once_cell::sync::OnceCell;
+use once_cell::sync::{Lazy, OnceCell};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use super::MetricsConfig;
@@ -11,6 +11,16 @@ pub(crate) fn metrics_try<F: FnOnce()>(op: &'static str, f: F) {
 }
 
 static GLOBAL_CONFIG: OnceCell<MetricsConfig> = OnceCell::new();
+
+/// Resolved once on first metric registration (call [`super::init_metrics`] before that).
+static METRIC_PREFIX: Lazy<String> = Lazy::new(|| {
+    GLOBAL_CONFIG
+        .get()
+        .and_then(|c| c.metric_prefix.clone())
+        .or_else(|| std::env::var("LANE_METRICS_PREFIX").ok())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "lane".into())
+});
 
 pub fn init_global_config(config: MetricsConfig) {
     let _ = GLOBAL_CONFIG.set(config);
@@ -32,18 +42,15 @@ pub fn on_scrape_callback() -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>
 ///
 /// Set via [`MetricsConfig::metric_prefix`] in [`super::init_metrics`] or the
 /// `LANE_METRICS_PREFIX` environment variable (must be set before the first metric is registered).
-pub fn metric_prefix() -> String {
-    GLOBAL_CONFIG
-        .get()
-        .and_then(|c| c.metric_prefix.clone())
-        .or_else(|| std::env::var("LANE_METRICS_PREFIX").ok())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "lane".into())
+pub fn metric_prefix() -> &'static str {
+    METRIC_PREFIX.as_str()
 }
 
 /// Build a fully qualified Prometheus metric name: `{prefix}_{suffix}`.
+///
+/// Called only during registry setup (once per process), not on the actor handle hot path.
 pub(crate) fn metric_name(suffix: &str) -> String {
-    format!("{}_{}", metric_prefix(), suffix)
+    format!("{}_{}", METRIC_PREFIX.as_str(), suffix)
 }
 
 pub(crate) const ACTOR_LABEL_NAMES: &[&str] =
