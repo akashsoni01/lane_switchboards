@@ -124,6 +124,18 @@ METRICS_ADDR=127.0.0.1:9092 LANE_METRICS_PREFIX=mysvc \
   cargo run --example resilient_calculator -p lane_core --features metrics
 ```
 
+### Shared Prometheus & Grafana (safe defaults)
+
+| Concern | Behavior |
+|---------|----------|
+| **Existing dashboards** | With no env set, metrics stay `lane_*` — compatible with [`docs/grafana/actor-runtime.json`](../../docs/grafana/actor-runtime.json) and all docs/examples. |
+| **Other services** | Prefix and listen address apply **only to this process**. Prometheus series from other scrape targets are never renamed or removed. |
+| **Filtering many lane apps** | Prefer `lane_*` + labels (`node`, `service`, `actor_name`) in PromQL before changing the prefix. |
+| **When to use a custom prefix** | Optional namespace for one deployment (e.g. `orders_lane_actor_*`) when you cannot rely on labels alone. Set **per deployment**, not globally. |
+| **Invalid prefix** | Falls back to `lane` with a log warning — avoids broken or illegal metric names affecting your stack. |
+
+**Avoid:** setting `LANE_METRICS_PREFIX` in a shared ConfigMap used by non-lane apps, or using a prefix that matches another team’s metric family (e.g. `http`, `process`).
+
 ---
 
 ## Architecture

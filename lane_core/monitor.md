@@ -17,6 +17,15 @@ Guide for **`lane_core` only** — connect to an **existing** Prometheus + Grafa
 | `monitor_enabled: true` (default) | Stats + enqueue timestamps for this actor |
 | `monitor_enabled: false` / `.without_monitor()` | No stats, plain mailbox envelopes |
 
+| Env / config | Default | Shared Prometheus / Grafana impact |
+|--------------|---------|-------------------------------------|
+| *(unset)* | `lane_*` metric names | **None** — same as before; works with `docs/grafana/actor-runtime.json` |
+| `LANE_METRICS_PREFIX` / `metric_prefix` | opt-in | **This process only** — other scrape targets unchanged; update *your* dashboards if you set a custom prefix |
+| `LANE_NODE` / `MetricsConfig.node` | `unknown` | Label on your series only; filter in Grafana with `node=` |
+| `METRICS_ADDR` (examples) | `127.0.0.1:9090` | Listen port for **this binary** only; does not affect other exporters |
+
+**Do not** set `LANE_METRICS_PREFIX` in a shared cluster ConfigMap unless every lane app in that namespace should drop `lane_*` names. For multiple lane services on one Prometheus, prefer **labels** (`service`, `node`) on the default `lane_*` names, or set a **per-deployment** prefix (e.g. `orders_lane`, `billing_lane`) so names stay unique without colliding with non-lane metrics.
+
 ---
 
 ## Part 1 — Send metrics to your existing Prometheus / Grafana

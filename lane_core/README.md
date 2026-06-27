@@ -102,6 +102,8 @@ lane_switchboards = { path = ".", features = ["metrics"] }
 
 Per-actor opt-out (`monitor_enabled: false` or `.without_monitor()`) skips counters and enqueue timestamps for that actor only.
 
+**Shared Prometheus / Grafana:** default export uses the `lane_*` metric family (unchanged). Custom prefix (`LANE_METRICS_PREFIX` / `MetricsConfig::metric_prefix`) is opt-in and scoped to **one process** — other services and existing `lane_*` dashboards are unaffected unless you explicitly rename that deployment. See [`monitor.md`](monitor.md#feature-flags-quick-reference).
+
 Metrics are split under `lane_core/src/metrics/`:
 
 | Module | Registry | When registered |

@@ -43,7 +43,10 @@ pub struct MetricsConfig {
     pub dc: Option<String>,
     pub environment: Option<String>,
     /// Prometheus metric name prefix (default `lane`). Series become `{prefix}_actor_*`, etc.
-    /// Overridden by `LANE_METRICS_PREFIX` when unset here.
+    ///
+    /// Opt-in only — unset keeps `lane_*` so existing Grafana dashboards and PromQL keep working.
+    /// Only this process is affected; other services on the same Prometheus are unchanged.
+    /// Overridden by `LANE_METRICS_PREFIX` when unset here. Invalid values fall back to `lane`.
     pub metric_prefix: Option<String>,
     /// Optional hook invoked after each successful [`render_prometheus_text`] (push sinks, logging).
     pub on_scrape: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
@@ -333,5 +336,13 @@ mod tests {
         record_mesh_dispatch("orders");
         let body = render_prometheus_text().expect("render");
         assert!(body.contains(&metric_name("mesh_dispatches_total")));
+    }
+
+    #[test]
+    fn default_metric_prefix_is_lane() {
+        assert_eq!(super::common::DEFAULT_METRIC_PREFIX, "lane");
+        assert_eq!(metric_prefix(), "lane");
+        let body = HUB.render().expect("render");
+        assert!(body.contains("lane_actor_messages_handled_total"));
     }
 }
