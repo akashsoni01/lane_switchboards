@@ -6,8 +6,8 @@ use prometheus::{Gauge, Histogram, IntCounter, IntCounterVec, Registry};
 use std::time::{Duration, Instant};
 
 use super::common::{
-    metrics_try, register_counter_vec, register_gauge_vec, register_histogram_vec, ACTOR_LABEL_NAMES,
-    EXIT_LABEL_NAMES, global_node,
+    metrics_try, metric_name, register_counter_vec, register_gauge_vec, register_histogram_vec,
+    ACTOR_LABEL_NAMES, EXIT_LABEL_NAMES, global_node,
 };
 
 /// Pre-bound Prometheus handles for one actor (no label allocation on the hot path).
@@ -59,37 +59,37 @@ impl ActorMetricsRegistry {
     pub(crate) fn register(registry: &Registry) -> Self {
         let messages_handled = register_counter_vec(
             registry,
-            "lane_actor_messages_handled_total",
+            &metric_name("actor_messages_handled_total"),
             "Successful actor handle() completions",
             ACTOR_LABEL_NAMES,
         );
         let handle_errors = register_counter_vec(
             registry,
-            "lane_actor_handle_errors_total",
+            &metric_name("actor_handle_errors_total"),
             "handle() returned Err",
             ACTOR_LABEL_NAMES,
         );
         let panics = register_counter_vec(
             registry,
-            "lane_actor_panics_total",
+            &metric_name("actor_panics_total"),
             "handle() panicked",
             ACTOR_LABEL_NAMES,
         );
         let handle_timeouts = register_counter_vec(
             registry,
-            "lane_actor_handle_timeouts_total",
+            &metric_name("actor_handle_timeouts_total"),
             "handle() exceeded handle_timeout",
             ACTOR_LABEL_NAMES,
         );
         let slow_handles = register_counter_vec(
             registry,
-            "lane_actor_slow_handles_total",
+            &metric_name("actor_slow_handles_total"),
             "handle() finished but exceeded slow_handle_threshold",
             ACTOR_LABEL_NAMES,
         );
         let counter_saturated = register_counter_vec(
             registry,
-            "lane_actor_counter_saturated_total",
+            &metric_name("actor_counter_saturated_total"),
             "Internal stat counter clamped at usize::MAX",
             &[
                 "field",
@@ -102,43 +102,43 @@ impl ActorMetricsRegistry {
         );
         let exits = register_counter_vec(
             registry,
-            "lane_actor_exits_total",
+            &metric_name("actor_exits_total"),
             "Actor exits by reason",
             EXIT_LABEL_NAMES,
         );
         let in_flight = register_gauge_vec(
             registry,
-            "lane_actor_in_flight",
+            &metric_name("actor_in_flight"),
             "Handles started but not finished",
             ACTOR_LABEL_NAMES,
         );
         let last_handle_seconds = register_gauge_vec(
             registry,
-            "lane_actor_last_handle_seconds",
+            &metric_name("actor_last_handle_seconds"),
             "Wall time of the most recent handle()",
             ACTOR_LABEL_NAMES,
         );
         let max_handle_seconds = register_gauge_vec(
             registry,
-            "lane_actor_max_handle_seconds",
+            &metric_name("actor_max_handle_seconds"),
             "Longest handle() wall time recorded",
             ACTOR_LABEL_NAMES,
         );
         let mailbox_capacity = register_gauge_vec(
             registry,
-            "lane_actor_mailbox_capacity",
+            &metric_name("actor_mailbox_capacity"),
             "Configured actor mailbox capacity",
             ACTOR_LABEL_NAMES,
         );
         let mailbox_depth = register_gauge_vec(
             registry,
-            "lane_actor_mailbox_depth",
+            &metric_name("actor_mailbox_depth"),
             "Approximate queued messages in the actor mailbox",
             ACTOR_LABEL_NAMES,
         );
         let handle_duration = register_histogram_vec(
             registry,
-            "lane_actor_handle_duration_seconds",
+            &metric_name("actor_handle_duration_seconds"),
             "Wall time per handle() call",
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
@@ -147,37 +147,37 @@ impl ActorMetricsRegistry {
         );
         let uptime_seconds = register_gauge_vec(
             registry,
-            "lane_actor_uptime_seconds",
+            &metric_name("actor_uptime_seconds"),
             "Seconds since the actor was registered",
             ACTOR_LABEL_NAMES,
         );
         let idle_seconds = register_gauge_vec(
             registry,
-            "lane_actor_idle_seconds",
+            &metric_name("actor_idle_seconds"),
             "Seconds since the last completed handle()",
             ACTOR_LABEL_NAMES,
         );
         let alive = register_gauge_vec(
             registry,
-            "lane_actor_alive",
+            &metric_name("actor_alive"),
             "1 while the actor is running, 0 after exit",
             ACTOR_LABEL_NAMES,
         );
         let mailbox_send_rejected = register_counter_vec(
             registry,
-            "lane_actor_mailbox_send_rejected_total",
+            &metric_name("actor_mailbox_send_rejected_total"),
             "Mailbox sends rejected (full or actor exited)",
             ACTOR_LABEL_NAMES,
         );
         let mailbox_send_blocked = register_counter_vec(
             registry,
-            "lane_actor_mailbox_send_blocked_total",
+            &metric_name("actor_mailbox_send_blocked_total"),
             "Async mailbox sends that waited on a full channel",
             ACTOR_LABEL_NAMES,
         );
         let mailbox_wait = register_histogram_vec(
             registry,
-            "lane_actor_mailbox_wait_seconds",
+            &metric_name("actor_mailbox_wait_seconds"),
             "Time from enqueue to begin_handle for actor messages",
             vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0],
             ACTOR_LABEL_NAMES,

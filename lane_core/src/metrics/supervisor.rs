@@ -5,7 +5,7 @@ use once_cell::sync::Lazy;
 use prometheus::{IntCounterVec, Registry};
 use std::sync::RwLock;
 
-use super::common::{metrics_try, register_counter_vec, register_gauge_vec, global_node};
+use super::common::{metrics_try, metric_name, register_counter_vec, register_gauge_vec, global_node};
 
 pub(crate) struct SupervisorMetricsRegistry {
     restarts: IntCounterVec,
@@ -21,31 +21,31 @@ impl SupervisorMetricsRegistry {
         Self {
             restarts: register_counter_vec(
                 registry,
-                "lane_supervisor_restarts_total",
+                &metric_name("supervisor_restarts_total"),
                 "Supervised child restarts",
                 &["child", "strategy", "node"],
             ),
             intensity_exceeded: register_counter_vec(
                 registry,
-                "lane_supervisor_intensity_exceeded_total",
+                &metric_name("supervisor_intensity_exceeded_total"),
                 "Restart intensity limit breached",
                 &["action", "node"],
             ),
             children_alive: register_gauge_vec(
                 registry,
-                "lane_supervisor_children_alive",
+                &metric_name("supervisor_children_alive"),
                 "Currently live children under the supervisor",
                 node_label,
             ),
             intensity_remaining: register_gauge_vec(
                 registry,
-                "lane_supervisor_restart_intensity_remaining",
+                &metric_name("supervisor_restart_intensity_remaining"),
                 "Restart budget remaining in the current window",
                 node_label,
             ),
             child_generation: register_gauge_vec(
                 registry,
-                "lane_supervisor_child_generation",
+                &metric_name("supervisor_child_generation"),
                 "Child restart generation from ChildRegistry",
                 &["child", "node"],
             ),

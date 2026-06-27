@@ -5,7 +5,7 @@ use prometheus::{IntCounterVec, Registry};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::common::{metrics_try, register_counter_vec, register_gauge_vec};
+use super::common::{metrics_try, metric_name, register_counter_vec, register_gauge_vec};
 
 pub(crate) struct StorageMetricsRegistry {
     puts: IntCounterVec,
@@ -42,55 +42,55 @@ impl StorageMetricsRegistry {
         Self {
             puts: register_counter_vec(
                 registry,
-                "lane_storage_puts_total",
+                &metric_name("storage_puts_total"),
                 "Storage put operations",
                 node_label,
             ),
             gets: register_counter_vec(
                 registry,
-                "lane_storage_gets_total",
+                &metric_name("storage_gets_total"),
                 "Storage get operations",
                 node_label,
             ),
             deletes: register_counter_vec(
                 registry,
-                "lane_storage_deletes_total",
+                &metric_name("storage_deletes_total"),
                 "Storage delete operations",
                 node_label,
             ),
             read_repairs: register_counter_vec(
                 registry,
-                "lane_storage_read_repairs_total",
+                &metric_name("storage_read_repairs_total"),
                 "Read repair operations",
                 node_label,
             ),
             paxos_writes: register_counter_vec(
                 registry,
-                "lane_storage_paxos_writes_total",
+                &metric_name("storage_paxos_writes_total"),
                 "Paxos write rounds",
                 node_label,
             ),
             quorum_failures: register_counter_vec(
                 registry,
-                "lane_storage_quorum_failures_total",
+                &metric_name("storage_quorum_failures_total"),
                 "Quorum failures on storage operations",
                 node_label,
             ),
             wal_bytes: register_counter_vec(
                 registry,
-                "lane_storage_wal_bytes_written_total",
+                &metric_name("storage_wal_bytes_written_total"),
                 "WAL bytes appended",
                 node_label,
             ),
             tombstones: register_gauge_vec(
                 registry,
-                "lane_storage_tombstone_count",
+                &metric_name("storage_tombstone_count"),
                 "Live tombstone records",
                 node_label,
             ),
             live_records: register_gauge_vec(
                 registry,
-                "lane_storage_live_records",
+                &metric_name("storage_live_records"),
                 "Live records in the MemTable",
                 node_label,
             ),

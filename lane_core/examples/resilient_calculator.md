@@ -63,6 +63,69 @@ See [`monitor.md`](../monitor.md) for Grafana wiring and per-actor opt-out (`mon
 
 ---
 
+## Environment variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `METRICS_ADDR` | `127.0.0.1:9090` | Host and port for the example’s `serve_metrics_http` listener |
+| `LANE_METRICS_PREFIX` | `lane` | Prometheus metric name prefix (`{prefix}_actor_*`, `{prefix}_supervisor_*`, …) |
+| `LANE_NODE` | `unknown` | `node` label when `MetricsConfig.node` is unset |
+
+### Change the scrape listen address
+
+The example reads `METRICS_ADDR` at startup (not built into `lane_core` itself):
+
+```bash
+METRICS_ADDR=0.0.0.0:9092 cargo run --example resilient_calculator -p lane_core --features metrics
+curl -s http://127.0.0.1:9092/metrics
+```
+
+In your own binary, use the same pattern:
+
+```rust
+let addr: std::net::SocketAddr = std::env::var("METRICS_ADDR")
+    .unwrap_or_else(|_| "127.0.0.1:9090".into())
+    .parse()
+    .expect("METRICS_ADDR");
+tokio::spawn(serve_metrics_http(addr));
+```
+
+### Change the `lane_` metric prefix
+
+Set `LANE_METRICS_PREFIX` **before the process starts** (or pass `metric_prefix` in `init_metrics`). Series become `{prefix}_actor_messages_handled_total`, etc.
+
+```bash
+LANE_METRICS_PREFIX=mysvc cargo run --example resilient_calculator -p lane_core --features metrics
+curl -s http://127.0.0.1:9090/metrics | grep mysvc_actor
+```
+
+Or in code (takes precedence over the env var):
+
+```rust
+init_metrics(MetricsConfig {
+    metric_prefix: Some("mysvc".into()),
+    ..Default::default()
+});
+```
+
+Query the active prefix in PromQL via [`metric_prefix()`](../../src/metrics/common.rs):
+
+```rust
+use lane_core::metrics::metric_prefix;
+
+let p = metric_prefix(); // "mysvc" or "lane"
+// rate({p}_actor_panics_total[5m])
+```
+
+Both overrides together:
+
+```bash
+METRICS_ADDR=127.0.0.1:9092 LANE_METRICS_PREFIX=mysvc \
+  cargo run --example resilient_calculator -p lane_core --features metrics
+```
+
+---
+
 ## Architecture
 
 ```mermaid
@@ -108,13 +171,13 @@ mul: 3 and 7 = 21
 Calculator stopped cleanly.
 ```
 
-With `--features metrics`, after the demo:
+With `--features metrics`, after the demo (default prefix `lane`):
 
 ```bash
 curl -s http://127.0.0.1:9090/metrics | grep lane_actor
 ```
 
-Useful PromQL:
+Useful PromQL (replace `lane` if you set `LANE_METRICS_PREFIX`):
 
 ```promql
 rate(lane_actor_messages_handled_total{actor_name="calculator"}[1m])

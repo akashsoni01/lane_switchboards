@@ -2,7 +2,9 @@
 
 use prometheus::{IntCounterVec, Registry};
 
-use super::common::{metrics_try, register_counter_vec, register_histogram_vec, global_node};
+use super::common::{
+    metrics_try, metric_name, register_counter_vec, register_histogram_vec, global_node,
+};
 
 pub(crate) struct MeshMetricsRegistry {
     dispatches: IntCounterVec,
@@ -28,33 +30,33 @@ impl MeshMetricsRegistry {
         Self {
             dispatches: register_counter_vec(
                 registry,
-                "lane_mesh_dispatches_total",
+                &metric_name("mesh_dispatches_total"),
                 "Mesh invoke_consistent / read_consistent dispatches",
                 &["service", "node"],
             ),
             consistency_operations: register_counter_vec(
                 registry,
-                "lane_consistency_operations_total",
+                &metric_name("consistency_operations_total"),
                 "Mesh consistency operations",
                 &["service", "level", "result", "node"],
             ),
             consistency_duration: register_histogram_vec(
                 registry,
-                "lane_consistency_duration_seconds",
+                &metric_name("consistency_duration_seconds"),
                 "Mesh consistency operation wall time",
                 vec![0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
                 &["service", "level", "node"],
             ),
             consistency_acks_required: register_histogram_vec(
                 registry,
-                "lane_consistency_acks_required",
+                &metric_name("consistency_acks_required"),
                 "Acknowledgements required per consistency operation",
                 vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0, 15.0, 31.0],
                 &["service", "level", "node"],
             ),
             consistency_acks_received: register_histogram_vec(
                 registry,
-                "lane_consistency_acks_received",
+                &metric_name("consistency_acks_received"),
                 "Acknowledgements received per consistency operation",
                 vec![0.0, 1.0, 2.0, 3.0, 5.0, 7.0, 9.0, 15.0, 31.0],
                 &["service", "level", "node"],

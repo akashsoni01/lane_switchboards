@@ -23,6 +23,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use actor::actor_label_strings;
+pub use common::metric_prefix;
 pub use mesh::ConsistencyOpSnapshot;
 pub use storage::StorageMetricsSnapshot;
 
@@ -41,6 +42,9 @@ pub struct MetricsConfig {
     pub node: Option<String>,
     pub dc: Option<String>,
     pub environment: Option<String>,
+    /// Prometheus metric name prefix (default `lane`). Series become `{prefix}_actor_*`, etc.
+    /// Overridden by `LANE_METRICS_PREFIX` when unset here.
+    pub metric_prefix: Option<String>,
     /// Optional hook invoked after each successful [`render_prometheus_text`] (push sinks, logging).
     pub on_scrape: Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>>,
 }
@@ -51,6 +55,7 @@ impl std::fmt::Debug for MetricsConfig {
             .field("node", &self.node)
             .field("dc", &self.dc)
             .field("environment", &self.environment)
+            .field("metric_prefix", &self.metric_prefix)
             .field("on_scrape", &self.on_scrape.as_ref().map(|_| "<callback>"))
             .finish()
     }
@@ -296,6 +301,7 @@ pub fn render_prometheus_text() -> Result<String, prometheus::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::metric_name;
 
     #[test]
     fn exit_reason_labels_are_bounded() {
@@ -312,20 +318,20 @@ mod tests {
     #[test]
     fn actor_metrics_always_registered() {
         let body = HUB.render().expect("render");
-        assert!(body.contains("lane_actor_messages_handled_total"));
+        assert!(body.contains(&metric_name("actor_messages_handled_total")));
     }
 
     #[test]
     fn optional_supervisor_metrics_lazy_register() {
         record_supervisor_restart("worker", RestartStrategy::OneForOne);
         let body = render_prometheus_text().expect("render");
-        assert!(body.contains("lane_supervisor_restarts_total"));
+        assert!(body.contains(&metric_name("supervisor_restarts_total")));
     }
 
     #[test]
     fn optional_mesh_metrics_lazy_register() {
         record_mesh_dispatch("orders");
         let body = render_prometheus_text().expect("render");
-        assert!(body.contains("lane_mesh_dispatches_total"));
+        assert!(body.contains(&metric_name("mesh_dispatches_total")));
     }
 }

@@ -2,7 +2,7 @@
 
 use prometheus::{IntCounterVec, Registry};
 
-use super::common::{metrics_try, register_counter_vec, global_node};
+use super::common::{metrics_try, metric_name, register_counter_vec, global_node};
 
 pub(crate) struct RemoteMetricsRegistry {
     send: IntCounterVec,
@@ -14,13 +14,13 @@ impl RemoteMetricsRegistry {
         Self {
             send: register_counter_vec(
                 registry,
-                "lane_remote_send_total",
+                &metric_name("remote_send_total"),
                 "Remote actor frame dispatches over gRPC",
                 &["target", "result", "node"],
             ),
             ack_timeouts: register_counter_vec(
                 registry,
-                "lane_remote_ack_timeouts_total",
+                &metric_name("remote_ack_timeouts_total"),
                 "Remote send_with_ack timeouts",
                 &["target", "node"],
             ),

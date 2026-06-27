@@ -6,8 +6,11 @@
 //! Run with in-process stats:
 //!   `cargo run --example resilient_calculator -p lane_core --features monitor`
 //!
-//! Run with Prometheus export on http://127.0.0.1:9090/metrics:
+//! Run with Prometheus export (default http://127.0.0.1:9090/metrics):
 //!   `cargo run --example resilient_calculator -p lane_core --features metrics`
+//!
+//! Override listen address: `METRICS_ADDR=0.0.0.0:9092 cargo run ... --features metrics`
+//! Override metric prefix:   `LANE_METRICS_PREFIX=mysvc cargo run ... --features metrics`
 //!
 //! See: `examples/resilient_calculator.md`
 
@@ -15,7 +18,7 @@ use lane_core::actor::{Actor, ActorProcessingErr, ActorRef};
 #[cfg(feature = "metrics")]
 use lane_core::config::ActorConfig;
 #[cfg(feature = "metrics")]
-use lane_core::metrics::{init_metrics, serve_metrics_http, MetricsConfig};
+use lane_core::metrics::{init_metrics, metric_prefix, serve_metrics_http, MetricsConfig};
 #[cfg(feature = "metrics")]
 use lane_core::monitor::ActorMeta;
 use lane_core::supervisor::{
@@ -197,6 +200,14 @@ fn print_result(op: &str, a: f64, b: f64, outcome: anyhow::Result<Result<f64, St
     }
 }
 
+#[cfg(feature = "metrics")]
+fn metrics_addr_from_env() -> std::net::SocketAddr {
+    std::env::var("METRICS_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:9090".into())
+        .parse()
+        .expect("METRICS_ADDR must be host:port")
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -207,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
             node: Some("resilient_calculator".into()),
             ..Default::default()
         });
-        let metrics_addr: std::net::SocketAddr = "127.0.0.1:9090".parse().expect("metrics addr");
+        let metrics_addr = metrics_addr_from_env();
         println!("Prometheus metrics on http://{metrics_addr}/metrics");
         tokio::spawn(serve_metrics_http(metrics_addr));
     }
@@ -240,11 +251,17 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "metrics")]
     {
+        let prefix = metric_prefix();
+        let metrics_addr = metrics_addr_from_env();
         println!("\nPromQL examples:");
-        println!("  rate(lane_actor_messages_handled_total{{actor_name=\"calculator\"}}[1m])");
-        println!("  rate(lane_actor_panics_total{{actor_name=\"calculator\"}}[5m])");
-        println!("  rate(lane_supervisor_restarts_total[5m])");
-        println!("\nScrape: curl -s http://127.0.0.1:9090/metrics | grep lane_");
+        println!(
+            "  rate({prefix}_actor_messages_handled_total{{actor_name=\"calculator\"}}[1m])"
+        );
+        println!("  rate({prefix}_actor_panics_total{{actor_name=\"calculator\"}}[5m])");
+        println!("  rate({prefix}_supervisor_restarts_total[5m])");
+        println!(
+            "\nScrape: curl -s http://{metrics_addr}/metrics | grep {prefix}_"
+        );
         println!("Press Ctrl-C to stop the metrics server.");
         tokio::signal::ctrl_c().await?;
         println!("shutting down");

@@ -28,6 +28,24 @@ pub fn on_scrape_callback() -> Option<std::sync::Arc<dyn Fn(&str) + Send + Sync>
     GLOBAL_CONFIG.get().and_then(|c| c.on_scrape.clone())
 }
 
+/// Active Prometheus metric name prefix (`lane` by default).
+///
+/// Set via [`MetricsConfig::metric_prefix`] in [`super::init_metrics`] or the
+/// `LANE_METRICS_PREFIX` environment variable (must be set before the first metric is registered).
+pub fn metric_prefix() -> String {
+    GLOBAL_CONFIG
+        .get()
+        .and_then(|c| c.metric_prefix.clone())
+        .or_else(|| std::env::var("LANE_METRICS_PREFIX").ok())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "lane".into())
+}
+
+/// Build a fully qualified Prometheus metric name: `{prefix}_{suffix}`.
+pub(crate) fn metric_name(suffix: &str) -> String {
+    format!("{}_{}", metric_prefix(), suffix)
+}
+
 pub(crate) const ACTOR_LABEL_NAMES: &[&str] =
     &["actor_name", "actor_type", "supervisor", "node", "service"];
 
