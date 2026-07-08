@@ -8,8 +8,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
-use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
+
+use crate::stream::{self, MaybeTlsStream, TlsConnector};
 
 use super::codec::{FrameCodec, Packet};
 use super::wire;
@@ -46,13 +47,13 @@ pub struct DownloadedMedia {
 ///
 /// [`recv`]: MessengerClient::recv
 pub struct MessengerClient {
-    framed: Framed<TcpStream, FrameCodec>,
+    framed: Framed<MaybeTlsStream, FrameCodec>,
     user_id: String,
     ping_seq: u64,
 }
 
 impl MessengerClient {
-    /// Connect and authenticate; replays any pending offline messages.
+    /// Connect over plain TCP and authenticate; replays pending messages.
     pub async fn connect(
         addr: &str,
         user_id: &str,
@@ -60,8 +61,20 @@ impl MessengerClient {
         auth_token: &str,
         resume_after_seq: u64,
     ) -> Result<(Self, LoginOutcome), MessengerError> {
-        let socket = TcpStream::connect(addr).await?;
-        socket.set_nodelay(true).ok();
+        Self::connect_tls(addr, None, user_id, device_id, auth_token, resume_after_seq).await
+    }
+
+    /// Connect with an optional TLS connector (`feature = "tls"`). The server
+    /// name for certificate validation is the host portion of `addr`.
+    pub async fn connect_tls(
+        addr: &str,
+        tls: Option<&TlsConnector>,
+        user_id: &str,
+        device_id: &str,
+        auth_token: &str,
+        resume_after_seq: u64,
+    ) -> Result<(Self, LoginOutcome), MessengerError> {
+        let socket = stream::connect(addr, tls).await?;
         let mut framed = Framed::new(socket, FrameCodec::default());
 
         framed
@@ -101,7 +114,9 @@ impl MessengerClient {
         ))
     }
 
-    async fn next(framed: &mut Framed<TcpStream, FrameCodec>) -> Result<Packet, MessengerError> {
+    async fn next(
+        framed: &mut Framed<MaybeTlsStream, FrameCodec>,
+    ) -> Result<Packet, MessengerError> {
         match tokio::time::timeout(RECV_TIMEOUT, framed.next()).await {
             Err(_) => Err(MessengerError::Timeout("server frame")),
             Ok(None) => Err(MessengerError::Closed),

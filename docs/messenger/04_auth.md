@@ -54,7 +54,10 @@ log output (Phase 9 observability work).
 
 ## Threat-model notes / current limits
 
-- Transport is plaintext TCP in this milestone — TLS on client sockets
-  (existing `TlsConfig` machinery) is required before any real deployment.
+- Transport TLS is available (`feature = "tls"`): `MessengerServer::bind_tls`
+  wraps every client socket via rustls before the first frame, and
+  `MessengerClient::connect_tls` validates the server certificate against the
+  host portion of the address. Plaintext clients are rejected at the
+  handshake. Production must always run with an acceptor.
 - Tokens do not expire; JWT with `exp` + rotation is the planned follow-up.
 - Message bodies are visible to the server until E2EE (Phase 10) lands.

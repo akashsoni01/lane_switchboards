@@ -66,3 +66,7 @@ anything acked survives shutdown and replays on the next login.
   one-minute window; excess connections are dropped before any frame is read.
 - Pre-auth deadline: `login_deadline` (default 10 s) bounds how long an
   unauthenticated socket can occupy a task.
+- Optional TLS (`feature = "tls"`): `MessengerServer::bind_tls` performs the
+  rustls handshake right after admission; failed handshakes never reach the
+  session state machine. Socket options (nodelay, keepalive) are applied to
+  the raw TCP stream before wrapping.

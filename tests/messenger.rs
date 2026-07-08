@@ -541,6 +541,122 @@ async fn repeated_auth_failures_backoff_grows() {
     assert!(d2 > d1, "backoff must grow: {d1:?} -> {d2:?}");
 }
 
+// ---- TLS (feature = "tls") ---------------------------------------------------------
+
+#[cfg(feature = "tls")]
+mod tls_tests {
+    use super::*;
+    use lane_switchboards::messenger::MessengerServer;
+    use std::io::Write as _;
+
+    /// Self-signed cert for 127.0.0.1 written to temp PEM files.
+    fn make_cert() -> (tempfile::NamedTempFile, tempfile::NamedTempFile) {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "127.0.0.1".to_string(),
+            "localhost".to_string(),
+        ])
+        .expect("generate cert");
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(cert.cert.pem().as_bytes()).unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        key_file
+            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .unwrap();
+        (cert_file, key_file)
+    }
+
+    #[tokio::test]
+    async fn tls_login_and_chat_round_trip() {
+        let (cert, key) = make_cert();
+        let server_cfg = lane_switchboards::tls::server_config_from_pem(
+            cert.path(),
+            key.path(),
+            None::<&std::path::Path>,
+        )
+        .expect("server tls config");
+        let acceptor = lane_switchboards::tls::build_acceptor(server_cfg);
+
+        let auth = HmacAuthenticator::new(SECRET);
+        let server = MessengerServer::bind_tls(
+            "127.0.0.1:0",
+            Arc::new(auth.clone()),
+            ServerConfig::default(),
+            Some(acceptor),
+        )
+        .await
+        .expect("bind tls gateway");
+        let addr = server.local_addr().to_string();
+
+        // Client trusts the self-signed cert as its CA root.
+        let client_cfg = lane_switchboards::tls::client_config_from_pem(
+            Some(cert.path()),
+            None::<&std::path::Path>,
+            None::<&std::path::Path>,
+        )
+        .expect("client tls config");
+        let connector = lane_switchboards::tls::build_connector(client_cfg);
+
+        let (mut alice, _) = MessengerClient::connect_tls(
+            &addr,
+            Some(&connector),
+            "alice",
+            "d1",
+            &auth.mint_token("alice", "d1"),
+            0,
+        )
+        .await
+        .expect("tls login alice");
+        let (mut bob, _) = MessengerClient::connect_tls(
+            &addr,
+            Some(&connector),
+            "bob",
+            "d1",
+            &auth.mint_token("bob", "d1"),
+            0,
+        )
+        .await
+        .expect("tls login bob");
+
+        alice.send_chat("bob", "m-tls", b"encrypted transport").await.expect("send over tls");
+        let pkt = bob
+            .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+            .await
+            .expect("recv over tls");
+        match pkt {
+            Packet::ChatMessage(m) => assert_eq!(m.body, b"encrypted transport"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_client_rejected_by_tls_gateway() {
+        let (cert, key) = make_cert();
+        let server_cfg = lane_switchboards::tls::server_config_from_pem(
+            cert.path(),
+            key.path(),
+            None::<&std::path::Path>,
+        )
+        .unwrap();
+        let acceptor = lane_switchboards::tls::build_acceptor(server_cfg);
+
+        let auth = HmacAuthenticator::new(SECRET);
+        let server = MessengerServer::bind_tls(
+            "127.0.0.1:0",
+            Arc::new(auth.clone()),
+            ServerConfig::default(),
+            Some(acceptor),
+        )
+        .await
+        .unwrap();
+        let addr = server.local_addr().to_string();
+
+        // Plain connect: the TLS handshake fails, login never succeeds.
+        let token = auth.mint_token("alice", "d1");
+        let res = MessengerClient::connect(&addr, "alice", "d1", &token, 0).await;
+        assert!(res.is_err(), "plaintext client must be rejected by TLS gateway");
+    }
+}
+
 // ---- Load smoke ------------------------------------------------------------------
 
 #[tokio::test]

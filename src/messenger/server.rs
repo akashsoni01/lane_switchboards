@@ -29,9 +29,14 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+use crate::stream::{self, MaybeTlsStream, TlsAcceptor};
+
 use super::codec::{FrameCodec, Packet};
 use super::wire;
 use super::{Authenticator, MessengerError};
+
+/// Frame transport for one client connection (plain TCP or TLS).
+type ClientFramed = Framed<MaybeTlsStream, FrameCodec>;
 
 /// Tunables for a gateway node. All limits have safe defaults.
 #[derive(Clone)]
@@ -163,11 +168,23 @@ impl Drop for MessengerServer {
 }
 
 impl MessengerServer {
-    /// Bind `addr` and start accepting client connections.
+    /// Bind `addr` and start accepting plain-TCP client connections.
     pub async fn bind(
         addr: &str,
         auth: Arc<dyn Authenticator>,
         cfg: ServerConfig,
+    ) -> Result<Self, MessengerError> {
+        Self::bind_tls(addr, auth, cfg, None).await
+    }
+
+    /// Bind `addr` with an optional TLS acceptor (`feature = "tls"`). With
+    /// `Some(acceptor)` every client socket is TLS-wrapped before the first
+    /// frame; production deployments should always pass an acceptor.
+    pub async fn bind_tls(
+        addr: &str,
+        auth: Arc<dyn Authenticator>,
+        cfg: ServerConfig,
+        tls: Option<TlsAcceptor>,
     ) -> Result<Self, MessengerError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
@@ -205,8 +222,22 @@ impl MessengerServer {
                             drop(socket);
                             continue;
                         }
+                        // Socket options apply to the raw TCP stream, before
+                        // any TLS wrapping.
+                        socket.set_nodelay(true).ok();
+                        if let Some(interval) = st.cfg.tcp_keepalive {
+                            set_tcp_keepalive(&socket, interval);
+                        }
+                        let tls = tls.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = run_session(st, socket).await {
+                            let stream = match stream::accept(socket, tls.as_ref()).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    debug!(%peer, error = %e, "tls handshake failed");
+                                    return;
+                                }
+                            };
+                            if let Err(e) = run_session(st, stream).await {
                                 debug!(%peer, error = %e, "session ended");
                             }
                         });
@@ -420,11 +451,7 @@ fn set_tcp_keepalive(socket: &TcpStream, interval: Duration) {
 }
 
 /// Per-connection state machine.
-async fn run_session(state: Arc<State>, socket: TcpStream) -> Result<(), MessengerError> {
-    socket.set_nodelay(true).ok();
-    if let Some(interval) = state.cfg.tcp_keepalive {
-        set_tcp_keepalive(&socket, interval);
-    }
+async fn run_session(state: Arc<State>, socket: MaybeTlsStream) -> Result<(), MessengerError> {
     let mut framed = Framed::new(socket, FrameCodec::with_max_frame(state.cfg.max_frame));
 
     // ---- Phase: AwaitingLogin -------------------------------------------
@@ -544,7 +571,7 @@ async fn session_loop(
     state: &Arc<State>,
     user: &str,
     session_id: u64,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     rx: &mut mpsc::Receiver<Packet>,
 ) -> Result<(), MessengerError> {
     // In-progress upload for this connection (media_id guard against interleaving).
@@ -638,7 +665,7 @@ async fn touch_session(state: &Arc<State>, user: &str, session_id: u64) {
 
 async fn handle_chat(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     m: wire::ChatMessage,
 ) -> Result<(), MessengerError> {
     if m.to_user.is_empty() || m.message_id.is_empty() {
@@ -703,7 +730,7 @@ async fn handle_read_ack(state: &Arc<State>, a: wire::ReadAck) {
 
 async fn handle_media_start(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     upload: &mut Option<String>,
     m: wire::MediaStart,
 ) -> Result<(), MessengerError> {
@@ -751,7 +778,7 @@ async fn handle_media_start(
 
 async fn handle_media_chunk(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     upload: &mut Option<String>,
     c: wire::MediaChunk,
 ) -> Result<(), MessengerError> {
@@ -841,7 +868,7 @@ async fn handle_media_chunk(
 
 async fn handle_media_fetch(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     f: wire::MediaFetch,
 ) -> Result<(), MessengerError> {
     // Copy out under the lock, stream without holding it.
@@ -905,7 +932,7 @@ async fn handle_media_fetch(
 
 async fn handle_group_event(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     user: &str,
     mut ev: wire::GroupEvent,
 ) -> Result<(), MessengerError> {
@@ -981,7 +1008,7 @@ async fn handle_group_event(
 
 async fn handle_group_message(
     state: &Arc<State>,
-    framed: &mut Framed<TcpStream, FrameCodec>,
+    framed: &mut ClientFramed,
     m: wire::GroupMessage,
 ) -> Result<(), MessengerError> {
     if m.group_id.is_empty() || m.message_id.is_empty() {
