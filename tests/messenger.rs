@@ -477,6 +477,70 @@ async fn offline_group_member_gets_message_on_login() {
     }
 }
 
+// ---- Hardening: shutdown, rate limit, auth backoff -------------------------------
+
+#[tokio::test]
+async fn graceful_shutdown_closes_sessions_and_stops_accepting() {
+    let (server, addr, auth) = boot().await;
+    let (mut c, _) = login(&addr, &auth, "akash", "d1").await;
+    c.ping().await.unwrap();
+
+    server.shutdown().await;
+
+    // Existing session observes EOF (recv errors with Closed).
+    let err = c.recv().await.expect_err("session must close");
+    assert!(matches!(err, lane_switchboards::messenger::MessengerError::Closed));
+
+    // New connections are refused (listener is gone).
+    let refused = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await;
+    match refused {
+        Ok(Err(_)) | Err(_) => {} // connection refused or timed out — both fine
+        Ok(Ok(_)) => panic!("gateway must stop accepting after shutdown"),
+    }
+}
+
+#[tokio::test]
+async fn per_ip_connection_rate_limit_drops_excess() {
+    let cfg = ServerConfig { max_conns_per_ip_per_min: 3, ..Default::default() };
+    let (_server, addr, auth) = boot_with(cfg).await;
+
+    // First 3 logins succeed.
+    let mut kept = Vec::new();
+    for i in 0..3 {
+        let user = format!("u{i}");
+        let (c, _) = login(&addr, &auth, &user, "d1").await;
+        kept.push(c);
+    }
+    // Fourth connection is dropped before login.
+    let token = auth.mint_token("u3", "d1");
+    let res = MessengerClient::connect(&addr, "u3", "d1", &token, 0).await;
+    assert!(res.is_err(), "over-limit connection must fail");
+}
+
+#[tokio::test]
+async fn repeated_auth_failures_backoff_grows() {
+    let cfg = ServerConfig {
+        auth_backoff_base: Duration::from_millis(200),
+        auth_backoff_max: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let (_server, addr, _auth) = boot_with(cfg).await;
+
+    // 1st failure: ~200ms, 2nd: ~400ms — measure the second is slower.
+    let t1 = std::time::Instant::now();
+    let _ = MessengerClient::connect(&addr, "victim", "d1", "bad", 0).await;
+    let d1 = t1.elapsed();
+    let t2 = std::time::Instant::now();
+    let _ = MessengerClient::connect(&addr, "victim", "d1", "bad", 0).await;
+    let d2 = t2.elapsed();
+    assert!(d1 >= Duration::from_millis(180), "first failure delayed: {d1:?}");
+    assert!(d2 > d1, "backoff must grow: {d1:?} -> {d2:?}");
+}
+
 // ---- Load smoke ------------------------------------------------------------------
 
 #[tokio::test]

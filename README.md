@@ -93,6 +93,7 @@ Feature-level comparison between **lane_switchboards** and **Lunatic**.
 | `monitor.rs` | `ActorMonitor`, `ActorStats` — per-actor runtime counters |
 | `mesh.rs` | gRPC service mesh — TTL registry, tonic client, diff sync, `serve_microservice` |
 | `storage/` | **Distributed KV store** — `StorageNode`, `StorageClient`, WAL, Paxos SERIAL, read repair |
+| `messenger/` | **FunXMPP-style binary chat protocol** — gateway, sessions, presence, tick-ladder acks, offline inbox, groups, chunked media. See [`docs/messenger/`](docs/messenger/README.md) |
 
 ## Core actor API
 

@@ -52,6 +52,17 @@ pub struct ServerConfig {
     pub max_media_bytes: u64,
     /// Max members per group.
     pub max_group_members: usize,
+    /// Max new connections accepted per source IP per minute (0 = unlimited).
+    pub max_conns_per_ip_per_min: u32,
+    /// Base delay for exponential login-failure backoff (doubles per
+    /// consecutive failure for the same user, capped at `auth_backoff_max`).
+    pub auth_backoff_base: Duration,
+    /// Upper bound for login-failure backoff.
+    pub auth_backoff_max: Duration,
+    /// TCP keepalive probe interval for client sockets (`None` disables).
+    /// Complements application-level Ping/Pong: keepalive detects dead NAT
+    /// paths below the protocol layer.
+    pub tcp_keepalive: Option<Duration>,
 }
 
 impl Default for ServerConfig {
@@ -64,6 +75,10 @@ impl Default for ServerConfig {
             max_inbox: 10_000,
             max_media_bytes: 64 * 1024 * 1024,
             max_group_members: 1024,
+            max_conns_per_ip_per_min: 120,
+            auth_backoff_base: Duration::from_millis(250),
+            auth_backoff_max: Duration::from_secs(30),
+            tcp_keepalive: Some(Duration::from_secs(60)),
         }
     }
 }
@@ -126,6 +141,10 @@ struct State {
     media: Mutex<HashMap<String, MediaBlob>>,
     groups: Mutex<HashMap<String, Group>>,
     session_ids: AtomicU64,
+    /// source IP -> (window start, connections accepted in window).
+    conn_rate: Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>,
+    /// user_id -> consecutive login failures (drives exponential backoff).
+    auth_failures: Mutex<HashMap<String, u32>>,
 }
 
 /// A running messenger gateway. Dropping the handle aborts the accept loop.
@@ -133,11 +152,13 @@ pub struct MessengerServer {
     addr: SocketAddr,
     state: Arc<State>,
     accept_task: JoinHandle<()>,
+    sweep_task: JoinHandle<()>,
 }
 
 impl Drop for MessengerServer {
     fn drop(&mut self) {
         self.accept_task.abort();
+        self.sweep_task.abort();
     }
 }
 
@@ -159,11 +180,13 @@ impl MessengerServer {
             media: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             session_ids: AtomicU64::new(1),
+            conn_rate: Mutex::new(HashMap::new()),
+            auth_failures: Mutex::new(HashMap::new()),
         });
 
         // Idle sweep: close sessions that missed heartbeats.
         let sweep_state = state.clone();
-        tokio::spawn(async move {
+        let sweep_task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
                 tick.tick().await;
@@ -177,6 +200,11 @@ impl MessengerServer {
                 match listener.accept().await {
                     Ok((socket, peer)) => {
                         let st = accept_state.clone();
+                        if !admit_connection(&st, peer.ip()).await {
+                            debug!(%peer, "connection rejected: per-IP rate limit");
+                            drop(socket);
+                            continue;
+                        }
                         tokio::spawn(async move {
                             if let Err(e) = run_session(st, socket).await {
                                 debug!(%peer, error = %e, "session ended");
@@ -192,7 +220,7 @@ impl MessengerServer {
         });
 
         info!(%addr, "messenger gateway listening");
-        Ok(Self { addr, state, accept_task })
+        Ok(Self { addr, state, accept_task, sweep_task })
     }
 
     /// Actual bound address (useful with port 0 in tests).
@@ -215,6 +243,48 @@ impl MessengerServer {
     pub async fn is_online(&self, user_id: &str) -> bool {
         self.state.sessions.read().await.get(user_id).is_some_and(|v| !v.is_empty())
     }
+
+    /// Graceful shutdown: stop accepting new connections, then close every
+    /// session. Outbound queues drain because closing the sender side lets
+    /// each session loop flush already-queued frames and return.
+    pub async fn shutdown(self) {
+        self.accept_task.abort();
+        self.sweep_task.abort();
+        let drained: Vec<String> = {
+            let mut sessions = self.state.sessions.write().await;
+            let users: Vec<String> = sessions.keys().cloned().collect();
+            // Dropping the SessionHandles drops the mpsc senders; each
+            // session task observes `rx.recv() == None` and exits cleanly.
+            sessions.clear();
+            users
+        };
+        let now = unix_secs();
+        let mut last_seen = self.state.last_seen.write().await;
+        for user in drained {
+            last_seen.insert(user, now);
+        }
+        info!("messenger gateway shut down");
+    }
+}
+
+/// Sliding one-minute window per source IP. Returns false when the IP
+/// exceeded its connection budget.
+async fn admit_connection(state: &Arc<State>, ip: std::net::IpAddr) -> bool {
+    let limit = state.cfg.max_conns_per_ip_per_min;
+    if limit == 0 {
+        return true;
+    }
+    let mut rate = state.conn_rate.lock().await;
+    // Opportunistic cleanup keeps the map bounded without a background task.
+    if rate.len() > 10_000 {
+        rate.retain(|_, (start, _)| start.elapsed() < Duration::from_secs(60));
+    }
+    let entry = rate.entry(ip).or_insert((Instant::now(), 0));
+    if entry.0.elapsed() >= Duration::from_secs(60) {
+        *entry = (Instant::now(), 0);
+    }
+    entry.1 += 1;
+    entry.1 <= limit
 }
 
 async fn sweep_idle(state: &Arc<State>) {
@@ -339,9 +409,22 @@ fn proto_error(code: wire::ErrorCode, detail: impl Into<String>) -> Packet {
     Packet::Error(wire::ProtocolError { code: code as i32, detail: detail.into() })
 }
 
+/// Enable OS-level TCP keepalive on a client socket. Best effort: failure is
+/// logged and ignored because the app-level Ping/Pong still covers liveness.
+fn set_tcp_keepalive(socket: &TcpStream, interval: Duration) {
+    use socket2::{SockRef, TcpKeepalive};
+    let ka = TcpKeepalive::new().with_time(interval).with_interval(interval);
+    if let Err(e) = SockRef::from(socket).set_tcp_keepalive(&ka) {
+        debug!(error = %e, "failed to set TCP keepalive");
+    }
+}
+
 /// Per-connection state machine.
 async fn run_session(state: Arc<State>, socket: TcpStream) -> Result<(), MessengerError> {
     socket.set_nodelay(true).ok();
+    if let Some(interval) = state.cfg.tcp_keepalive {
+        set_tcp_keepalive(&socket, interval);
+    }
     let mut framed = Framed::new(socket, FrameCodec::with_max_frame(state.cfg.max_frame));
 
     // ---- Phase: AwaitingLogin -------------------------------------------
@@ -370,10 +453,25 @@ async fn run_session(state: Arc<State>, socket: TcpStream) -> Result<(), Messeng
         return Err(MessengerError::AuthFailed);
     }
     if !state.auth.verify(&login.user_id, &login.device_id, &login.auth_token) {
-        warn!(user = %login.user_id, "auth failed");
+        // Exponential per-user backoff before answering, so credential
+        // guessing costs the attacker wall-clock time.
+        let failures = {
+            let mut fails = state.auth_failures.lock().await;
+            let n = fails.entry(login.user_id.clone()).or_insert(0);
+            *n = n.saturating_add(1);
+            *n
+        };
+        let delay = state
+            .cfg
+            .auth_backoff_base
+            .saturating_mul(1u32 << (failures - 1).min(20))
+            .min(state.cfg.auth_backoff_max);
+        tokio::time::sleep(delay).await;
+        warn!(user = %login.user_id, failures, "auth failed");
         let _ = framed.send(proto_error(wire::ErrorCode::AuthFailed, "invalid token")).await;
         return Err(MessengerError::AuthFailed);
     }
+    state.auth_failures.lock().await.remove(&login.user_id);
 
     let user = login.user_id.clone();
     let session_id = state.session_ids.fetch_add(1, Ordering::Relaxed);
@@ -396,6 +494,9 @@ async fn run_session(state: Arc<State>, socket: TcpStream) -> Result<(), Messeng
             last_seen: Instant::now(),
         });
     }
+    // The registry owns the only sender now; when the session is removed
+    // (kick, sweep, shutdown) `rx` closes and the loop below exits.
+    drop(tx);
     state.last_seen.write().await.remove(&user);
 
     // ---- LoginAck + offline replay ---------------------------------------
