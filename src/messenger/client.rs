@@ -359,6 +359,7 @@ impl MessengerClient {
                 actor_user: self.user_id.clone(),
                 subject_user: subject.into(),
                 version: 0,
+                to_user: String::new(),
             }))
             .await?;
         match self
@@ -390,6 +391,7 @@ impl MessengerClient {
                 sent_at: unix_millis(),
                 media_id: String::new(),
                 seq: 0,
+                to_user: String::new(),
             }))
             .await?;
         match self

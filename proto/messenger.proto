@@ -97,6 +97,9 @@ message ChatMessage {
 message ServerAck {
   string message_id = 1;
   uint64 seq = 2;
+  // Set on inter-node links: the sending user this ack must be routed to.
+  // Empty on direct client connections.
+  string to_user = 3;
 }
 
 // pkt_type = 0x22. Recipient device -> server -> sender (double tick).
@@ -115,6 +118,9 @@ message ReadAck {
 message SyncComplete {
   uint64 delivered = 1;
   uint64 latest_seq = 2;
+  // Set on inter-node links so the receiving gateway can route the marker
+  // to the right session. Empty on direct client connections.
+  string user_id = 3;
 }
 
 // ---- Bulk data / media (e.g. PDF, images) ----------------------------------
@@ -170,6 +176,9 @@ message GroupMessage {
   string media_id = 6;
   // Set per-recipient by the server; total order within each member's inbox.
   uint64 seq = 7;
+  // Recipient for this copy; set by the group home shard during fan-out
+  // (inter-node links only, empty on the sender's original packet).
+  string to_user = 8;
 }
 
 // pkt_type = 0x41
@@ -179,6 +188,8 @@ message GroupEvent {
   string actor_user = 3;   // who performed the operation
   string subject_user = 4; // who it applies to (add/remove)
   uint64 version = 5;      // monotonic membership version
+  // Notification recipient; set by the group home shard on inter-node links.
+  string to_user = 6;
 }
 
 enum GroupOp {
@@ -187,4 +198,33 @@ enum GroupOp {
   ADD_MEMBER = 2;
   REMOVE_MEMBER = 3;
   LEAVE = 4;
+}
+
+// ---- Inter-node (peer) links -------------------------------------------------
+//
+// Gateways in a cluster connect to each other with the same binary protocol.
+// A peer link is authenticated by a PeerHello as its first frame; after that,
+// regular packets flow with cluster routing semantics (see
+// docs/messenger/05_cluster.md).
+
+// pkt_type = 0x50. First frame on an outbound peer link.
+message PeerHello {
+  string node_id = 1;
+  // hex(HMAC-SHA256(secret, "node_id:peer")) — same Authenticator as clients.
+  string auth_token = 2;
+}
+
+// pkt_type = 0x51. Broadcast on user login/logout so every node can route
+// live deliveries to the right gateway.
+message PeerPresence {
+  string user_id = 1;
+  bool online = 2;
+  string node_id = 3;   // gateway holding the session (when online)
+  uint64 last_seen = 4; // unix secs (when offline)
+}
+
+// pkt_type = 0x52. Login gateway -> user's home shard: replay the inbox.
+message PeerSync {
+  string user_id = 1;
+  uint64 after_seq = 2;
 }

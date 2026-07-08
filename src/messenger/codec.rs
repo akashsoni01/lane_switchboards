@@ -50,6 +50,9 @@ pub enum PacketType {
     MediaFetch = 0x33,
     GroupMessage = 0x40,
     GroupEvent = 0x41,
+    PeerHello = 0x50,
+    PeerPresence = 0x51,
+    PeerSync = 0x52,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -74,6 +77,9 @@ impl TryFrom<u8> for PacketType {
             0x33 => Self::MediaFetch,
             0x40 => Self::GroupMessage,
             0x41 => Self::GroupEvent,
+            0x50 => Self::PeerHello,
+            0x51 => Self::PeerPresence,
+            0x52 => Self::PeerSync,
             other => return Err(MessengerError::UnknownPacketType(other)),
         })
     }
@@ -99,6 +105,9 @@ pub enum Packet {
     MediaFetch(wire::MediaFetch),
     GroupMessage(wire::GroupMessage),
     GroupEvent(wire::GroupEvent),
+    PeerHello(wire::PeerHello),
+    PeerPresence(wire::PeerPresence),
+    PeerSync(wire::PeerSync),
 }
 
 impl Packet {
@@ -122,6 +131,9 @@ impl Packet {
             Packet::MediaFetch(_) => PacketType::MediaFetch,
             Packet::GroupMessage(_) => PacketType::GroupMessage,
             Packet::GroupEvent(_) => PacketType::GroupEvent,
+            Packet::PeerHello(_) => PacketType::PeerHello,
+            Packet::PeerPresence(_) => PacketType::PeerPresence,
+            Packet::PeerSync(_) => PacketType::PeerSync,
         }
     }
 
@@ -144,6 +156,9 @@ impl Packet {
             Packet::MediaFetch(m) => m.encoded_len(),
             Packet::GroupMessage(m) => m.encoded_len(),
             Packet::GroupEvent(m) => m.encoded_len(),
+            Packet::PeerHello(m) => m.encoded_len(),
+            Packet::PeerPresence(m) => m.encoded_len(),
+            Packet::PeerSync(m) => m.encoded_len(),
         }
     }
 
@@ -167,6 +182,9 @@ impl Packet {
             Packet::MediaFetch(m) => m.encode(buf),
             Packet::GroupMessage(m) => m.encode(buf),
             Packet::GroupEvent(m) => m.encode(buf),
+            Packet::PeerHello(m) => m.encode(buf),
+            Packet::PeerPresence(m) => m.encode(buf),
+            Packet::PeerSync(m) => m.encode(buf),
         };
         debug_assert!(r.is_ok(), "BytesMut encode cannot fail");
     }
@@ -190,6 +208,9 @@ impl Packet {
             PacketType::MediaFetch => Packet::MediaFetch(wire::MediaFetch::decode(payload)?),
             PacketType::GroupMessage => Packet::GroupMessage(wire::GroupMessage::decode(payload)?),
             PacketType::GroupEvent => Packet::GroupEvent(wire::GroupEvent::decode(payload)?),
+            PacketType::PeerHello => Packet::PeerHello(wire::PeerHello::decode(payload)?),
+            PacketType::PeerPresence => Packet::PeerPresence(wire::PeerPresence::decode(payload)?),
+            PacketType::PeerSync => Packet::PeerSync(wire::PeerSync::decode(payload)?),
         })
     }
 }
@@ -307,7 +328,11 @@ mod tests {
             seq: 0,
             media_id: String::new(),
         }));
-        round_trip(Packet::ServerAck(wire::ServerAck { message_id: "m-1".into(), seq: 9 }));
+        round_trip(Packet::ServerAck(wire::ServerAck {
+            message_id: "m-1".into(),
+            seq: 9,
+            to_user: String::new(),
+        }));
         round_trip(Packet::DeliveredAck(wire::DeliveredAck {
             message_id: "m-1".into(),
             from_user: "john".into(),
@@ -316,7 +341,11 @@ mod tests {
             message_id: "m-1".into(),
             from_user: "john".into(),
         }));
-        round_trip(Packet::SyncComplete(wire::SyncComplete { delivered: 2, latest_seq: 10 }));
+        round_trip(Packet::SyncComplete(wire::SyncComplete {
+            delivered: 2,
+            latest_seq: 10,
+            user_id: String::new(),
+        }));
         round_trip(Packet::MediaStart(wire::MediaStart {
             media_id: "f-1".into(),
             file_name: "report.pdf".into(),
@@ -346,6 +375,7 @@ mod tests {
             sent_at: 2,
             media_id: String::new(),
             seq: 0,
+            to_user: String::new(),
         }));
         round_trip(Packet::GroupEvent(wire::GroupEvent {
             group_id: "g-1".into(),
@@ -353,7 +383,19 @@ mod tests {
             actor_user: "akash".into(),
             subject_user: "john".into(),
             version: 2,
+            to_user: String::new(),
         }));
+        round_trip(Packet::PeerHello(wire::PeerHello {
+            node_id: "node-1".into(),
+            auth_token: "cafe".into(),
+        }));
+        round_trip(Packet::PeerPresence(wire::PeerPresence {
+            user_id: "akash".into(),
+            online: true,
+            node_id: "node-1".into(),
+            last_seen: 0,
+        }));
+        round_trip(Packet::PeerSync(wire::PeerSync { user_id: "akash".into(), after_seq: 5 }));
     }
 
     #[test]

@@ -10,6 +10,7 @@ overview, then dive into the layer you care about.
 | [02_bulk_data.md](02_bulk_data.md) | Chunked media transfer (PDFs, images) with integrity checks |
 | [03_sessions.md](03_sessions.md) | Session state machine, backpressure, liveness, graceful shutdown |
 | [04_auth.md](04_auth.md) | Token format, multi-device rules, brute-force protection, threat model |
+| [05_cluster.md](05_cluster.md) | Multi-node topology, home shards, peer links, cross-node flows |
 | [limits.md](limits.md) | Every configurable limit with defaults and rationale |
 
 Code map:

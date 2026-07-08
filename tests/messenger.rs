@@ -541,6 +541,231 @@ async fn repeated_auth_failures_backoff_grows() {
     assert!(d2 > d1, "backoff must grow: {d1:?} -> {d2:?}");
 }
 
+// ---- Multi-node cluster -------------------------------------------------------------
+
+mod cluster_tests {
+    use super::*;
+    use lane_switchboards::messenger::{ClusterConfig, PeerAddr};
+
+    const PEER_SECRET: &str = "peer-secret";
+
+    /// Boot a full-mesh cluster of `n` gateways on ephemeral ports and wait
+    /// for all peer links to establish.
+    async fn boot_cluster(n: usize) -> (Vec<MessengerServer>, Vec<String>, HmacAuthenticator) {
+        let auth = HmacAuthenticator::new(SECRET);
+        // Reserve addresses first so every node knows all peers up front.
+        let mut listeners = Vec::new();
+        for _ in 0..n {
+            // Bind to grab a free port, record it, release the socket; the
+            // gateway rebinds the same port right after (no TIME_WAIT on
+            // listening sockets, so this is race-free enough for tests).
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listeners.push(l.local_addr().unwrap().to_string());
+        }
+
+        let mut servers = Vec::new();
+        for (i, addr) in listeners.iter().enumerate() {
+            let peers: Vec<PeerAddr> = listeners
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(j, a)| PeerAddr { node_id: format!("node-{j}"), addr: a.clone() })
+                .collect();
+            let server = MessengerServer::bind_cluster(
+                addr,
+                Arc::new(auth.clone()),
+                ServerConfig::default(),
+                ClusterConfig {
+                    node_id: format!("node-{i}"),
+                    peers,
+                    peer_secret: PEER_SECRET.into(),
+                },
+            )
+            .await
+            .expect("bind cluster node");
+            servers.push(server);
+        }
+        let addrs: Vec<String> = servers.iter().map(|s| s.local_addr().to_string()).collect();
+        // Give the reconnecting peer links a moment to establish.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (servers, addrs, auth)
+    }
+
+    /// Find which user is homed on which node by probing: send to the user
+    /// and check where the inbox landed.
+    async fn home_index(servers: &[MessengerServer], user: &str) -> Option<usize> {
+        for (i, s) in servers.iter().enumerate() {
+            if s.pending_for(user).await > 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn cross_node_online_delivery_with_acks() {
+        let (_servers, addrs, auth) = boot_cluster(3).await;
+
+        // Alice on node 0, Bob on node 2 — different gateways.
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .expect("alice login");
+        let (mut bob, _) = MessengerClient::connect(
+            &addrs[2], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .expect("bob login");
+        // Let presence broadcasts propagate.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let seq = alice.send_chat("bob", "xm-1", b"across the cluster").await.expect("ack");
+        assert!(seq >= 1);
+
+        let pkt = bob
+            .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+            .await
+            .expect("cross-node delivery");
+        match pkt {
+            Packet::ChatMessage(m) => {
+                assert_eq!(m.from_user, "alice");
+                assert_eq!(m.body, b"across the cluster");
+            }
+            _ => unreachable!(),
+        }
+
+        // Delivered ack crosses back to Alice's gateway.
+        bob.ack_delivered("xm-1").await.unwrap();
+        alice
+            .recv_until(|p| matches!(p, Packet::DeliveredAck(a) if a.message_id == "xm-1"))
+            .await
+            .expect("cross-node delivered ack");
+    }
+
+    #[tokio::test]
+    async fn offline_message_replays_across_nodes() {
+        let (servers, addrs, auth) = boot_cluster(3).await;
+
+        // Alice on node 1 messages Bob who is offline everywhere.
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[1], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let seq = alice.send_chat("bob", "xm-off", b"catch up later").await.expect("ack");
+        assert_eq!(seq, 1);
+
+        // The message is persisted on exactly one node (Bob's home shard).
+        let home = home_index(&servers, "bob").await.expect("stored somewhere");
+        let total: usize = {
+            let mut t = 0;
+            for s in &servers {
+                t += s.pending_for("bob").await;
+            }
+            t
+        };
+        assert_eq!(total, 1, "exactly one copy cluster-wide");
+
+        // Bob logs in on a *different* node than his home shard.
+        let login_node = (home + 1) % servers.len();
+        let (mut bob, outcome) = MessengerClient::connect(
+            &addrs[login_node], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .expect("bob login on non-home node");
+
+        // Replay arrives via the peer mesh: either in the login outcome or
+        // shortly after (remote sync completes asynchronously).
+        let got = if outcome
+            .replayed
+            .iter()
+            .any(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == "xm-off"))
+        {
+            true
+        } else {
+            matches!(
+                bob.recv_until(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == "xm-off"))
+                    .await,
+                Ok(_)
+            )
+        };
+        assert!(got, "offline message must replay across nodes");
+    }
+
+    #[tokio::test]
+    async fn group_chat_spans_nodes() {
+        let (_servers, addrs, auth) = boot_cluster(3).await;
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let (mut bob, _) = MessengerClient::connect(
+            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let (mut carol, _) = MessengerClient::connect(
+            &addrs[2], "carol", "d1", &auth.mint_token("carol", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        alice.create_group("xg-1").await.expect("create");
+        alice.add_member("xg-1", "bob").await.expect("add bob");
+        alice.add_member("xg-1", "carol").await.expect("add carol");
+        alice.send_group("xg-1", "xgm-1", b"cluster group hello").await.expect("group send");
+
+        for (name, c) in [("bob", &mut bob), ("carol", &mut carol)] {
+            let pkt = c
+                .recv_until(|p| matches!(p, Packet::GroupMessage(gm) if gm.message_id == "xgm-1"))
+                .await
+                .unwrap_or_else(|e| panic!("{name} missed group message: {e}"));
+            match pkt {
+                Packet::GroupMessage(gm) => assert_eq!(gm.body, b"cluster group hello"),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn presence_propagates_across_nodes() {
+        let (_servers, addrs, auth) = boot_cluster(2).await;
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        // Bob logs in on the other node; Alice sees him come online.
+        let (bob, _) = MessengerClient::connect(
+            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        alice
+            .recv_until(|p| {
+                matches!(p, Packet::Presence(pr)
+                    if pr.user_id == "bob" && pr.kind == wire::PresenceKind::Available as i32)
+            })
+            .await
+            .expect("cross-node available");
+
+        bob.close().await.ok();
+        alice
+            .recv_until(|p| {
+                matches!(p, Packet::Presence(pr)
+                    if pr.user_id == "bob" && pr.kind == wire::PresenceKind::Unavailable as i32)
+            })
+            .await
+            .expect("cross-node unavailable");
+    }
+}
+
 // ---- TLS (feature = "tls") ---------------------------------------------------------
 
 #[cfg(feature = "tls")]

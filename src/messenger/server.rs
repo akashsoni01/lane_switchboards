@@ -29,8 +29,10 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{debug, info, warn};
 
+use crate::hash_ring::{HashRing, RingNode};
 use crate::stream::{self, MaybeTlsStream, TlsAcceptor};
 
+use super::auth::HmacAuthenticator;
 use super::codec::{FrameCodec, Packet};
 use super::wire;
 use super::{Authenticator, MessengerError};
@@ -92,6 +94,89 @@ fn unix_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
+/// One peer gateway in a messenger cluster.
+#[derive(Clone, Debug)]
+pub struct PeerAddr {
+    /// Stable node identifier (must match the peer's own `node_id`).
+    pub node_id: String,
+    /// `host:port` of the peer's messenger listener.
+    pub addr: String,
+}
+
+/// Multi-node configuration. Gateways form a full mesh of peer links over
+/// the same binary protocol, authenticated with `peer_secret`.
+///
+/// Sharding model: every user (and group) has a *home node* chosen by
+/// consistent hashing over all node ids. The home node owns the inbox
+/// (persistence, seq assignment, dedup) and group membership; gateways
+/// forward messages to home nodes and push live deliveries to wherever the
+/// recipient's session lives (tracked via `PeerPresence` broadcasts).
+#[derive(Clone, Debug)]
+pub struct ClusterConfig {
+    /// This node's identifier.
+    pub node_id: String,
+    /// All *other* nodes in the cluster.
+    pub peers: Vec<PeerAddr>,
+    /// Shared secret authenticating inter-node links (never reuse the
+    /// client-token secret).
+    pub peer_secret: String,
+}
+
+/// Runtime cluster state.
+struct ClusterState {
+    node_id: String,
+    /// Consistent-hash ring over all node ids (including self).
+    ring: HashRing,
+    /// node_id -> outbound frame queue (owned by the reconnecting link task).
+    peer_txs: HashMap<String, mpsc::Sender<Packet>>,
+    /// Authenticates PeerHello frames on inbound links.
+    peer_auth: HmacAuthenticator,
+}
+
+impl ClusterState {
+    /// Home node id for a routing key (user or group id).
+    fn home_of(&self, key: &str) -> String {
+        self.ring
+            .get_node(&key)
+            .map(|n| n.id.clone())
+            .unwrap_or_else(|| self.node_id.clone())
+    }
+
+    fn is_home(&self, key: &str) -> bool {
+        self.home_of(key) == self.node_id
+    }
+}
+
+/// True when this node owns `key`'s inbox (always true single-node).
+fn is_home(state: &State, key: &str) -> bool {
+    state.cluster.as_ref().map(|c| c.is_home(key)).unwrap_or(true)
+}
+
+/// Queue a packet on the outbound link to `node_id` (drops with a log when
+/// the link buffer is full or the node is unknown; chat frames are safe to
+/// drop post-persist because inbox replay recovers them).
+fn send_to_peer(state: &State, node_id: &str, pkt: Packet) {
+    let Some(cluster) = state.cluster.as_ref() else { return };
+    match cluster.peer_txs.get(node_id) {
+        Some(tx) => {
+            if let Err(e) = tx.try_send(pkt) {
+                warn!(node_id, error = %e, "peer link backpressure: frame dropped");
+            }
+        }
+        None => warn!(node_id, "unknown peer node"),
+    }
+}
+
+/// Broadcast a packet to every peer link.
+fn send_to_all_peers(state: &State, pkt: &Packet) {
+    let Some(cluster) = state.cluster.as_ref() else { return };
+    for (node_id, tx) in &cluster.peer_txs {
+        if let Err(e) = tx.try_send(pkt.clone()) {
+            debug!(node_id, error = %e, "peer broadcast frame dropped");
+        }
+    }
+}
+
 /// Handle to a connected device session: outbound frame queue + liveness.
 struct SessionHandle {
     session_id: u64,
@@ -150,6 +235,11 @@ struct State {
     conn_rate: Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>,
     /// user_id -> consecutive login failures (drives exponential backoff).
     auth_failures: Mutex<HashMap<String, u32>>,
+    /// Multi-node state (None on single-node deployments).
+    cluster: Option<ClusterState>,
+    /// user_id -> node_id where the user's session lives (cluster mode;
+    /// maintained via PeerPresence broadcasts).
+    user_locations: RwLock<HashMap<String, String>>,
 }
 
 /// A running messenger gateway. Dropping the handle aborts the accept loop.
@@ -158,12 +248,59 @@ pub struct MessengerServer {
     state: Arc<State>,
     accept_task: JoinHandle<()>,
     sweep_task: JoinHandle<()>,
+    peer_tasks: Vec<JoinHandle<()>>,
 }
 
 impl Drop for MessengerServer {
     fn drop(&mut self) {
         self.accept_task.abort();
         self.sweep_task.abort();
+        for t in &self.peer_tasks {
+            t.abort();
+        }
+    }
+}
+
+/// Outbound peer link: connect, send `PeerHello`, then forward queued frames.
+/// Reconnects with backoff on any failure; queued frames survive reconnects.
+async fn peer_link(
+    self_node: String,
+    peer: PeerAddr,
+    token: String,
+    mut rx: mpsc::Receiver<Packet>,
+) {
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        let socket = match stream::connect(&peer.addr, None).await {
+            Ok(s) => s,
+            Err(e) => {
+                debug!(peer = %peer.node_id, error = %e, "peer connect failed; retrying");
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+                continue;
+            }
+        };
+        backoff = Duration::from_millis(100);
+        let mut framed = Framed::new(socket, FrameCodec::default());
+        if framed
+            .send(Packet::PeerHello(wire::PeerHello {
+                node_id: self_node.clone(),
+                auth_token: token.clone(),
+            }))
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        info!(peer = %peer.node_id, "peer link established");
+        // Forward frames until the link breaks; frames still in `rx` are
+        // preserved for the next connection.
+        while let Some(pkt) = rx.recv().await {
+            if let Err(e) = framed.send(pkt).await {
+                warn!(peer = %peer.node_id, error = %e, "peer link broken; reconnecting");
+                break;
+            }
+        }
     }
 }
 
@@ -186,8 +323,52 @@ impl MessengerServer {
         cfg: ServerConfig,
         tls: Option<TlsAcceptor>,
     ) -> Result<Self, MessengerError> {
+        Self::bind_inner(addr, auth, cfg, tls, None).await
+    }
+
+    /// Bind `addr` as one node of a multi-node cluster. Peer links are
+    /// established (and re-established on failure) to every configured peer.
+    pub async fn bind_cluster(
+        addr: &str,
+        auth: Arc<dyn Authenticator>,
+        cfg: ServerConfig,
+        cluster: ClusterConfig,
+    ) -> Result<Self, MessengerError> {
+        Self::bind_inner(addr, auth, cfg, None, Some(cluster)).await
+    }
+
+    async fn bind_inner(
+        addr: &str,
+        auth: Arc<dyn Authenticator>,
+        cfg: ServerConfig,
+        tls: Option<TlsAcceptor>,
+        cluster_cfg: Option<ClusterConfig>,
+    ) -> Result<Self, MessengerError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
+
+        // Build cluster state: ring over all node ids + one reconnecting
+        // outbound link task per peer.
+        let mut peer_tasks: Vec<JoinHandle<()>> = Vec::new();
+        let cluster = cluster_cfg.map(|cc| {
+            let mut ring = HashRing::new(64);
+            ring.add_node(RingNode::new(cc.node_id.clone(), "local", 0));
+            let peer_auth = HmacAuthenticator::new(&cc.peer_secret);
+            let mut peer_txs = HashMap::new();
+            for peer in &cc.peers {
+                ring.add_node(RingNode::new(peer.node_id.clone(), "peer", 0));
+                let (tx, rx) = mpsc::channel::<Packet>(4096);
+                peer_txs.insert(peer.node_id.clone(), tx);
+                peer_tasks.push(tokio::spawn(peer_link(
+                    cc.node_id.clone(),
+                    peer.clone(),
+                    peer_auth.mint_token(&cc.node_id, "peer"),
+                    rx,
+                )));
+            }
+            ClusterState { node_id: cc.node_id, ring, peer_txs, peer_auth }
+        });
+
         let state = Arc::new(State {
             cfg,
             auth,
@@ -199,6 +380,8 @@ impl MessengerServer {
             session_ids: AtomicU64::new(1),
             conn_rate: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
+            cluster,
+            user_locations: RwLock::new(HashMap::new()),
         });
 
         // Idle sweep: close sessions that missed heartbeats.
@@ -251,7 +434,7 @@ impl MessengerServer {
         });
 
         info!(%addr, "messenger gateway listening");
-        Ok(Self { addr, state, accept_task, sweep_task })
+        Ok(Self { addr, state, accept_task, sweep_task, peer_tasks })
     }
 
     /// Actual bound address (useful with port 0 in tests).
@@ -281,6 +464,9 @@ impl MessengerServer {
     pub async fn shutdown(self) {
         self.accept_task.abort();
         self.sweep_task.abort();
+        for t in &self.peer_tasks {
+            t.abort();
+        }
         let drained: Vec<String> = {
             let mut sessions = self.state.sessions.write().await;
             let users: Vec<String> = sessions.keys().cloned().collect();
@@ -357,9 +543,27 @@ async fn remove_session(state: &Arc<State>, user: &str, session_id: u64) {
     }
 }
 
-/// Send a presence update about `user` to every online session (roster model
-/// intentionally simple: all online users; contact filtering is a follow-up).
+/// Presence update: notify local sessions and fan out to peer gateways.
 async fn broadcast_presence(state: &Arc<State>, user: &str, kind: wire::PresenceKind) {
+    broadcast_presence_local(state, user, kind).await;
+    if let Some(cluster) = state.cluster.as_ref() {
+        let online = kind == wire::PresenceKind::Available;
+        send_to_all_peers(
+            state,
+            &Packet::PeerPresence(wire::PeerPresence {
+                user_id: user.to_string(),
+                online,
+                node_id: cluster.node_id.clone(),
+                last_seen: if online { 0 } else { unix_secs() },
+            }),
+        );
+    }
+}
+
+/// Send a presence update about `user` to every local online session (roster
+/// model intentionally simple: all online users; contact filtering is a
+/// follow-up).
+async fn broadcast_presence_local(state: &Arc<State>, user: &str, kind: wire::PresenceKind) {
     let last_seen = if kind == wire::PresenceKind::Unavailable { unix_secs() } else { 0 };
     let pkt = Packet::Presence(wire::Presence {
         user_id: user.to_string(),
@@ -377,18 +581,35 @@ async fn broadcast_presence(state: &Arc<State>, user: &str, kind: wire::Presence
     }
 }
 
-/// Deliver `pkt` to all live sessions of `user`. Returns true if at least one
-/// session accepted it.
+/// Deliver `pkt` to `user`: local sessions first; in cluster mode, forward to
+/// the gateway holding the user's session (per the presence location map).
+/// Returns true if at least one session (local or remote link) accepted it.
 async fn deliver_online(state: &Arc<State>, user: &str, pkt: &Packet) -> bool {
-    let sessions = state.sessions.read().await;
-    let Some(handles) = sessions.get(user) else { return false };
-    let mut any = false;
-    for h in handles {
-        if h.tx.try_send(pkt.clone()).is_ok() {
-            any = true;
+    {
+        let sessions = state.sessions.read().await;
+        if let Some(handles) = sessions.get(user) {
+            let mut any = false;
+            for h in handles {
+                if h.tx.try_send(pkt.clone()).is_ok() {
+                    any = true;
+                }
+            }
+            if any {
+                return true;
+            }
         }
     }
-    any
+    // No local session: push to the user's gateway if known.
+    if let Some(cluster) = state.cluster.as_ref() {
+        let target_node = state.user_locations.read().await.get(user).cloned();
+        if let Some(node) = target_node {
+            if node != cluster.node_id {
+                send_to_peer(state, &node, pkt.clone());
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Persist a message into `to_user`'s inbox (assigning seq) unless it is a
@@ -465,6 +686,23 @@ async fn run_session(state: Arc<State>, socket: MaybeTlsStream) -> Result<(), Me
         Ok(None) => return Err(MessengerError::Closed),
         Ok(Some(Err(e))) => return Err(e),
         Ok(Some(Ok(Packet::Login(l)))) => l,
+        // Inter-node link: authenticate the peer, then switch to the peer
+        // dispatch loop for the rest of the connection.
+        Ok(Some(Ok(Packet::PeerHello(hello)))) => {
+            let ok = state
+                .cluster
+                .as_ref()
+                .is_some_and(|c| c.peer_auth.verify(&hello.node_id, "peer", &hello.auth_token));
+            if !ok {
+                warn!(node = %hello.node_id, "peer hello rejected");
+                let _ = framed
+                    .send(proto_error(wire::ErrorCode::AuthFailed, "invalid peer token"))
+                    .await;
+                return Err(MessengerError::AuthFailed);
+            }
+            info!(node = %hello.node_id, "inbound peer link authenticated");
+            return peer_session(&state, &hello.node_id, &mut framed).await;
+        }
         Ok(Some(Ok(_))) => {
             let _ = framed
                 .send(proto_error(wire::ErrorCode::NotAuthenticated, "first frame must be Login"))
@@ -527,38 +765,74 @@ async fn run_session(state: Arc<State>, socket: MaybeTlsStream) -> Result<(), Me
     state.last_seen.write().await.remove(&user);
 
     // ---- LoginAck + offline replay ---------------------------------------
-    let replay: Vec<StoredMessage> = {
-        let inboxes = state.inboxes.lock().await;
-        inboxes
-            .get(&user)
-            .map(|i| {
-                i.pending
-                    .iter()
-                    .filter(|m| !m.delivered && m.seq > login.resume_after_seq)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    framed
-        .send(Packet::LoginAck(wire::LoginAck {
-            ok: true,
-            error: String::new(),
-            session_id: format!("s-{session_id}"),
-            pending_messages: replay.len() as u64,
-        }))
-        .await?;
-    let latest_seq = replay.last().map(|m| m.seq).unwrap_or(login.resume_after_seq);
-    let replayed = replay.len() as u64;
-    for m in &replay {
-        framed.send(m.packet.clone()).await?;
+    if is_home(&state, &user) {
+        // Inbox is local: replay inline, then SyncComplete.
+        let replay: Vec<StoredMessage> = {
+            let inboxes = state.inboxes.lock().await;
+            inboxes
+                .get(&user)
+                .map(|i| {
+                    i.pending
+                        .iter()
+                        .filter(|m| !m.delivered && m.seq > login.resume_after_seq)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        framed
+            .send(Packet::LoginAck(wire::LoginAck {
+                ok: true,
+                error: String::new(),
+                session_id: format!("s-{session_id}"),
+                pending_messages: replay.len() as u64,
+            }))
+            .await?;
+        let latest_seq = replay.last().map(|m| m.seq).unwrap_or(login.resume_after_seq);
+        let replayed = replay.len() as u64;
+        for m in &replay {
+            framed.send(m.packet.clone()).await?;
+        }
+        framed
+            .send(Packet::SyncComplete(wire::SyncComplete {
+                delivered: replayed,
+                latest_seq,
+                user_id: String::new(),
+            }))
+            .await?;
+    } else {
+        // Inbox lives on the user's home node: broadcast presence first so
+        // the home node knows where to push, then ask it to replay. Its
+        // SyncComplete arrives through the peer mesh and ends the client's
+        // sync phase.
+        framed
+            .send(Packet::LoginAck(wire::LoginAck {
+                ok: true,
+                error: String::new(),
+                session_id: format!("s-{session_id}"),
+                pending_messages: 0, // unknown until the home node replies
+            }))
+            .await?;
+        broadcast_presence(&state, &user, wire::PresenceKind::Available).await;
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&user))
+            .unwrap_or_default();
+        send_to_peer(
+            &state,
+            &home,
+            Packet::PeerSync(wire::PeerSync {
+                user_id: user.clone(),
+                after_seq: login.resume_after_seq,
+            }),
+        );
     }
-    framed
-        .send(Packet::SyncComplete(wire::SyncComplete { delivered: replayed, latest_seq }))
-        .await?;
 
     info!(user, session_id, device = %login.device_id, "session authenticated");
-    broadcast_presence(&state, &user, wire::PresenceKind::Available).await;
+    if is_home(&state, &user) {
+        broadcast_presence(&state, &user, wire::PresenceKind::Available).await;
+    }
 
     // ---- Authenticated main loop -----------------------------------------
     let result = session_loop(&state, &user, session_id, &mut framed, &mut rx).await;
@@ -650,6 +924,155 @@ async fn session_loop(
     }
 }
 
+// ---- Inter-node dispatch ------------------------------------------------------
+
+/// Receive loop for an authenticated inbound peer link. Peer links are
+/// one-directional: this side only reads; replies go out via our own
+/// outbound link to `peer_node`.
+async fn peer_session(
+    state: &Arc<State>,
+    peer_node: &str,
+    framed: &mut ClientFramed,
+) -> Result<(), MessengerError> {
+    loop {
+        let pkt = match framed.next().await {
+            None => {
+                debug!(peer_node, "peer link closed");
+                return Ok(());
+            }
+            Some(Err(e)) => return Err(e),
+            Some(Ok(p)) => p,
+        };
+        dispatch_peer_packet(state, peer_node, pkt).await;
+    }
+}
+
+/// Handle one frame arriving from a peer gateway.
+async fn dispatch_peer_packet(state: &Arc<State>, peer_node: &str, pkt: Packet) {
+    match pkt {
+        // Presence fan-in: update the location map and tell local sessions.
+        Packet::PeerPresence(p) => {
+            {
+                let mut locs = state.user_locations.write().await;
+                if p.online {
+                    locs.insert(p.user_id.clone(), p.node_id.clone());
+                } else if locs.get(&p.user_id) == Some(&p.node_id) {
+                    locs.remove(&p.user_id);
+                }
+            }
+            if !p.online {
+                state.last_seen.write().await.insert(p.user_id.clone(), p.last_seen);
+            }
+            let kind = if p.online {
+                wire::PresenceKind::Available
+            } else {
+                wire::PresenceKind::Unavailable
+            };
+            broadcast_presence_local(state, &p.user_id, kind).await;
+        }
+
+        // A gateway asks us (the home node) to replay a user's inbox.
+        Packet::PeerSync(s) => {
+            let replay: Vec<StoredMessage> = {
+                let inboxes = state.inboxes.lock().await;
+                inboxes
+                    .get(&s.user_id)
+                    .map(|i| {
+                        i.pending
+                            .iter()
+                            .filter(|m| !m.delivered && m.seq > s.after_seq)
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let latest = replay.last().map(|m| m.seq).unwrap_or(s.after_seq);
+            let count = replay.len() as u64;
+            for m in replay {
+                send_to_peer(state, peer_node, m.packet);
+            }
+            send_to_peer(
+                state,
+                peer_node,
+                Packet::SyncComplete(wire::SyncComplete {
+                    delivered: count,
+                    latest_seq: latest,
+                    user_id: s.user_id,
+                }),
+            );
+        }
+
+        // Chat: either we are the recipient's home (persist + route) or the
+        // recipient's session lives here (seq already assigned: deliver).
+        Packet::ChatMessage(m) => {
+            if m.seq == 0 {
+                route_new_chat(state, m, Some(peer_node)).await;
+            } else {
+                deliver_online(state, &m.to_user.clone(), &Packet::ChatMessage(m)).await;
+            }
+        }
+
+        // Group flows (see route_group_message / handle group event docs).
+        Packet::GroupMessage(m) => {
+            if m.to_user.is_empty() {
+                // We are the group's home shard: fan out.
+                route_group_fanout(state, m).await;
+            } else if m.seq == 0 {
+                // We are this member's home: persist a copy, then deliver.
+                store_and_push_group_copy(state, m).await;
+            } else {
+                deliver_online(state, &m.to_user.clone(), &Packet::GroupMessage(m)).await;
+            }
+        }
+        Packet::GroupEvent(ev) => {
+            if !ev.to_user.is_empty() {
+                // Membership notification for a member connected here.
+                let target = ev.to_user.clone();
+                deliver_online(state, &target, &Packet::GroupEvent(ev)).await;
+            } else if is_home(state, &ev.group_id) {
+                apply_group_event_at_home(state, ev).await;
+            } else {
+                debug!("group event for a group not homed here; ignored");
+            }
+        }
+
+        // Acks addressed to a user whose home/session is on this node.
+        Packet::ServerAck(a) => {
+            let target = a.to_user.clone();
+            deliver_online(state, &target, &Packet::ServerAck(a)).await;
+        }
+        Packet::DeliveredAck(a) => {
+            // Tombstone if we are the acking user's home, then notify local
+            // sessions (peer-received acks are never re-forwarded).
+            if is_home(state, &a.from_user) {
+                mark_delivered(state, &a.from_user, &a.message_id).await;
+            }
+            broadcast_to_local_sessions(state, &Packet::DeliveredAck(a)).await;
+        }
+        Packet::ReadAck(a) => {
+            broadcast_to_local_sessions(state, &Packet::ReadAck(a)).await;
+        }
+        // Marker for a user syncing on this gateway.
+        Packet::SyncComplete(s) => {
+            let target = s.user_id.clone();
+            deliver_online(state, &target, &Packet::SyncComplete(s)).await;
+        }
+        other => {
+            debug!(peer_node, ty = ?other.packet_type(), "unexpected peer packet ignored");
+        }
+    }
+}
+
+/// Send `pkt` to every local session (used for ack relays).
+async fn broadcast_to_local_sessions(state: &Arc<State>, pkt: &Packet) {
+    let sessions = state.sessions.read().await;
+    for handles in sessions.values() {
+        for h in handles {
+            let _ = h.tx.try_send(pkt.clone());
+        }
+    }
+}
+
 async fn touch_session(state: &Arc<State>, user: &str, session_id: u64) {
     let mut sessions = state.sessions.write().await;
     if let Some(handles) = sessions.get_mut(user) {
@@ -677,6 +1100,18 @@ async fn handle_chat(
     let to_user = m.to_user.clone();
     let message_id = m.message_id.clone();
 
+    // Cluster mode: if another node owns the recipient's inbox, forward the
+    // message there; the ServerAck comes back over the peer mesh.
+    if !is_home(state, &to_user) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&to_user))
+            .unwrap_or_default();
+        send_to_peer(state, &home, Packet::ChatMessage(m));
+        return Ok(());
+    }
+
     // Persist first (ServerAck must mean "durable"), then attempt delivery.
     let seq = store_message(state, &to_user, &message_id, |seq| {
         let mut stored = m.clone();
@@ -688,11 +1123,21 @@ async fn handle_chat(
     match seq {
         None => {
             // Duplicate retry: re-ack so the sender stops retrying.
-            framed.send(Packet::ServerAck(wire::ServerAck { message_id, seq: 0 })).await?;
+            framed
+                .send(Packet::ServerAck(wire::ServerAck {
+                    message_id,
+                    seq: 0,
+                    to_user: String::new(),
+                }))
+                .await?;
         }
         Some(seq) => {
             framed
-                .send(Packet::ServerAck(wire::ServerAck { message_id: message_id.clone(), seq }))
+                .send(Packet::ServerAck(wire::ServerAck {
+                    message_id: message_id.clone(),
+                    seq,
+                    to_user: String::new(),
+                }))
                 .await?;
             let mut delivered = m;
             delivered.seq = seq;
@@ -702,28 +1147,50 @@ async fn handle_chat(
     Ok(())
 }
 
-async fn handle_delivered_ack(state: &Arc<State>, acking_user: &str, a: wire::DeliveredAck) {
-    mark_delivered(state, acking_user, &a.message_id).await;
-    // Relay the double-tick to the original sender if online. The stored
-    // packet is gone after tombstoning, so we relay by broadcast-to-sender
-    // via the ack's implicit addressing: sender learns from message_id.
-    let pkt = Packet::DeliveredAck(a.clone());
-    let sessions = state.sessions.read().await;
-    for handles in sessions.values() {
-        for h in handles {
-            let _ = h.tx.try_send(pkt.clone());
-        }
+/// Persist + route a chat message on the recipient's home node when it
+/// arrived over a peer link (the sender is connected to another gateway).
+async fn route_new_chat(state: &Arc<State>, m: wire::ChatMessage, _origin_peer: Option<&str>) {
+    let to_user = m.to_user.clone();
+    let from_user = m.from_user.clone();
+    let message_id = m.message_id.clone();
+    let seq = store_message(state, &to_user, &message_id, |seq| {
+        let mut stored = m.clone();
+        stored.seq = seq;
+        Packet::ChatMessage(stored)
+    })
+    .await;
+    // Ack the sender wherever their session lives (duplicates re-acked with 0).
+    let ack = Packet::ServerAck(wire::ServerAck {
+        message_id,
+        seq: seq.unwrap_or(0),
+        to_user: from_user.clone(),
+    });
+    deliver_online(state, &from_user, &ack).await;
+    if let Some(seq) = seq {
+        let mut delivered = m;
+        delivered.seq = seq;
+        deliver_online(state, &to_user, &Packet::ChatMessage(delivered)).await;
     }
 }
 
-async fn handle_read_ack(state: &Arc<State>, a: wire::ReadAck) {
-    let pkt = Packet::ReadAck(a.clone());
-    let sessions = state.sessions.read().await;
-    for handles in sessions.values() {
-        for h in handles {
-            let _ = h.tx.try_send(pkt.clone());
-        }
+async fn handle_delivered_ack(state: &Arc<State>, acking_user: &str, a: wire::DeliveredAck) {
+    // Tombstone on the acking user's home node (locally, or via the mesh —
+    // every peer receives the ack and the home node tombstones).
+    if is_home(state, acking_user) {
+        mark_delivered(state, acking_user, &a.message_id).await;
     }
+    // Relay the double-tick to the original sender. The stored packet is gone
+    // after tombstoning, so the relay is broadcast-addressed: sessions match
+    // it to their pending sends by message_id.
+    let pkt = Packet::DeliveredAck(a);
+    broadcast_to_local_sessions(state, &pkt).await;
+    send_to_all_peers(state, &pkt);
+}
+
+async fn handle_read_ack(state: &Arc<State>, a: wire::ReadAck) {
+    let pkt = Packet::ReadAck(a);
+    broadcast_to_local_sessions(state, &pkt).await;
+    send_to_all_peers(state, &pkt);
 }
 
 // ---- Media (bulk data: PDFs, images, …) --------------------------------------
@@ -937,6 +1404,44 @@ async fn handle_group_event(
     mut ev: wire::GroupEvent,
 ) -> Result<(), MessengerError> {
     ev.actor_user = user.to_string();
+    ev.to_user = String::new();
+
+    // Cluster mode: membership lives on the group's home shard.
+    if !is_home(state, &ev.group_id) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&ev.group_id))
+            .unwrap_or_default();
+        send_to_peer(state, &home, Packet::GroupEvent(ev));
+        // The versioned event (the client's confirmation) comes back
+        // addressed to the actor over the peer mesh.
+        return Ok(());
+    }
+
+    match apply_group_event(state, ev).await {
+        Err(detail) => {
+            framed.send(proto_error(wire::ErrorCode::MalformedFrame, detail)).await?;
+        }
+        Ok(()) => {}
+    }
+    Ok(())
+}
+
+/// Apply a membership mutation on the group's home node (invoked from a peer
+/// link; errors are logged because there is no client to answer directly).
+async fn apply_group_event_at_home(state: &Arc<State>, mut ev: wire::GroupEvent) {
+    ev.to_user = String::new();
+    if let Err(detail) = apply_group_event(state, ev).await {
+        warn!(detail, "remote group event rejected");
+    }
+}
+
+/// Validate + apply a group membership change, then notify every member
+/// (including the actor) with the versioned event.
+async fn apply_group_event(state: &Arc<State>, mut ev: wire::GroupEvent) -> Result<(), String> {
+    let user_owned = ev.actor_user.clone();
+    let user = user_owned.as_str();
     let op = wire::GroupOp::try_from(ev.op).unwrap_or(wire::GroupOp::Unspecified);
     let outcome: Result<(u64, Vec<String>), String> = {
         let mut groups = state.groups.lock().await;
@@ -988,20 +1493,17 @@ async fn handle_group_event(
         }
     };
 
-    match outcome {
-        Err(detail) => {
-            framed.send(proto_error(wire::ErrorCode::MalformedFrame, detail)).await?;
-        }
-        Ok((version, members)) => {
-            ev.version = version;
-            let pkt = Packet::GroupEvent(ev.clone());
-            framed.send(pkt.clone()).await?;
-            for member in members {
-                if member != user {
-                    deliver_online(state, &member, &pkt).await;
-                }
-            }
-        }
+    let (version, members) = outcome?;
+    ev.version = version;
+    // Notify each member plus the actor (who may have just left the group).
+    let mut targets: Vec<String> = members;
+    if !targets.iter().any(|m| m == user) {
+        targets.push(user.to_string());
+    }
+    for member in targets {
+        let mut copy = ev.clone();
+        copy.to_user = member.clone();
+        deliver_online(state, &member, &Packet::GroupEvent(copy)).await;
     }
     Ok(())
 }
@@ -1017,6 +1519,20 @@ async fn handle_group_message(
             .await?;
         return Ok(());
     }
+    // Cluster mode: fan-out happens on the group's home shard.
+    if !is_home(state, &m.group_id) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&m.group_id))
+            .unwrap_or_default();
+        let mut fwd = m;
+        fwd.to_user = String::new();
+        send_to_peer(state, &home, Packet::GroupMessage(fwd));
+        // ServerAck comes back over the peer mesh addressed to the sender.
+        return Ok(());
+    }
+
     // Snapshot membership at a consistent version.
     let members: Option<Vec<String>> = {
         let groups = state.groups.lock().await;
@@ -1034,29 +1550,83 @@ async fn handle_group_message(
     };
 
     framed
-        .send(Packet::ServerAck(wire::ServerAck { message_id: m.message_id.clone(), seq: 0 }))
+        .send(Packet::ServerAck(wire::ServerAck {
+            message_id: m.message_id.clone(),
+            seq: 0,
+            to_user: String::new(),
+        }))
         .await?;
 
+    fanout_group(state, m, members).await;
+    Ok(())
+}
+
+/// Fan out a group message arriving over a peer link (this node is the
+/// group's home shard; the sender is connected to another gateway).
+async fn route_group_fanout(state: &Arc<State>, m: wire::GroupMessage) {
+    let members: Option<Vec<String>> = {
+        let groups = state.groups.lock().await;
+        groups.get(&m.group_id).and_then(|g| {
+            g.members
+                .contains(&m.from_user)
+                .then(|| g.members.iter().cloned().collect())
+        })
+    };
+    let Some(members) = members else {
+        warn!(group = %m.group_id, from = %m.from_user, "remote group send rejected");
+        return;
+    };
+    // Ack the sender wherever they are connected.
+    let ack = Packet::ServerAck(wire::ServerAck {
+        message_id: m.message_id.clone(),
+        seq: 0,
+        to_user: m.from_user.clone(),
+    });
+    deliver_online(state, &m.from_user.clone(), &ack).await;
+    fanout_group(state, m, members).await;
+}
+
+/// Deliver one group message to every member except the sender: persist on
+/// each member's home node (locally or via the mesh), then push to live
+/// sessions.
+async fn fanout_group(state: &Arc<State>, m: wire::GroupMessage, members: Vec<String>) {
     for member in members {
         if member == m.from_user {
             continue;
         }
-        // Per-member dedup key so one group message maps to one inbox entry each.
-        let dedup = format!("{}:{}", m.message_id, member);
-        let msg = m.clone();
-        let stored = store_message(state, &member, &dedup, move |seq| {
-            let mut g = msg;
-            g.seq = seq;
-            Packet::GroupMessage(g)
-        })
-        .await;
-        if let Some(seq) = stored {
-            let mut out = m.clone();
-            out.seq = seq;
-            deliver_online(state, &member, &Packet::GroupMessage(out)).await;
+        let mut copy = m.clone();
+        copy.to_user = member.clone();
+        copy.seq = 0;
+        if is_home(state, &member) {
+            store_and_push_group_copy(state, copy).await;
+        } else {
+            let home = state
+                .cluster
+                .as_ref()
+                .map(|c| c.home_of(&member))
+                .unwrap_or_default();
+            send_to_peer(state, &home, Packet::GroupMessage(copy));
         }
     }
-    Ok(())
+}
+
+/// Persist a per-member group message copy on this node (the member's home)
+/// and push it to their session if online. Dedup key is `message_id:member`.
+async fn store_and_push_group_copy(state: &Arc<State>, m: wire::GroupMessage) {
+    let member = m.to_user.clone();
+    let dedup = format!("{}:{}", m.message_id, member);
+    let msg = m.clone();
+    let stored = store_message(state, &member, &dedup, move |seq| {
+        let mut g = msg;
+        g.seq = seq;
+        Packet::GroupMessage(g)
+    })
+    .await;
+    if let Some(seq) = stored {
+        let mut out = m;
+        out.seq = seq;
+        deliver_online(state, &member, &Packet::GroupMessage(out)).await;
+    }
 }
 
 // Minimal hex helper (avoids new dependency for one call site).

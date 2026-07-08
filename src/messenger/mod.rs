@@ -29,7 +29,7 @@ pub use crate::proto::messenger as wire;
 pub use auth::{Authenticator, HmacAuthenticator};
 pub use client::MessengerClient;
 pub use codec::{FrameCodec, Packet, PacketType, PROTOCOL_VERSION};
-pub use server::{MessengerServer, ServerConfig};
+pub use server::{ClusterConfig, MessengerServer, PeerAddr, ServerConfig};
 
 /// Errors surfaced by the messenger layer.
 #[derive(Debug, thiserror::Error)]

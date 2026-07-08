@@ -46,6 +46,9 @@ is 52 bytes of markup for 5 bytes of content. The equivalent binary frame is
 | 0x33 | `MediaFetch` | C→S | Request stored blob (resumable) |
 | 0x40 | `GroupMessage` | both | Group chat message |
 | 0x41 | `GroupEvent` | both | Create / add / remove / leave |
+| 0x50 | `PeerHello` | node→node | Authenticate an inter-node link |
+| 0x51 | `PeerPresence` | node→node | User login/logout location broadcast |
+| 0x52 | `PeerSync` | node→node | Ask a home shard to replay an inbox |
 
 Payload schemas: `proto/messenger.proto`. Field numbers and packet IDs are
 append-only — never reuse or renumber.

@@ -1,0 +1,91 @@
+# Multi-Node Clustering
+
+Multiple gateways form a full mesh of peer links speaking the same binary
+protocol as clients. Configuration is `ClusterConfig { node_id, peers,
+peer_secret }` passed to `MessengerServer::bind_cluster`.
+
+## Topology
+
+```text
+              clients                clients                clients
+                 │                      │                      │
+            ┌────▼────┐            ┌────▼────┐            ┌────▼────┐
+            │ node-0  │◄──────────►│ node-1  │◄──────────►│ node-2  │
+            └────┬────┘  peer      └─────────┘   peer     └────┬────┘
+                 └────────────────── links ────────────────────┘
+```
+
+- **Peer links**: every ordered node pair has one outbound link (connect →
+  `PeerHello` with an HMAC token over `peer_secret` → frames). Links
+  reconnect with exponential backoff; queued frames survive reconnects.
+  Inbound links only receive; replies travel over the receiver's own
+  outbound link.
+- **Peer auth**: `PeerHello.auth_token = hex(HMAC-SHA256(peer_secret,
+  "node_id:peer"))` — same authenticator machinery as clients, separate
+  secret.
+
+## Sharding model
+
+Every user and group has a **home node** chosen by consistent hashing
+(`HashRing`, 64 virtual nodes) over all node ids:
+
+| Owned by home node | Meaning |
+|--------------------|---------|
+| Inbox | persistence, `seq` assignment, dedup, tombstoning |
+| Group membership | create/add/remove/leave, versioning, fan-out |
+
+Sessions live wherever the client connected; a **location map**
+(`user → node`) is maintained on every node via `PeerPresence` broadcasts on
+login/logout.
+
+## Message flows
+
+**1:1 chat** (Alice on node-0 → Bob homed on node-1, connected to node-2):
+
+```text
+Alice ── ChatMessage ──► node-0
+node-0 ─ forward ──────► node-1 (Bob's home)   persist, assign seq
+node-1 ─ ServerAck{to_user=alice} ─► node-0 ─► Alice   (single tick)
+node-1 ─ ChatMessage{seq} ─► node-2 ─► Bob             (delivery)
+Bob ── DeliveredAck ─► node-2 ─ broadcast ─► all peers
+node-1 tombstones; Alice's node relays the double tick to her session
+```
+
+**Offline + sync**: messages wait in the home node's inbox. When the user
+logs in on any gateway, that gateway sends `PeerSync { user, after_seq }` to
+the home node, which streams the pending messages followed by
+`SyncComplete{user_id}` through the mesh to the user's session.
+
+**Groups**: the sender's gateway forwards `GroupMessage` to the group's home
+shard, which validates membership at a consistent version, acks the sender
+(`ServerAck{to_user}` routed via the location map), and fans out one copy per
+member to that member's home node (persist, dedup key `message_id:member`)
+and on to their live session.
+
+## Delivery guarantees (cluster)
+
+- `ServerAck` still means "persisted on the recipient's home node".
+- Exactly one stored copy per recipient cluster-wide (dedup at the home).
+- Peer-link frame drops are safe post-persist: inbox replay recovers them.
+- Acks (`DeliveredAck`/`ReadAck`) are broadcast to all nodes; each node
+  relays to local sessions and the home node tombstones. Broadcast is O(n)
+  in cluster size — acceptable for small meshes, a routing-table follow-up
+  for large ones.
+
+## Current limitations
+
+- Static membership: node join/leave rebalancing is not implemented yet
+  (ring is fixed at startup).
+- Media blobs are stored on the uploader's gateway only; `MediaFetch` must
+  hit that node. Content-addressed replicated storage is Phase 6 work.
+- Group-operation errors (e.g. non-admin add) are logged on the home node
+  but not relayed to remote actors; the client times out instead of getting
+  a typed error.
+- Peer links are plain TCP; TLS between nodes is a follow-up (client TLS is
+  supported).
+
+## Tests
+
+`tests/messenger.rs` (`cluster_tests`): cross-node delivery with the full
+ack ladder, offline replay when the user logs in on a non-home node with
+exactly-one-copy assertion, a 3-node group chat, and cross-node presence.
