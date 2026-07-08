@@ -32,6 +32,7 @@ pub mod hash_ring;
 pub mod macros;
 pub mod mesh;
 pub mod mesh_registry_grpc;
+pub mod messenger;
 pub mod proto;
 pub mod paxos;
 pub mod paxos_grpc;

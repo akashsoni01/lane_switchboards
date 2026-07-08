@@ -1,0 +1,190 @@
+// Messenger plane: compact binary client protocol (FunXMPP-style).
+//
+// Framing (not part of protobuf, see docs/messenger/01_wire_protocol.md):
+//   +---------+-------------+------------+------------------+
+//   | u8 ver  | u8 pkt_type | u32 length | protobuf payload |
+//   +---------+-------------+------------+------------------+
+//
+// Each pkt_type maps to exactly one message below. Field numbers are
+// append-only: never reuse or renumber.
+syntax = "proto3";
+
+package lane_switchboard.messenger;
+
+// ---- Control ---------------------------------------------------------------
+
+// pkt_type = 0x01. First frame a client must send.
+message Login {
+  string user_id = 1;
+  string device_id = 2;
+  // HMAC-SHA256 token, hex encoded: hex(hmac(secret, "user_id:device_id")).
+  string auth_token = 3;
+  string client_version = 4;
+  // Resume point: highest inbox sequence already seen by this device.
+  // Server replays everything after it. 0 = full sync.
+  uint64 resume_after_seq = 5;
+}
+
+// pkt_type = 0x02
+message LoginAck {
+  bool ok = 1;
+  string error = 2;
+  // Server-assigned session id (diagnostics/logging correlation).
+  string session_id = 3;
+  // Number of offline messages that will be replayed after this ack.
+  uint64 pending_messages = 4;
+}
+
+// pkt_type = 0x03 / 0x04
+message Ping { uint64 seq = 1; }
+message Pong { uint64 seq = 1; }
+
+// pkt_type = 0x0F. Fatal, typed error; server closes the connection after.
+message ProtocolError {
+  ErrorCode code = 1;
+  string detail = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  UNSUPPORTED_VERSION = 1;
+  NOT_AUTHENTICATED = 2;
+  AUTH_FAILED = 3;
+  REPLACED_BY_NEW_SESSION = 4;
+  FRAME_TOO_LARGE = 5;
+  MALFORMED_FRAME = 6;
+  RATE_LIMITED = 7;
+  UNKNOWN_RECIPIENT = 8;
+  MEDIA_TRANSFER_FAILED = 9;
+}
+
+// ---- Presence --------------------------------------------------------------
+
+// pkt_type = 0x10. Server -> client notification (and client -> server update).
+message Presence {
+  string user_id = 1;
+  PresenceKind kind = 2;
+  // Unix seconds; meaningful for LAST_SEEN.
+  uint64 last_seen = 3;
+}
+
+enum PresenceKind {
+  PRESENCE_KIND_UNSPECIFIED = 0;
+  AVAILABLE = 1;
+  UNAVAILABLE = 2;
+  LAST_SEEN = 3;
+}
+
+// ---- Chat ------------------------------------------------------------------
+
+// pkt_type = 0x20. Client -> server -> recipient.
+message ChatMessage {
+  // Client-generated unique id (UUID); dedup key across retries.
+  string message_id = 1;
+  string from_user = 2;
+  string to_user = 3;
+  // Opaque to the server once E2EE lands; today: UTF-8 text or media ref.
+  bytes body = 4;
+  // Unix millis at sender.
+  uint64 sent_at = 5;
+  // Set by the recipient's home shard; total order per recipient inbox.
+  uint64 seq = 6;
+  // If this message references an uploaded media blob (see MediaStart).
+  string media_id = 7;
+}
+
+// pkt_type = 0x21. Server -> sender: message persisted (single tick).
+message ServerAck {
+  string message_id = 1;
+  uint64 seq = 2;
+}
+
+// pkt_type = 0x22. Recipient device -> server -> sender (double tick).
+message DeliveredAck {
+  string message_id = 1;
+  string from_user = 2; // acking user
+}
+
+// pkt_type = 0x23. Recipient -> server -> sender (blue tick).
+message ReadAck {
+  string message_id = 1;
+  string from_user = 2;
+}
+
+// pkt_type = 0x24. Server -> client after login: offline replay finished.
+message SyncComplete {
+  uint64 delivered = 1;
+  uint64 latest_seq = 2;
+}
+
+// ---- Bulk data / media (e.g. PDF, images) ----------------------------------
+//
+// Large payloads are never sent as one frame. The sender streams the blob in
+// chunks over the same connection; the server stores it and hands out a
+// media_id which is then referenced from a normal ChatMessage. The receiver
+// pulls the blob with MediaFetch. See docs/messenger/02_bulk_data.md.
+
+// pkt_type = 0x30. Client -> server: begin an upload.
+message MediaStart {
+  string media_id = 1;   // client-generated UUID
+  string file_name = 2;  // e.g. "invoice.pdf"
+  string mime_type = 3;  // e.g. "application/pdf"
+  uint64 total_size = 4; // bytes; server enforces a max
+  string sha256 = 5;     // hex digest of the full blob for integrity check
+}
+
+// pkt_type = 0x31. One chunk of the blob (<= 64 KiB recommended).
+message MediaChunk {
+  string media_id = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool last = 4;
+}
+
+// pkt_type = 0x32. Server -> uploader: upload verified & stored, or per-chunk
+// flow-control credit (ok=true, complete=false).
+message MediaAck {
+  string media_id = 1;
+  bool ok = 2;
+  bool complete = 3;
+  uint64 received_bytes = 4;
+  string error = 5;
+}
+
+// pkt_type = 0x33. Receiver -> server: request a stored blob; server responds
+// with MediaStart metadata followed by MediaChunk frames.
+message MediaFetch {
+  string media_id = 1;
+  uint64 from_offset = 2; // resume support
+}
+
+// ---- Groups ----------------------------------------------------------------
+
+// pkt_type = 0x40. Fan-out handled by the group's home shard.
+message GroupMessage {
+  string message_id = 1;
+  string from_user = 2;
+  string group_id = 3;
+  bytes body = 4;
+  uint64 sent_at = 5;
+  string media_id = 6;
+  // Set per-recipient by the server; total order within each member's inbox.
+  uint64 seq = 7;
+}
+
+// pkt_type = 0x41
+message GroupEvent {
+  string group_id = 1;
+  GroupOp op = 2;
+  string actor_user = 3;   // who performed the operation
+  string subject_user = 4; // who it applies to (add/remove)
+  uint64 version = 5;      // monotonic membership version
+}
+
+enum GroupOp {
+  GROUP_OP_UNSPECIFIED = 0;
+  CREATE = 1;
+  ADD_MEMBER = 2;
+  REMOVE_MEMBER = 3;
+  LEAVE = 4;
+}

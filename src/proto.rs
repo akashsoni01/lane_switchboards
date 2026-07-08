@@ -12,6 +12,9 @@ pub mod paxos {
 pub mod storage {
     tonic::include_proto!("lane_switchboard.storage");
 }
+pub mod messenger {
+    tonic::include_proto!("lane_switchboard.messenger");
+}
 
 use crate::mesh::ServiceRecord;
 
