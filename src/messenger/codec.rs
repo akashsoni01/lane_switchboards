@@ -53,6 +53,13 @@ pub enum PacketType {
     PeerHello = 0x50,
     PeerPresence = 0x51,
     PeerSync = 0x52,
+    PeerJoin = 0x53,
+    PeerLeave = 0x54,
+    PeerHandoffUser = 0x55,
+    PeerHandoffGroup = 0x56,
+    PublishKeys = 0x60,
+    FetchKeys = 0x61,
+    KeyBundle = 0x62,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -80,6 +87,13 @@ impl TryFrom<u8> for PacketType {
             0x50 => Self::PeerHello,
             0x51 => Self::PeerPresence,
             0x52 => Self::PeerSync,
+            0x53 => Self::PeerJoin,
+            0x54 => Self::PeerLeave,
+            0x55 => Self::PeerHandoffUser,
+            0x56 => Self::PeerHandoffGroup,
+            0x60 => Self::PublishKeys,
+            0x61 => Self::FetchKeys,
+            0x62 => Self::KeyBundle,
             other => return Err(MessengerError::UnknownPacketType(other)),
         })
     }
@@ -108,6 +122,13 @@ pub enum Packet {
     PeerHello(wire::PeerHello),
     PeerPresence(wire::PeerPresence),
     PeerSync(wire::PeerSync),
+    PeerJoin(wire::PeerJoin),
+    PeerLeave(wire::PeerLeave),
+    PeerHandoffUser(wire::PeerHandoffUser),
+    PeerHandoffGroup(wire::PeerHandoffGroup),
+    PublishKeys(wire::PublishKeys),
+    FetchKeys(wire::FetchKeys),
+    KeyBundle(wire::KeyBundle),
 }
 
 impl Packet {
@@ -134,6 +155,13 @@ impl Packet {
             Packet::PeerHello(_) => PacketType::PeerHello,
             Packet::PeerPresence(_) => PacketType::PeerPresence,
             Packet::PeerSync(_) => PacketType::PeerSync,
+            Packet::PeerJoin(_) => PacketType::PeerJoin,
+            Packet::PeerLeave(_) => PacketType::PeerLeave,
+            Packet::PeerHandoffUser(_) => PacketType::PeerHandoffUser,
+            Packet::PeerHandoffGroup(_) => PacketType::PeerHandoffGroup,
+            Packet::PublishKeys(_) => PacketType::PublishKeys,
+            Packet::FetchKeys(_) => PacketType::FetchKeys,
+            Packet::KeyBundle(_) => PacketType::KeyBundle,
         }
     }
 
@@ -159,6 +187,13 @@ impl Packet {
             Packet::PeerHello(m) => m.encoded_len(),
             Packet::PeerPresence(m) => m.encoded_len(),
             Packet::PeerSync(m) => m.encoded_len(),
+            Packet::PeerJoin(m) => m.encoded_len(),
+            Packet::PeerLeave(m) => m.encoded_len(),
+            Packet::PeerHandoffUser(m) => m.encoded_len(),
+            Packet::PeerHandoffGroup(m) => m.encoded_len(),
+            Packet::PublishKeys(m) => m.encoded_len(),
+            Packet::FetchKeys(m) => m.encoded_len(),
+            Packet::KeyBundle(m) => m.encoded_len(),
         }
     }
 
@@ -185,6 +220,13 @@ impl Packet {
             Packet::PeerHello(m) => m.encode(buf),
             Packet::PeerPresence(m) => m.encode(buf),
             Packet::PeerSync(m) => m.encode(buf),
+            Packet::PeerJoin(m) => m.encode(buf),
+            Packet::PeerLeave(m) => m.encode(buf),
+            Packet::PeerHandoffUser(m) => m.encode(buf),
+            Packet::PeerHandoffGroup(m) => m.encode(buf),
+            Packet::PublishKeys(m) => m.encode(buf),
+            Packet::FetchKeys(m) => m.encode(buf),
+            Packet::KeyBundle(m) => m.encode(buf),
         };
         debug_assert!(r.is_ok(), "BytesMut encode cannot fail");
     }
@@ -211,6 +253,17 @@ impl Packet {
             PacketType::PeerHello => Packet::PeerHello(wire::PeerHello::decode(payload)?),
             PacketType::PeerPresence => Packet::PeerPresence(wire::PeerPresence::decode(payload)?),
             PacketType::PeerSync => Packet::PeerSync(wire::PeerSync::decode(payload)?),
+            PacketType::PeerJoin => Packet::PeerJoin(wire::PeerJoin::decode(payload)?),
+            PacketType::PeerLeave => Packet::PeerLeave(wire::PeerLeave::decode(payload)?),
+            PacketType::PeerHandoffUser => {
+                Packet::PeerHandoffUser(wire::PeerHandoffUser::decode(payload)?)
+            }
+            PacketType::PeerHandoffGroup => {
+                Packet::PeerHandoffGroup(wire::PeerHandoffGroup::decode(payload)?)
+            }
+            PacketType::PublishKeys => Packet::PublishKeys(wire::PublishKeys::decode(payload)?),
+            PacketType::FetchKeys => Packet::FetchKeys(wire::FetchKeys::decode(payload)?),
+            PacketType::KeyBundle => Packet::KeyBundle(wire::KeyBundle::decode(payload)?),
         })
     }
 }
@@ -396,6 +449,42 @@ mod tests {
             last_seen: 0,
         }));
         round_trip(Packet::PeerSync(wire::PeerSync { user_id: "akash".into(), after_seq: 5 }));
+        round_trip(Packet::PeerJoin(wire::PeerJoin {
+            node_id: "node-3".into(),
+            addr: "127.0.0.1:9000".into(),
+        }));
+        round_trip(Packet::PeerLeave(wire::PeerLeave { node_id: "node-3".into() }));
+        round_trip(Packet::PeerHandoffUser(wire::PeerHandoffUser {
+            user_id: "bob".into(),
+            next_seq: 5,
+            seen: vec!["m-1".into()],
+            chats: vec![],
+            groups: vec![],
+        }));
+        round_trip(Packet::PeerHandoffGroup(wire::PeerHandoffGroup {
+            group_id: "g-1".into(),
+            members: vec!["alice".into(), "bob".into()],
+            admins: vec!["alice".into()],
+            version: 2,
+        }));
+        round_trip(Packet::PublishKeys(wire::PublishKeys {
+            user_id: "akash".into(),
+            device_id: "d1".into(),
+            identity_key: "idk".into(),
+            one_time_keys: vec!["otk1".into(), "otk2".into()],
+        }));
+        round_trip(Packet::FetchKeys(wire::FetchKeys {
+            user_id: "john".into(),
+            for_user: "akash".into(),
+        }));
+        round_trip(Packet::KeyBundle(wire::KeyBundle {
+            user_id: "john".into(),
+            device_id: "d1".into(),
+            identity_key: "idk".into(),
+            one_time_key: "otk".into(),
+            for_user: "akash".into(),
+            found: true,
+        }));
     }
 
     #[test]

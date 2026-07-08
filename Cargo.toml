@@ -48,6 +48,7 @@ rustls = { version = "0.23", optional = true, features = ["aws_lc_rs"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+vodozemac = "0.10.0"
 
 [features]
 default = []

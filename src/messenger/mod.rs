@@ -23,6 +23,7 @@
 pub mod auth;
 pub mod client;
 pub mod codec;
+mod cluster;
 mod journal;
 pub mod server;
 

@@ -852,6 +852,90 @@ mod cluster_tests {
             .await
             .expect("cross-node unavailable");
     }
+
+    #[tokio::test]
+    async fn dynamic_peer_join_rebalances_and_replays() {
+        let (servers, addrs, auth) = boot_cluster(2).await;
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        alice.send_chat("bob", "join-1", b"before third node").await.expect("ack");
+
+        let home_before = home_index(&servers, "bob").await.expect("stored on a home shard");
+        assert_eq!(
+            servers[home_before].pending_for("bob").await,
+            1,
+            "exactly one copy before join"
+        );
+
+        let node2_addr = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string();
+        let node2 = MessengerServer::bind_cluster(
+            &node2_addr,
+            Arc::new(auth.clone()),
+            ServerConfig::default(),
+            ClusterConfig {
+                node_id: "node-2".into(),
+                peers: vec![
+                    PeerAddr { node_id: "node-0".into(), addr: addrs[0].clone() },
+                    PeerAddr { node_id: "node-1".into(), addr: addrs[1].clone() },
+                ],
+                peer_secret: PEER_SECRET.into(),
+            },
+        )
+        .await
+        .expect("bind third node");
+
+        servers[0]
+            .add_peer(PeerAddr { node_id: "node-2".into(), addr: node2.local_addr().to_string() })
+            .await
+            .expect("node-0 adds node-2");
+        servers[1]
+            .add_peer(PeerAddr { node_id: "node-2".into(), addr: node2.local_addr().to_string() })
+            .await
+            .expect("node-1 adds node-2");
+
+        assert_eq!(node2.cluster_size(), 3);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let mut total = 0;
+        for s in servers.iter().chain(std::iter::once(&node2)) {
+            total += s.pending_for("bob").await;
+        }
+        assert_eq!(total, 1, "exactly one copy after rebalance");
+
+        let (mut bob, outcome) = MessengerClient::connect(
+            &node2.local_addr().to_string(),
+            "bob",
+            "d1",
+            &auth.mint_token("bob", "d1"),
+            0,
+        )
+        .await
+        .expect("bob login on new node");
+
+        let got = if outcome
+            .replayed
+            .iter()
+            .any(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == "join-1"))
+        {
+            true
+        } else {
+            matches!(
+                bob.recv_until(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == "join-1"))
+                    .await,
+                Ok(_)
+            )
+        };
+        assert!(got, "offline message survives join rebalance");
+    }
 }
 
 // ---- TLS (feature = "tls") ---------------------------------------------------------

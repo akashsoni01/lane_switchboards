@@ -62,6 +62,28 @@ shard, which validates membership at a consistent version, acks the sender
 member to that member's home node (persist, dedup key `message_id:member`)
 and on to their live session.
 
+## Dynamic membership (join / leave)
+
+The hash ring can change at runtime via `MessengerServer::add_peer` /
+`remove_peer` or inbound gossip:
+
+| Packet | Direction | Purpose |
+|--------|-----------|---------|
+| `PeerJoin { node_id, addr }` | gossip | announce a new gateway; every node updates the ring and opens an outbound link |
+| `PeerLeave { node_id }` | gossip | remove a gateway from the ring and drop its link |
+| `PeerHandoffUser` | point-to-point | migrate an inbox (pending messages, `next_seq`, dedup set) to the new home shard |
+| `PeerHandoffGroup` | point-to-point | migrate group membership state (members, admins, version) |
+
+Rebalance steps when the ring changes:
+
+1. Snapshot users/groups this node currently owns.
+2. Add or remove the node from the ring.
+3. For every snapshot entry that is **no longer** homed here, send a handoff
+   packet to the new home node and delete the local copy.
+
+Handoffs are idempotent: the receiver merges via the existing `seen` set and
+keeps the highest group version.
+
 ## Delivery guarantees (cluster)
 
 - `ServerAck` still means "persisted on the recipient's home node".
@@ -74,8 +96,6 @@ and on to their live session.
 
 ## Current limitations
 
-- Static membership: node join/leave rebalancing is not implemented yet
-  (ring is fixed at startup).
 - Media blobs are stored on the uploader's gateway only; `MediaFetch` must
   hit that node. Content-addressed replicated storage is Phase 6 work.
 - Group-operation errors (e.g. non-admin add) are logged on the home node
@@ -88,4 +108,5 @@ and on to their live session.
 
 `tests/messenger.rs` (`cluster_tests`): cross-node delivery with the full
 ack ladder, offline replay when the user logs in on a non-home node with
-exactly-one-copy assertion, a 3-node group chat, and cross-node presence.
+exactly-one-copy assertion, a 3-node group chat, cross-node presence, and
+dynamic join with inbox handoff + replay on the new node.

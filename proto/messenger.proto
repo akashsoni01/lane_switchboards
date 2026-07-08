@@ -228,3 +228,73 @@ message PeerSync {
   string user_id = 1;
   uint64 after_seq = 2;
 }
+
+// pkt_type = 0x53. Gossip: a new gateway joined the cluster.
+message PeerJoin {
+  string node_id = 1;
+  string addr = 2; // host:port for outbound peer links
+}
+
+// pkt_type = 0x54. Gossip: a gateway is leaving (graceful) or failed.
+message PeerLeave {
+  string node_id = 1;
+}
+
+// pkt_type = 0x55. Migrate a user inbox to a new home shard after ring
+// rebalance. Sent by the old home; merged idempotently by seen keys.
+message PeerHandoffUser {
+  string user_id = 1;
+  uint64 next_seq = 2;
+  repeated string seen = 3;
+  repeated ChatMessage chats = 4;
+  repeated GroupMessage groups = 5;
+}
+
+// pkt_type = 0x56. Migrate group membership to a new home shard.
+message PeerHandoffGroup {
+  string group_id = 1;
+  repeated string members = 2;
+  repeated string admins = 3;
+  uint64 version = 4;
+}
+
+// ---- End-to-end encryption key directory --------------------------------------
+//
+// The server only stores and hands out public key material; message bodies
+// are encrypted client-side (vodozemac Olm: X3DH-style session setup +
+// double ratchet) and are opaque bytes to every node. See
+// docs/messenger/07_e2ee.md.
+
+// pkt_type = 0x60. Client -> server after login: publish this device's
+// public identity key and a batch of single-use one-time keys.
+message PublishKeys {
+  string user_id = 1;   // overwritten with the authenticated user
+  string device_id = 2;
+  string identity_key = 3;           // Curve25519, base64
+  repeated string one_time_keys = 4; // Curve25519, base64, single-use
+}
+
+// pkt_type = 0x61. Client -> server: request a prekey bundle for a peer.
+message FetchKeys {
+  string user_id = 1;  // whose keys
+  string for_user = 2; // requester; set by the server for reply routing
+}
+
+// pkt_type = 0x62. Server -> client: one single-use prekey bundle. The
+// one_time_key is removed from the directory when handed out.
+message KeyBundle {
+  string user_id = 1;
+  string device_id = 2;
+  string identity_key = 3;
+  string one_time_key = 4;
+  string for_user = 5; // reply routing on inter-node links
+  bool found = 6;
+}
+
+// Encoded into ChatMessage.body / GroupMessage.body by E2EE clients.
+// Not a frame type: the server never parses it.
+message EncryptedPayload {
+  string sender_key = 1;  // sender's Curve25519 identity key, base64
+  uint32 message_type = 2; // 0 = Olm pre-key message, 1 = normal message
+  bytes ciphertext = 3;
+}

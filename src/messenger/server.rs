@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
@@ -33,6 +33,7 @@ use crate::hash_ring::{HashRing, RingNode};
 use crate::stream::{self, MaybeTlsStream, TlsAcceptor};
 
 use super::auth::HmacAuthenticator;
+use super::cluster::{self, ClusterRuntime};
 use super::codec::{FrameCodec, Packet};
 use super::wire;
 use super::{Authenticator, MessengerError};
@@ -128,42 +129,17 @@ pub struct ClusterConfig {
     pub peer_secret: String,
 }
 
-/// Runtime cluster state.
-struct ClusterState {
-    node_id: String,
-    /// Consistent-hash ring over all node ids (including self).
-    ring: HashRing,
-    /// node_id -> outbound frame queue (owned by the reconnecting link task).
-    peer_txs: HashMap<String, mpsc::Sender<Packet>>,
-    /// Authenticates PeerHello frames on inbound links.
-    peer_auth: HmacAuthenticator,
-}
-
-impl ClusterState {
-    /// Home node id for a routing key (user or group id).
-    fn home_of(&self, key: &str) -> String {
-        self.ring
-            .get_node(&key)
-            .map(|n| n.id.clone())
-            .unwrap_or_else(|| self.node_id.clone())
-    }
-
-    fn is_home(&self, key: &str) -> bool {
-        self.home_of(key) == self.node_id
-    }
-}
+/// Runtime cluster state lives in [`cluster::ClusterRuntime`].
 
 /// True when this node owns `key`'s inbox (always true single-node).
 fn is_home(state: &State, key: &str) -> bool {
     state.cluster.as_ref().map(|c| c.is_home(key)).unwrap_or(true)
 }
 
-/// Queue a packet on the outbound link to `node_id` (drops with a log when
-/// the link buffer is full or the node is unknown; chat frames are safe to
-/// drop post-persist because inbox replay recovers them).
-fn send_to_peer(state: &State, node_id: &str, pkt: Packet) {
+/// Queue a packet on the outbound link to `node_id`.
+pub(super) fn send_to_peer(state: &State, node_id: &str, pkt: Packet) {
     let Some(cluster) = state.cluster.as_ref() else { return };
-    match cluster.peer_txs.get(node_id) {
+    match cluster.peer_txs.read().ok().and_then(|t| t.get(node_id).cloned()) {
         Some(tx) => {
             if let Err(e) = tx.try_send(pkt) {
                 warn!(node_id, error = %e, "peer link backpressure: frame dropped");
@@ -176,9 +152,26 @@ fn send_to_peer(state: &State, node_id: &str, pkt: Packet) {
 /// Broadcast a packet to every peer link.
 fn send_to_all_peers(state: &State, pkt: &Packet) {
     let Some(cluster) = state.cluster.as_ref() else { return };
-    for (node_id, tx) in &cluster.peer_txs {
-        if let Err(e) = tx.try_send(pkt.clone()) {
-            debug!(node_id, error = %e, "peer broadcast frame dropped");
+    if let Ok(txs) = cluster.peer_txs.read() {
+        for (node_id, tx) in txs.iter() {
+            if let Err(e) = tx.try_send(pkt.clone()) {
+                debug!(node_id, error = %e, "peer broadcast frame dropped");
+            }
+        }
+    }
+}
+
+/// Broadcast to all peers except `skip_node_id`.
+pub(super) fn send_to_all_peers_except(state: &State, skip_node_id: &str, pkt: &Packet) {
+    let Some(cluster) = state.cluster.as_ref() else { return };
+    if let Ok(txs) = cluster.peer_txs.read() {
+        for (node_id, tx) in txs.iter() {
+            if node_id == skip_node_id {
+                continue;
+            }
+            if let Err(e) = tx.try_send(pkt.clone()) {
+                debug!(node_id, error = %e, "peer broadcast frame dropped");
+            }
         }
     }
 }
@@ -193,19 +186,19 @@ struct SessionHandle {
 
 /// A message persisted for (eventual) delivery to one recipient device set.
 #[derive(Clone)]
-struct StoredMessage {
-    seq: u64,
-    packet: Packet,
-    delivered: bool,
+pub(super) struct StoredMessage {
+    pub(super) seq: u64,
+    pub(super) packet: Packet,
+    pub(super) delivered: bool,
 }
 
 #[derive(Default)]
-struct Inbox {
-    next_seq: u64,
+pub(super) struct Inbox {
+    pub(super) next_seq: u64,
     /// Ordered by seq. Entries stay until `DeliveredAck` (tombstoned on ack).
-    pending: VecDeque<StoredMessage>,
+    pub(super) pending: VecDeque<StoredMessage>,
     /// message_ids already accepted — dedup across sender retries.
-    seen: HashSet<String>,
+    pub(super) seen: HashSet<String>,
 }
 
 struct MediaBlob {
@@ -217,14 +210,23 @@ struct MediaBlob {
     complete: bool,
 }
 
-struct Group {
-    members: HashSet<String>,
-    admins: HashSet<String>,
-    version: u64,
+pub(super) struct Group {
+    pub(super) members: HashSet<String>,
+    pub(super) admins: HashSet<String>,
+    pub(super) version: u64,
+}
+
+/// Published E2EE key material for one user (single device per user in this
+/// milestone). The server never sees private keys.
+struct DeviceKeys {
+    device_id: String,
+    identity_key: String,
+    /// Single-use prekeys, consumed one per `FetchKeys`.
+    one_time_keys: Vec<String>,
 }
 
 /// Shared state for one gateway node.
-struct State {
+pub(super) struct State {
     cfg: ServerConfig,
     auth: Arc<dyn Authenticator>,
     /// user_id -> live device sessions.
@@ -232,22 +234,27 @@ struct State {
     /// user_id -> last seen (unix secs) for offline users.
     last_seen: RwLock<HashMap<String, u64>>,
     /// user_id -> inbox (offline store + dedup + seq).
-    inboxes: Mutex<HashMap<String, Inbox>>,
+    pub(super) inboxes: Mutex<HashMap<String, Inbox>>,
     /// media_id -> blob (in-memory store; swap for StorageNode later).
     media: Mutex<HashMap<String, MediaBlob>>,
-    groups: Mutex<HashMap<String, Group>>,
+    pub(super) groups: Mutex<HashMap<String, Group>>,
     session_ids: AtomicU64,
     /// source IP -> (window start, connections accepted in window).
     conn_rate: Mutex<HashMap<std::net::IpAddr, (Instant, u32)>>,
     /// user_id -> consecutive login failures (drives exponential backoff).
     auth_failures: Mutex<HashMap<String, u32>>,
     /// Multi-node state (None on single-node deployments).
-    cluster: Option<ClusterState>,
+    pub(super) cluster: Option<ClusterRuntime>,
     /// Durable inbox journal (None = memory-only inboxes).
     journal: Option<Mutex<super::journal::Journal>>,
+    /// E2EE key directory: user_id -> published public keys (homed on the
+    /// user's home node in cluster mode).
+    key_directory: Mutex<HashMap<String, DeviceKeys>>,
     /// user_id -> node_id where the user's session lives (cluster mode;
     /// maintained via PeerPresence broadcasts).
     user_locations: RwLock<HashMap<String, String>>,
+    /// Outbound peer link tasks (cluster mode only).
+    peer_tasks: Option<Arc<StdMutex<HashMap<String, JoinHandle<()>>>>>,
 }
 
 /// A running messenger gateway. Dropping the handle aborts the accept loop.
@@ -256,57 +263,16 @@ pub struct MessengerServer {
     state: Arc<State>,
     accept_task: JoinHandle<()>,
     sweep_task: JoinHandle<()>,
-    peer_tasks: Vec<JoinHandle<()>>,
+    peer_tasks: Arc<StdMutex<HashMap<String, JoinHandle<()>>>>,
 }
 
 impl Drop for MessengerServer {
     fn drop(&mut self) {
         self.accept_task.abort();
         self.sweep_task.abort();
-        for t in &self.peer_tasks {
-            t.abort();
-        }
-    }
-}
-
-/// Outbound peer link: connect, send `PeerHello`, then forward queued frames.
-/// Reconnects with backoff on any failure; queued frames survive reconnects.
-async fn peer_link(
-    self_node: String,
-    peer: PeerAddr,
-    token: String,
-    mut rx: mpsc::Receiver<Packet>,
-) {
-    let mut backoff = Duration::from_millis(100);
-    loop {
-        let socket = match stream::connect(&peer.addr, None).await {
-            Ok(s) => s,
-            Err(e) => {
-                debug!(peer = %peer.node_id, error = %e, "peer connect failed; retrying");
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(5));
-                continue;
-            }
-        };
-        backoff = Duration::from_millis(100);
-        let mut framed = Framed::new(socket, FrameCodec::default());
-        if framed
-            .send(Packet::PeerHello(wire::PeerHello {
-                node_id: self_node.clone(),
-                auth_token: token.clone(),
-            }))
-            .await
-            .is_err()
-        {
-            continue;
-        }
-        info!(peer = %peer.node_id, "peer link established");
-        // Forward frames until the link breaks; frames still in `rx` are
-        // preserved for the next connection.
-        while let Some(pkt) = rx.recv().await {
-            if let Err(e) = framed.send(pkt).await {
-                warn!(peer = %peer.node_id, error = %e, "peer link broken; reconnecting");
-                break;
+        if let Ok(mut tasks) = self.peer_tasks.lock() {
+            for (_, t) in tasks.drain() {
+                t.abort();
             }
         }
     }
@@ -357,7 +323,7 @@ impl MessengerServer {
 
         // Build cluster state: ring over all node ids + one reconnecting
         // outbound link task per peer.
-        let mut peer_tasks: Vec<JoinHandle<()>> = Vec::new();
+        let mut peer_tasks_map: HashMap<String, JoinHandle<()>> = HashMap::new();
         let cluster = cluster_cfg.map(|cc| {
             let mut ring = HashRing::new(64);
             ring.add_node(RingNode::new(cc.node_id.clone(), "local", 0));
@@ -367,15 +333,26 @@ impl MessengerServer {
                 ring.add_node(RingNode::new(peer.node_id.clone(), "peer", 0));
                 let (tx, rx) = mpsc::channel::<Packet>(4096);
                 peer_txs.insert(peer.node_id.clone(), tx);
-                peer_tasks.push(tokio::spawn(peer_link(
-                    cc.node_id.clone(),
-                    peer.clone(),
-                    peer_auth.mint_token(&cc.node_id, "peer"),
-                    rx,
-                )));
+                peer_tasks_map.insert(
+                    peer.node_id.clone(),
+                    tokio::spawn(cluster::peer_link(
+                        cc.node_id.clone(),
+                        peer.clone(),
+                        peer_auth.mint_token(&cc.node_id, "peer"),
+                        rx,
+                    )),
+                );
             }
-            ClusterState { node_id: cc.node_id, ring, peer_txs, peer_auth }
+            ClusterRuntime {
+                node_id: cc.node_id.clone(),
+                listen_addr: addr.to_string(),
+                peer_secret: cc.peer_secret,
+                ring: StdRwLock::new(ring),
+                peer_txs: StdRwLock::new(peer_txs),
+                peer_auth,
+            }
         });
+        let peer_tasks = cluster.as_ref().map(|_| Arc::new(StdMutex::new(peer_tasks_map)));
 
         // Durable mode: replay the inbox journal into memory before serving.
         let mut seeded_inboxes: HashMap<String, Inbox> = HashMap::new();
@@ -416,7 +393,9 @@ impl MessengerServer {
             auth_failures: Mutex::new(HashMap::new()),
             cluster,
             journal,
+            key_directory: Mutex::new(HashMap::new()),
             user_locations: RwLock::new(HashMap::new()),
+            peer_tasks: peer_tasks.clone(),
         });
 
         // Idle sweep: close sessions that missed heartbeats.
@@ -469,7 +448,13 @@ impl MessengerServer {
         });
 
         info!(%addr, "messenger gateway listening");
-        Ok(Self { addr, state, accept_task, sweep_task, peer_tasks })
+        Ok(Self {
+            addr,
+            state,
+            accept_task,
+            sweep_task,
+            peer_tasks: peer_tasks.unwrap_or_else(|| Arc::new(StdMutex::new(HashMap::new()))),
+        })
     }
 
     /// Actual bound address (useful with port 0 in tests).
@@ -493,14 +478,38 @@ impl MessengerServer {
         self.state.sessions.read().await.get(user_id).is_some_and(|v| !v.is_empty())
     }
 
+    /// Add a peer gateway to a running cluster (updates the hash ring, starts
+    /// an outbound link, gossips `PeerJoin`, and handoffs any shards we no
+    /// longer own).
+    pub async fn add_peer(&self, peer: PeerAddr) -> Result<(), MessengerError> {
+        cluster::add_peer(&self.state, &self.peer_tasks, peer).await
+    }
+
+    /// Remove a peer from the cluster (gossips `PeerLeave`, handoffs shards,
+    /// stops the outbound link).
+    pub async fn remove_peer(&self, node_id: &str) -> Result<(), MessengerError> {
+        cluster::remove_peer(&self.state, &self.peer_tasks, node_id).await
+    }
+
+    /// Number of nodes in the cluster hash ring (1 on single-node).
+    pub fn cluster_size(&self) -> usize {
+        self.state
+            .cluster
+            .as_ref()
+            .map(|c| c.node_count())
+            .unwrap_or(1)
+    }
+
     /// Graceful shutdown: stop accepting new connections, then close every
     /// session. Outbound queues drain because closing the sender side lets
     /// each session loop flush already-queued frames and return.
     pub async fn shutdown(self) {
         self.accept_task.abort();
         self.sweep_task.abort();
-        for t in &self.peer_tasks {
-            t.abort();
+        if let Ok(mut tasks) = self.peer_tasks.lock() {
+            for (_, t) in tasks.drain() {
+                t.abort();
+            }
         }
         let drained: Vec<String> = {
             let mut sessions = self.state.sessions.write().await;
@@ -984,6 +993,14 @@ async fn session_loop(
                         m.from_user = user.to_string();
                         handle_group_message(state, framed, m).await?;
                     }
+                    Packet::PublishKeys(mut k) => {
+                        k.user_id = user.to_string();
+                        handle_publish_keys(state, k).await;
+                    }
+                    Packet::FetchKeys(mut f) => {
+                        f.for_user = user.to_string();
+                        handle_fetch_keys(state, f).await;
+                    }
                     other => {
                         framed.send(proto_error(
                             wire::ErrorCode::MalformedFrame,
@@ -1130,6 +1147,32 @@ async fn dispatch_peer_packet(state: &Arc<State>, peer_node: &str, pkt: Packet) 
             let target = s.user_id.clone();
             deliver_online(state, &target, &Packet::SyncComplete(s)).await;
         }
+        Packet::PeerJoin(j) => {
+            if let Some(tasks) = state.peer_tasks.as_ref() {
+                cluster::handle_peer_join(state, tasks, peer_node, j).await;
+            }
+        }
+        Packet::PeerLeave(l) => {
+            if let Some(tasks) = state.peer_tasks.as_ref() {
+                cluster::handle_peer_leave(state, tasks, l).await;
+            }
+        }
+        Packet::PeerHandoffUser(h) => {
+            cluster::merge_handoff_user(state, h).await;
+        }
+        Packet::PeerHandoffGroup(h) => {
+            cluster::merge_handoff_group(state, h).await;
+        }
+        Packet::PublishKeys(k) => {
+            handle_publish_keys(state, k).await;
+        }
+        Packet::FetchKeys(f) => {
+            handle_fetch_keys(state, f).await;
+        }
+        Packet::KeyBundle(b) => {
+            let target = b.for_user.clone();
+            deliver_online(state, &target, &Packet::KeyBundle(b)).await;
+        }
         other => {
             debug!(peer_node, ty = ?other.packet_type(), "unexpected peer packet ignored");
         }
@@ -1155,6 +1198,71 @@ async fn touch_session(state: &Arc<State>, user: &str, session_id: u64) {
             }
         }
     }
+}
+
+// ---- E2EE key directory -------------------------------------------------------
+
+async fn handle_publish_keys(state: &Arc<State>, k: wire::PublishKeys) {
+    if k.user_id.is_empty() || k.device_id.is_empty() {
+        return;
+    }
+    if !is_home(state, &k.user_id) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&k.user_id))
+            .unwrap_or_default();
+        send_to_peer(state, &home, Packet::PublishKeys(k));
+        return;
+    }
+    let mut dir = state.key_directory.lock().await;
+    dir.insert(
+        k.user_id.clone(),
+        DeviceKeys {
+            device_id: k.device_id,
+            identity_key: k.identity_key,
+            one_time_keys: k.one_time_keys,
+        },
+    );
+}
+
+async fn handle_fetch_keys(state: &Arc<State>, f: wire::FetchKeys) {
+    if f.user_id.is_empty() || f.for_user.is_empty() {
+        return;
+    }
+    if !is_home(state, &f.user_id) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&f.user_id))
+            .unwrap_or_default();
+        send_to_peer(state, &home, Packet::FetchKeys(f));
+        return;
+    }
+    let bundle = {
+        let mut dir = state.key_directory.lock().await;
+        dir.get_mut(&f.user_id)
+            .map(|keys| {
+                let one_time = keys.one_time_keys.pop().unwrap_or_default();
+                wire::KeyBundle {
+                    user_id: f.user_id.clone(),
+                    device_id: keys.device_id.clone(),
+                    identity_key: keys.identity_key.clone(),
+                    one_time_key: one_time,
+                    for_user: f.for_user.clone(),
+                    found: !keys.identity_key.is_empty(),
+                }
+            })
+            .unwrap_or(wire::KeyBundle {
+                user_id: f.user_id.clone(),
+                device_id: String::new(),
+                identity_key: String::new(),
+                one_time_key: String::new(),
+                for_user: f.for_user.clone(),
+                found: false,
+            })
+    };
+    deliver_online(state, &f.for_user, &Packet::KeyBundle(bundle)).await;
 }
 
 // ---- 1:1 chat ---------------------------------------------------------------
