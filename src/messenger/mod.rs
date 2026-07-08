@@ -23,6 +23,7 @@
 pub mod auth;
 pub mod client;
 pub mod codec;
+mod journal;
 pub mod server;
 
 pub use crate::proto::messenger as wire;

@@ -16,6 +16,7 @@ Every value is per-gateway-node.
 | `auth_backoff_base` | 250 ms | credential brute force | Doubles per consecutive failure for the same user. |
 | `auth_backoff_max` | 30 s | unbounded backoff | Cap for the exponential delay. |
 | `tcp_keepalive` | 60 s | dead NAT paths | OS-level; `None` disables. App-level Ping/Pong still applies. |
+| `durable_dir` | `None` | message loss on crash | `Some(dir)` enables the fsynced inbox journal (`dir/inbox.wal`); see `06_offline_store.md`. |
 
 Protocol-level constants (in `src/messenger/codec.rs`):
 

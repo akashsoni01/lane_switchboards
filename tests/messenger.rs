@@ -541,6 +541,94 @@ async fn repeated_auth_failures_backoff_grows() {
     assert!(d2 > d1, "backoff must grow: {d1:?} -> {d2:?}");
 }
 
+// ---- Durable inboxes (crash recovery) ------------------------------------------------
+
+#[tokio::test]
+async fn acked_message_survives_gateway_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || ServerConfig {
+        durable_dir: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+
+    // Boot, send to an offline user, "crash" (drop the server).
+    {
+        let auth = HmacAuthenticator::new(SECRET);
+        let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg())
+            .await
+            .unwrap();
+        let addr = server.local_addr().to_string();
+        let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+        let seq = alice.send_chat("bob", "durable-1", b"survives crashes").await.expect("ack");
+        assert_eq!(seq, 1);
+        assert_eq!(server.pending_for("bob").await, 1);
+        // Server dropped here without graceful shutdown.
+    }
+
+    // Reboot from the same directory: the message must still be there.
+    let auth = HmacAuthenticator::new(SECRET);
+    let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg())
+        .await
+        .unwrap();
+    let addr = server.local_addr().to_string();
+    assert_eq!(server.pending_for("bob").await, 1, "journal replay restores inbox");
+
+    let (mut bob, outcome) = login(&addr, &auth, "bob", "d1").await;
+    assert_eq!(outcome.replayed.len(), 1);
+    match &outcome.replayed[0] {
+        Packet::ChatMessage(m) => {
+            assert_eq!(m.message_id, "durable-1");
+            assert_eq!(m.body, b"survives crashes");
+            assert_eq!(m.seq, 1);
+        }
+        other => panic!("expected chat, got {other:?}"),
+    }
+
+    // Ack, restart again: inbox is empty but the seq high-water mark holds.
+    bob.ack_delivered("durable-1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(bob);
+    drop(server);
+
+    let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg())
+        .await
+        .unwrap();
+    let addr = server.local_addr().to_string();
+    assert_eq!(server.pending_for("bob").await, 0, "tombstone survived restart");
+
+    // New message must continue the sequence, not restart at 1.
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+    let seq = alice.send_chat("bob", "durable-2", b"after restart").await.unwrap();
+    assert_eq!(seq, 2, "seq high-water mark survives compaction");
+}
+
+#[tokio::test]
+async fn dedup_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = || ServerConfig {
+        durable_dir: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+    let auth = HmacAuthenticator::new(SECRET);
+    {
+        let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg())
+            .await
+            .unwrap();
+        let addr = server.local_addr().to_string();
+        let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+        alice.send_chat("bob", "dup-1", b"first").await.unwrap();
+    }
+    let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg())
+        .await
+        .unwrap();
+    let addr = server.local_addr().to_string();
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+    // Retry of the same message_id after restart must be deduplicated.
+    let seq = alice.send_chat("bob", "dup-1", b"retry").await.unwrap();
+    assert_eq!(seq, 0, "duplicate sentinel");
+    assert_eq!(server.pending_for("bob").await, 1, "still exactly one copy");
+}
+
 // ---- Multi-node cluster -------------------------------------------------------------
 
 mod cluster_tests {

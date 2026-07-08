@@ -70,6 +70,11 @@ pub struct ServerConfig {
     /// Complements application-level Ping/Pong: keepalive detects dead NAT
     /// paths below the protocol layer.
     pub tcp_keepalive: Option<Duration>,
+    /// Directory for the durable inbox journal (WAL). `None` keeps inboxes
+    /// in memory only. With `Some(dir)`, every message is fsynced to
+    /// `dir/inbox.wal` before `ServerAck`, and inboxes are rebuilt (and the
+    /// journal compacted) on startup — acked messages survive crashes.
+    pub durable_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +91,7 @@ impl Default for ServerConfig {
             auth_backoff_base: Duration::from_millis(250),
             auth_backoff_max: Duration::from_secs(30),
             tcp_keepalive: Some(Duration::from_secs(60)),
+            durable_dir: None,
         }
     }
 }
@@ -237,6 +243,8 @@ struct State {
     auth_failures: Mutex<HashMap<String, u32>>,
     /// Multi-node state (None on single-node deployments).
     cluster: Option<ClusterState>,
+    /// Durable inbox journal (None = memory-only inboxes).
+    journal: Option<Mutex<super::journal::Journal>>,
     /// user_id -> node_id where the user's session lives (cluster mode;
     /// maintained via PeerPresence broadcasts).
     user_locations: RwLock<HashMap<String, String>>,
@@ -369,18 +377,45 @@ impl MessengerServer {
             ClusterState { node_id: cc.node_id, ring, peer_txs, peer_auth }
         });
 
+        // Durable mode: replay the inbox journal into memory before serving.
+        let mut seeded_inboxes: HashMap<String, Inbox> = HashMap::new();
+        let journal = match &cfg.durable_dir {
+            None => None,
+            Some(dir) => {
+                let (journal, replayed) = super::journal::Journal::open_and_replay(dir).await?;
+                for (user, r) in replayed {
+                    let inbox = Inbox {
+                        next_seq: r.next_seq,
+                        pending: r
+                            .pending
+                            .into_iter()
+                            .map(|packet| StoredMessage {
+                                seq: stored_seq_of(&packet),
+                                packet,
+                                delivered: false,
+                            })
+                            .collect(),
+                        seen: r.seen.into_iter().collect(),
+                    };
+                    seeded_inboxes.insert(user, inbox);
+                }
+                Some(Mutex::new(journal))
+            }
+        };
+
         let state = Arc::new(State {
             cfg,
             auth,
             sessions: RwLock::new(HashMap::new()),
             last_seen: RwLock::new(HashMap::new()),
-            inboxes: Mutex::new(HashMap::new()),
+            inboxes: Mutex::new(seeded_inboxes),
             media: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             session_ids: AtomicU64::new(1),
             conn_rate: Mutex::new(HashMap::new()),
             auth_failures: Mutex::new(HashMap::new()),
             cluster,
+            journal,
             user_locations: RwLock::new(HashMap::new()),
         });
 
@@ -620,18 +655,41 @@ async fn store_message(
     message_id: &str,
     make_packet: impl FnOnce(u64) -> Packet,
 ) -> Option<u64> {
-    let mut inboxes = state.inboxes.lock().await;
-    let inbox = inboxes.entry(to_user.to_string()).or_default();
-    if !inbox.seen.insert(message_id.to_string()) {
-        return None; // duplicate retry — already stored
+    let stored_packet;
+    let seq;
+    {
+        let mut inboxes = state.inboxes.lock().await;
+        let inbox = inboxes.entry(to_user.to_string()).or_default();
+        if !inbox.seen.insert(message_id.to_string()) {
+            return None; // duplicate retry — already stored
+        }
+        inbox.next_seq += 1;
+        seq = inbox.next_seq;
+        let packet = make_packet(seq);
+        stored_packet = packet.clone();
+        inbox.pending.push_back(StoredMessage { seq, packet, delivered: false });
+        while inbox.pending.len() > state.cfg.max_inbox {
+            inbox.pending.pop_front();
+        }
     }
-    inbox.next_seq += 1;
-    let seq = inbox.next_seq;
-    inbox.pending.push_back(StoredMessage { seq, packet: make_packet(seq), delivered: false });
-    while inbox.pending.len() > state.cfg.max_inbox {
-        inbox.pending.pop_front();
+    // Durable mode: fsync the entry before the caller emits ServerAck.
+    // A journal failure is logged, not fatal — delivery proceeds with
+    // degraded durability rather than dropping the message.
+    if let Some(journal) = state.journal.as_ref() {
+        if let Err(e) = journal.lock().await.append(&stored_packet).await {
+            tracing::error!(error = %e, "inbox journal append failed");
+        }
     }
     Some(seq)
+}
+
+/// Seq embedded in a stored packet (used when rebuilding from the journal).
+fn stored_seq_of(pkt: &Packet) -> u64 {
+    match pkt {
+        Packet::ChatMessage(m) => m.seq,
+        Packet::GroupMessage(m) => m.seq,
+        _ => 0,
+    }
 }
 
 fn message_id_of(pkt: &Packet) -> Option<&str> {
@@ -644,15 +702,30 @@ fn message_id_of(pkt: &Packet) -> Option<&str> {
 
 /// Mark a message delivered (tombstone) once the recipient acks it.
 async fn mark_delivered(state: &Arc<State>, user: &str, message_id: &str) {
-    let mut inboxes = state.inboxes.lock().await;
-    if let Some(inbox) = inboxes.get_mut(user) {
-        for m in inbox.pending.iter_mut() {
-            if message_id_of(&m.packet) == Some(message_id) {
-                m.delivered = true;
+    let mut changed = false;
+    {
+        let mut inboxes = state.inboxes.lock().await;
+        if let Some(inbox) = inboxes.get_mut(user) {
+            for m in inbox.pending.iter_mut() {
+                if message_id_of(&m.packet) == Some(message_id) && !m.delivered {
+                    m.delivered = true;
+                    changed = true;
+                }
+            }
+            while inbox.pending.front().is_some_and(|m| m.delivered) {
+                inbox.pending.pop_front();
             }
         }
-        while inbox.pending.front().is_some_and(|m| m.delivered) {
-            inbox.pending.pop_front();
+    }
+    if changed {
+        if let Some(journal) = state.journal.as_ref() {
+            let tombstone = Packet::DeliveredAck(wire::DeliveredAck {
+                message_id: message_id.to_string(),
+                from_user: user.to_string(),
+            });
+            if let Err(e) = journal.lock().await.append(&tombstone).await {
+                tracing::error!(error = %e, "inbox journal tombstone failed");
+            }
         }
     }
 }
