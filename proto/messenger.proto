@@ -269,7 +269,7 @@ message PeerMediaReady {
 // The server only stores and hands out public key material; message bodies
 // are encrypted client-side (vodozemac Olm: X3DH-style session setup +
 // double ratchet) and are opaque bytes to every node. See
-// docs/messenger/07_e2ee.md.
+// docs/messenger/10_e2ee.md.
 
 // pkt_type = 0x60. Client -> server after login: publish this device's
 // public identity key and a batch of single-use one-time keys.

@@ -1066,6 +1066,127 @@ mod cluster_tests {
     }
 }
 
+// ---- E2EE (Phase 10) -------------------------------------------------------------
+
+mod e2ee_tests {
+    use super::*;
+    use lane_switchboards::messenger::E2eeDevice;
+
+    #[tokio::test]
+    async fn e2ee_chat_single_node_server_never_sees_plaintext() {
+        let (_server, addr, auth) = boot().await;
+        let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+        let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+
+        let mut alice_e2ee = E2eeDevice::generate();
+        let mut bob_e2ee = E2eeDevice::generate();
+
+        alice.publish_e2ee_device("d1", &mut alice_e2ee, 5).await.unwrap();
+        bob.publish_e2ee_device("d1", &mut bob_e2ee, 5).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        alice.establish_e2ee_session("bob", &mut alice_e2ee).await.unwrap();
+
+        let secret = b"plausible deniability text";
+        alice
+            .send_encrypted_chat(&mut alice_e2ee, "bob", "e2ee-1", secret)
+            .await
+            .unwrap();
+
+        let pkt = bob
+            .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+            .await
+            .unwrap();
+        let body = match pkt {
+            Packet::ChatMessage(m) => {
+                assert!(E2eeDevice::is_encrypted_body(&m.body));
+                assert!(!E2eeDevice::body_contains_substring(&m.body, secret));
+                m.body
+            }
+            _ => unreachable!(),
+        };
+
+        let plain = MessengerClient::decrypt_chat(&mut bob_e2ee, "alice", &body).unwrap();
+        assert_eq!(plain, secret);
+    }
+
+    #[tokio::test]
+    async fn e2ee_chat_cross_node_cluster() {
+        use lane_switchboards::messenger::{ClusterConfig, E2eeDevice, PeerAddr};
+
+        const PEER_SECRET: &str = "e2ee-peer-secret";
+        let auth = HmacAuthenticator::new(SECRET);
+        let mut listeners = Vec::new();
+        for _ in 0..2 {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listeners.push(l.local_addr().unwrap().to_string());
+        }
+        let mut servers = Vec::new();
+        for (i, addr) in listeners.iter().enumerate() {
+            let peers: Vec<PeerAddr> = listeners
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(j, a)| PeerAddr { node_id: format!("node-{j}"), addr: a.clone() })
+                .collect();
+            servers.push(
+                MessengerServer::bind_cluster(
+                    addr,
+                    Arc::new(auth.clone()),
+                    ServerConfig::default(),
+                    ClusterConfig {
+                        node_id: format!("node-{i}"),
+                        peers,
+                        peer_secret: PEER_SECRET.into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let addrs: Vec<String> = servers.iter().map(|s| s.local_addr().to_string()).collect();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let (mut bob, _) = MessengerClient::connect(
+            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        let mut alice_e2ee = E2eeDevice::generate();
+        let mut bob_e2ee = E2eeDevice::generate();
+        alice.publish_e2ee_device("d1", &mut alice_e2ee, 5).await.unwrap();
+        bob.publish_e2ee_device("d1", &mut bob_e2ee, 5).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        alice.establish_e2ee_session("bob", &mut alice_e2ee).await.unwrap();
+
+        let secret = b"cluster ciphertext only";
+        alice
+            .send_encrypted_chat(&mut alice_e2ee, "bob", "e2ee-x", secret)
+            .await
+            .unwrap();
+
+        let pkt = bob
+            .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+            .await
+            .unwrap();
+        match pkt {
+            Packet::ChatMessage(m) => {
+                assert!(!E2eeDevice::body_contains_substring(&m.body, secret));
+                let plain = MessengerClient::decrypt_chat(&mut bob_e2ee, "alice", &m.body).unwrap();
+                assert_eq!(plain, secret);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 // ---- TLS (feature = "tls") ---------------------------------------------------------
 
 #[cfg(feature = "tls")]

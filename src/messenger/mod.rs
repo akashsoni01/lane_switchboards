@@ -27,12 +27,14 @@ mod cluster;
 mod journal;
 #[cfg(feature = "metrics")]
 pub mod metrics;
+pub mod e2ee;
 pub mod server;
 
 pub use crate::proto::messenger as wire;
 pub use auth::{Authenticator, HmacAuthenticator};
 pub use client::MessengerClient;
 pub use codec::{FrameCodec, Packet, PacketType, PROTOCOL_VERSION};
+pub use e2ee::{E2eeDevice, E2eeError, PeerKeyBundle};
 pub use server::{ClusterConfig, MessengerServer, PeerAddr, ServerConfig};
 
 /// Errors surfaced by the messenger layer.
@@ -58,4 +60,6 @@ pub enum MessengerError {
     Timeout(&'static str),
     #[error("media transfer failed: {0}")]
     Media(String),
+    #[error("e2ee error: {0}")]
+    E2ee(#[from] e2ee::E2eeError),
 }

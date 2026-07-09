@@ -1431,13 +1431,14 @@ async fn handle_fetch_keys(state: &Arc<State>, f: wire::FetchKeys) {
         dir.get_mut(&f.user_id)
             .map(|keys| {
                 let one_time = keys.one_time_keys.pop().unwrap_or_default();
+                let has_keys = !keys.identity_key.is_empty() && !one_time.is_empty();
                 wire::KeyBundle {
                     user_id: f.user_id.clone(),
                     device_id: keys.device_id.clone(),
                     identity_key: keys.identity_key.clone(),
                     one_time_key: one_time,
                     for_user: f.for_user.clone(),
-                    found: !keys.identity_key.is_empty(),
+                    found: has_keys,
                 }
             })
             .unwrap_or(wire::KeyBundle {

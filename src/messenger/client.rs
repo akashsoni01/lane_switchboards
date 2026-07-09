@@ -13,6 +13,7 @@ use tokio_util::codec::Framed;
 use crate::stream::{self, MaybeTlsStream, TlsConnector};
 
 use super::codec::{FrameCodec, Packet};
+use super::e2ee::{E2eeDevice, PeerKeyBundle};
 use super::wire;
 use super::MessengerError;
 
@@ -409,5 +410,91 @@ impl MessengerClient {
     /// Close the connection gracefully.
     pub async fn close(mut self) -> Result<(), MessengerError> {
         self.framed.close().await
+    }
+
+    // ---- E2EE (Phase 10) ----------------------------------------------------
+
+    /// Publish this device's identity + one-time prekeys to the key directory.
+    pub async fn publish_keys(
+        &mut self,
+        device_id: &str,
+        identity_key: &str,
+        one_time_keys: Vec<String>,
+    ) -> Result<(), MessengerError> {
+        self.framed
+            .send(Packet::PublishKeys(wire::PublishKeys {
+                user_id: self.user_id.clone(),
+                device_id: device_id.into(),
+                identity_key: identity_key.into(),
+                one_time_keys,
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// Request a peer's prekey bundle from the key directory.
+    pub async fn fetch_key_bundle(&mut self, user_id: &str) -> Result<wire::KeyBundle, MessengerError> {
+        let for_user = self.user_id.clone();
+        self.framed
+            .send(Packet::FetchKeys(wire::FetchKeys {
+                user_id: user_id.into(),
+                for_user: for_user.clone(),
+            }))
+            .await?;
+        match self
+            .recv_until(|p| {
+                matches!(p, Packet::KeyBundle(b) if b.for_user == for_user || b.for_user.is_empty())
+            })
+            .await?
+        {
+            Packet::KeyBundle(b) => Ok(b),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Publish keys from an [`E2eeDevice`] and mark them published locally.
+    pub async fn publish_e2ee_device(
+        &mut self,
+        device_id: &str,
+        e2ee: &mut E2eeDevice,
+        one_time_count: usize,
+    ) -> Result<(), MessengerError> {
+        let otks = e2ee.generate_one_time_keys(one_time_count);
+        self.publish_keys(device_id, &e2ee.identity_key_base64(), otks)
+            .await?;
+        e2ee.mark_keys_published();
+        Ok(())
+    }
+
+    /// Fetch a peer bundle and establish an outbound Olm session.
+    pub async fn establish_e2ee_session(
+        &mut self,
+        peer: &str,
+        e2ee: &mut E2eeDevice,
+    ) -> Result<(), MessengerError> {
+        let bundle = self.fetch_key_bundle(peer).await?;
+        e2ee.establish_outbound(peer, &PeerKeyBundle::from_wire(&bundle)?)?;
+        Ok(())
+    }
+
+    /// Send an E2EE 1:1 message; `ChatMessage.body` carries an encrypted payload.
+    pub async fn send_encrypted_chat(
+        &mut self,
+        e2ee: &mut E2eeDevice,
+        to_user: &str,
+        message_id: &str,
+        plaintext: &[u8],
+    ) -> Result<u64, MessengerError> {
+        let body = e2ee.encrypt_for_peer(to_user, plaintext)?;
+        self.send_chat_with_media(to_user, message_id, &body, "").await
+    }
+
+    /// Decrypt an incoming `ChatMessage` body from `from_user`.
+    pub fn decrypt_chat(
+        e2ee: &mut E2eeDevice,
+        from_user: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, MessengerError> {
+        Ok(e2ee.decrypt_from_sender(from_user, body)?)
     }
 }
