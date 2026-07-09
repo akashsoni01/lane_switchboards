@@ -585,4 +585,39 @@ mod tests {
         }
         assert!(codec.decode(&mut buf).unwrap().is_none());
     }
+
+    #[cfg(test)]
+    mod proptest_roundtrip {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn chat_body_round_trip(body in proptest::collection::vec(any::<u8>(), 0..8192)) {
+                let pkt = Packet::ChatMessage(wire::ChatMessage {
+                    message_id: "prop-1".into(),
+                    from_user: "alice".into(),
+                    to_user: "bob".into(),
+                    body,
+                    sent_at: 1,
+                    seq: 0,
+                    media_id: String::new(),
+                });
+                let mut codec = FrameCodec::default();
+                let mut buf = BytesMut::new();
+                codec.encode(pkt.clone(), &mut buf).unwrap();
+                let decoded = codec.decode(&mut buf).unwrap().expect("one frame");
+                assert_eq!(decoded, pkt);
+            }
+
+            #[test]
+            fn length_prefix_never_panics_on_truncated_stream(
+                header in proptest::collection::vec(any::<u8>(), 0..12),
+            ) {
+                let mut codec = FrameCodec::default();
+                let mut buf = BytesMut::from(&header[..]);
+                let _ = codec.decode(&mut buf);
+            }
+        }
+    }
 }

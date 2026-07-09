@@ -3,6 +3,8 @@
 //! Each test boots a real gateway on an ephemeral port and drives it with
 //! the reference `MessengerClient` over real TCP sockets.
 
+#![cfg(feature = "messenger")]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -218,6 +220,77 @@ async fn resume_after_seq_skips_already_seen_messages() {
         })
         .collect();
     assert_eq!(seqs, vec![3, 4]);
+}
+
+#[tokio::test]
+async fn reconnect_after_partition_replays_gap_only() {
+    let (_server, addr, auth) = boot().await;
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+
+    for i in 1..=3u32 {
+        alice
+            .send_chat("bob", &format!("part-{i}"), b"x")
+            .await
+            .unwrap();
+    }
+
+    let token = auth.mint_token("bob", "d1");
+    let (mut bob, outcome) = MessengerClient::connect(&addr, "bob", "d1", &token, 0)
+        .await
+        .unwrap();
+    let initial: Vec<_> = outcome
+        .replayed
+        .iter()
+        .filter_map(|p| match p {
+            Packet::ChatMessage(m) => Some(m.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(initial.len(), 3);
+    let resume_seq = initial[1].seq;
+    bob.close().await.ok();
+
+    alice.send_chat("bob", "part-4", b"x").await.unwrap();
+    alice.send_chat("bob", "part-5", b"x").await.unwrap();
+
+    let (mut bob2, outcome2) =
+        MessengerClient::connect(&addr, "bob", "d1", &token, resume_seq)
+            .await
+            .unwrap();
+    assert_eq!(outcome2.replayed.len(), 3, "gap only: part-3,4,5");
+    let ids: Vec<String> = outcome2
+        .replayed
+        .iter()
+        .map(|p| match p {
+            Packet::ChatMessage(m) => m.message_id.clone(),
+            _ => panic!(),
+        })
+        .collect();
+    assert_eq!(ids, vec!["part-3", "part-4", "part-5"]);
+    bob2.close().await.ok();
+}
+
+#[tokio::test]
+async fn send_chat_with_retry_dedups_same_message_id() {
+    let (_server, addr, auth) = boot().await;
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+    let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+
+    let seq1 = alice
+        .send_chat_with_retry("bob", "retry-dedup", b"once", 3)
+        .await
+        .unwrap();
+    assert!(seq1 > 0);
+
+    let seq2 = alice
+        .send_chat_with_retry("bob", "retry-dedup", b"retry", 3)
+        .await
+        .unwrap();
+    assert_eq!(seq2, 0, "duplicate message_id re-acked with seq sentinel");
+
+    bob.recv_until(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == "retry-dedup"))
+        .await
+        .unwrap();
 }
 
 // ---- Presence -------------------------------------------------------------------

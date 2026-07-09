@@ -10,8 +10,11 @@ overview, then dive into the layer you care about.
 | [02_bulk_data.md](02_bulk_data.md) | Chunked media transfer (PDFs, images) with integrity checks |
 | [03_sessions.md](03_sessions.md) | Session state machine, backpressure, liveness, graceful shutdown |
 | [04_auth.md](04_auth.md) | Token format, multi-device rules, brute-force protection, threat model |
+| [04_presence.md](04_presence.md) | Presence registry, fan-out, cluster propagation, privacy |
 | [05_cluster.md](05_cluster.md) | Multi-node topology, home shards, peer links, cross-node flows |
 | [06_offline_store.md](06_offline_store.md) | Inbox model, durable WAL journal, crash recovery |
+| [07_heartbeats.md](07_heartbeats.md) | Ping/Pong, idle timeout, reconnect + resume |
+| [08_groups.md](08_groups.md) | Group membership, fan-out, authz, ack limitations |
 | [09_operations.md](09_operations.md) | Scaling, observability, runbooks, benchmarks |
 | [10_e2ee.md](10_e2ee.md) | Olm + Megolm E2EE: key directory, encrypted payloads, client API |
 | [11_security_review.md](11_security_review.md) | Pre-production E2EE security checklist |

@@ -6,15 +6,35 @@ on:
   pull_request:
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: cargo clippy --workspace --all-features -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Default features (fast path, no monitor)
+      - name: Without default features (no messenger)
+        run: cargo test -p lane_switchboards --lib --no-default-features
+      - name: Default features (messenger)
         run: cargo test --workspace
-      - name: Monitor feature
-        run: cargo test --workspace --features monitor
+      - name: TLS messenger tests
+        run: cargo test --features tls --test messenger
       - name: Metrics feature
         run: |
           cargo test --workspace --features metrics

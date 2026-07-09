@@ -195,6 +195,55 @@ impl MessengerClient {
         }
     }
 
+    /// Like [`send_chat`](Self::send_chat) but retries until `ServerAck` or
+    /// `max_attempts` is exhausted. Safe to retry the same `message_id` — the
+    /// server dedups and re-acks duplicates.
+    pub async fn send_chat_with_retry(
+        &mut self,
+        to_user: &str,
+        message_id: &str,
+        body: &[u8],
+        max_attempts: u32,
+    ) -> Result<u64, MessengerError> {
+        self.send_chat_with_media_retry(to_user, message_id, body, "", max_attempts)
+            .await
+    }
+
+    /// Like [`send_chat_with_media`](Self::send_chat_with_media) with exponential
+    /// backoff on transient errors (`Timeout`, `Closed`, `Io`).
+    pub async fn send_chat_with_media_retry(
+        &mut self,
+        to_user: &str,
+        message_id: &str,
+        body: &[u8],
+        media_id: &str,
+        max_attempts: u32,
+    ) -> Result<u64, MessengerError> {
+        let attempts = max_attempts.max(1);
+        let mut backoff = Duration::from_millis(50);
+        for attempt in 0..attempts {
+            match self
+                .send_chat_with_media(to_user, message_id, body, media_id)
+                .await
+            {
+                Ok(seq) => return Ok(seq),
+                Err(e) if attempt + 1 < attempts && Self::send_error_retryable(&e) => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on last attempt")
+    }
+
+    fn send_error_retryable(err: &MessengerError) -> bool {
+        matches!(
+            err,
+            MessengerError::Timeout(_) | MessengerError::Closed | MessengerError::Io(_)
+        )
+    }
+
     /// Acknowledge delivery of a received message (double tick).
     pub async fn ack_delivered(&mut self, message_id: &str) -> Result<(), MessengerError> {
         self.framed
