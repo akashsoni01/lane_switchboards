@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "lane_core"]
+members = [".", "lane_core", "lane_messenger_ffi"]
 resolver = "2"
 
 [package]

@@ -33,6 +33,8 @@ jobs:
         run: cargo test -p lane_switchboards --lib --no-default-features
       - name: Default features (messenger)
         run: cargo test --workspace
+      - name: Messenger FFI
+        run: cargo test -p lane_messenger_ffi
       - name: TLS messenger tests
         run: cargo test --features tls --test messenger
       - name: Metrics feature

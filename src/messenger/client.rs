@@ -54,6 +54,22 @@ pub struct MessengerClient {
 }
 
 impl MessengerClient {
+    /// Authenticated user id for this connection.
+    pub fn user_id(&self) -> &str {
+        &self.user_id
+    }
+
+    /// Send a raw packet without waiting for a reply (FFI / advanced hosts).
+    pub async fn send_packet(&mut self, packet: Packet) -> Result<(), MessengerError> {
+        self.framed.send(packet).await
+    }
+
+    /// Allocate the next ping sequence number (does not send).
+    pub fn alloc_ping_seq(&mut self) -> u64 {
+        self.ping_seq += 1;
+        self.ping_seq
+    }
+
     /// Connect over plain TCP and authenticate; replays pending messages.
     pub async fn connect(
         addr: &str,
@@ -425,6 +441,20 @@ impl MessengerClient {
     /// Add a member (caller must be admin).
     pub async fn add_member(&mut self, group_id: &str, user: &str) -> Result<u64, MessengerError> {
         self.group_event(group_id, wire::GroupOp::AddMember, user).await
+    }
+
+    /// Remove a member (caller must be admin).
+    pub async fn remove_member(
+        &mut self,
+        group_id: &str,
+        user: &str,
+    ) -> Result<u64, MessengerError> {
+        self.group_event(group_id, wire::GroupOp::RemoveMember, user).await
+    }
+
+    /// Leave a group (caller is the subject).
+    pub async fn leave_group(&mut self, group_id: &str) -> Result<u64, MessengerError> {
+        self.group_event(group_id, wire::GroupOp::Leave, "").await
     }
 
     async fn group_event(
