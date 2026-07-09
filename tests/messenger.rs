@@ -271,6 +271,85 @@ async fn reconnect_after_partition_replays_gap_only() {
 }
 
 #[tokio::test]
+async fn presence_roster_filters_broadcasts() {
+    let (_server, addr, auth) = boot().await;
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+    let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+    let (mut carol, _) = login(&addr, &auth, "carol", "d1").await;
+
+    alice.subscribe_presence(["bob"]).await.unwrap();
+    bob.subscribe_presence(["alice"]).await.unwrap();
+    // carol keeps legacy (no roster).
+
+    // Force alice Available again so filtered fan-out runs.
+    alice
+        .framed_send_presence(wire::PresenceKind::Available)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let bob_got = poll_presence(&mut bob, "alice").await;
+    let carol_got = poll_presence(&mut carol, "alice").await;
+    assert!(bob_got, "bob is on alice's roster");
+    assert!(!carol_got, "carol is not on alice's roster");
+}
+
+async fn poll_presence(client: &mut MessengerClient, user: &str) -> bool {
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_millis(40), client.recv()).await {
+            Ok(Ok(Packet::Presence(p))) if p.user_id == user => return true,
+            Ok(Ok(_)) => continue,
+            _ => break,
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn group_ack_summary_aggregates_member_receipts() {
+    let (_server, addr, auth) = boot().await;
+    let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+    let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+    let (mut carol, _) = login(&addr, &auth, "carol", "d1").await;
+
+    alice.create_group("g-ack").await.unwrap();
+    alice.add_member("g-ack", "bob").await.unwrap();
+    alice.add_member("g-ack", "carol").await.unwrap();
+
+    alice.send_group("g-ack", "gm-ack-1", b"hello").await.unwrap();
+
+    for (c, name) in [(&mut bob, "bob"), (&mut carol, "carol")] {
+        let pkt = c
+            .recv_until(|p| matches!(p, Packet::GroupMessage(g) if g.message_id == "gm-ack-1"))
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        if let Packet::GroupMessage(m) = pkt {
+            c.ack_delivered(&m.message_id).await.unwrap();
+            c.ack_read(&m.message_id).await.unwrap();
+        }
+    }
+
+    // Summaries are pushed on every ack; wait until both members have read.
+    let mut last = None;
+    for _ in 0..8 {
+        let summary = alice
+            .recv_until(|p| matches!(p, Packet::GroupAckSummary(s) if s.message_id == "gm-ack-1"))
+            .await
+            .expect("group ack summary");
+        if let Packet::GroupAckSummary(s) = summary {
+            if s.read_by.len() >= 2 {
+                assert_eq!(s.member_count, 2);
+                assert!(s.delivered_by.len() >= 2);
+                return;
+            }
+            last = Some(s);
+        }
+    }
+    panic!("expected full read aggregation, last={last:?}");
+}
+
+#[tokio::test]
 async fn send_chat_with_retry_dedups_same_message_id() {
     let (_server, addr, auth) = boot().await;
     let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
@@ -1136,6 +1215,148 @@ mod cluster_tests {
             }
         }
         assert!(n >= 500);
+    }
+
+    /// Simulated packet loss: hard-close mid-sync and resume without duplicates.
+    #[tokio::test]
+    async fn chaos_packet_loss_reconnect_no_dupes() {
+        let (_servers, addrs, auth) = boot_cluster(2).await;
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        for i in 0..5 {
+            alice
+                .send_chat("bob", &format!("loss-{i}"), b"x")
+                .await
+                .unwrap();
+        }
+
+        let (bob, outcome) = MessengerClient::connect(
+            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let mut seqs: Vec<u64> = outcome
+            .replayed
+            .iter()
+            .filter_map(|p| match p {
+                Packet::ChatMessage(m) => Some(m.seq),
+                _ => None,
+            })
+            .collect();
+        seqs.sort_unstable();
+        let resume_seq = seqs.get(1).copied().unwrap_or(0);
+        drop(bob);
+
+        alice.send_chat("bob", "loss-5", b"x").await.unwrap();
+
+        let (mut bob2, outcome2) = MessengerClient::connect(
+            &addrs[1],
+            "bob",
+            "d1",
+            &auth.mint_token("bob", "d1"),
+            resume_seq,
+        )
+        .await
+        .unwrap();
+        let mut ids = std::collections::HashSet::new();
+        for p in &outcome2.replayed {
+            if let Packet::ChatMessage(m) = p {
+                assert!(ids.insert(m.message_id.clone()), "duplicate {}", m.message_id);
+            }
+        }
+        assert!(!ids.is_empty());
+        bob2.close().await.ok();
+    }
+
+    /// Clock skew: absurd client `sent_at` must not break server seq order.
+    #[tokio::test]
+    async fn chaos_clock_skew_sent_at_ignored_for_order() {
+        use futures_util::{SinkExt, StreamExt};
+        let (_server, addr, auth) = boot().await;
+        let token = auth.mint_token("alice", "d1");
+        let socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let mut raw = tokio_util::codec::Framed::new(
+            socket,
+            lane_switchboards::messenger::FrameCodec::default(),
+        );
+        raw.send(Packet::Login(wire::Login {
+            user_id: "alice".into(),
+            device_id: "d1".into(),
+            auth_token: token,
+            client_version: "t".into(),
+            resume_after_seq: 0,
+        }))
+        .await
+        .unwrap();
+        loop {
+            let p = raw.next().await.unwrap().unwrap();
+            if matches!(p, Packet::SyncComplete(_)) {
+                break;
+            }
+        }
+        for (i, ts) in [(1u64, 0u64), (2, u64::MAX), (3, 1)] {
+            raw.send(Packet::ChatMessage(wire::ChatMessage {
+                message_id: format!("skew-{i}"),
+                from_user: "alice".into(),
+                to_user: "bob".into(),
+                body: b"x".to_vec(),
+                sent_at: ts,
+                seq: 0,
+                media_id: String::new(),
+            }))
+            .await
+            .unwrap();
+            let ack = raw.next().await.unwrap().unwrap();
+            assert!(matches!(ack, Packet::ServerAck(_)));
+        }
+
+        let (mut bob, outcome) = login(&addr, &auth, "bob", "d1").await;
+        let mut seqs: Vec<u64> = outcome
+            .replayed
+            .iter()
+            .filter_map(|p| match p {
+                Packet::ChatMessage(m) => Some(m.seq),
+                _ => None,
+            })
+            .collect();
+        while seqs.len() < 3 {
+            if let Ok(Packet::ChatMessage(m)) = bob.recv().await {
+                seqs.push(m.seq);
+            }
+        }
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "seq order independent of client sent_at");
+    }
+
+    /// 10k idle connections — memory/FD soak. Ignored by default.
+    #[tokio::test]
+    #[ignore = "manual soak: cargo test idle_10k_connections -- --ignored --nocapture"]
+    async fn idle_10k_connections() {
+        let cfg = ServerConfig {
+            max_conns_per_ip_per_min: 0,
+            idle_timeout: Duration::from_secs(600),
+            ..Default::default()
+        };
+        let (_server, addr, auth) = boot_with(cfg).await;
+        let mut clients = Vec::with_capacity(10_000);
+        for i in 0..10_000 {
+            let user = format!("u{i}");
+            let token = auth.mint_token(&user, "d1");
+            let (c, _) = MessengerClient::connect(&addr, &user, "d1", &token, 0)
+                .await
+                .unwrap_or_else(|e| panic!("connect {i}: {e}"));
+            clients.push(c);
+            if i % 500 == 0 {
+                eprintln!("connected {i}");
+            }
+        }
+        assert_eq!(clients.len(), 10_000);
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 

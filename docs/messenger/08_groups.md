@@ -70,15 +70,14 @@ Violations return `ProtocolError` with detail; connection stays open.
 
 - `ServerAck` when the group home persists and accepts the fan-out job.
 
-**Not yet implemented:**
+**Aggregation (implemented):**
 
-- Per-member `DeliveredAck` / `ReadAck` **aggregation** for the sender
-  (WhatsApp-style "read by N of M"). Today each member's device acks
-  independently and the sender sees individual 1:1-style acks only if they
-  share a direct routing path — there is no group-level rollup.
-
-Clients should show a single tick on `ServerAck` for group sends until
-aggregation lands.
+- On fan-out the group home registers a `GroupAckTracker` for `message_id`.
+- Member `DeliveredAck` / `ReadAck` update the tracker and push
+  `GroupAckSummary` (0x42) to the sender with `delivered_by`, `read_by`,
+  and `member_count`.
+- Clients show single tick on `ServerAck`, then progress from summaries
+  (e.g. "read by 2 of 5").
 
 ## E2EE groups
 

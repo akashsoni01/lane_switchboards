@@ -75,6 +75,15 @@ enum PresenceKind {
   LAST_SEEN = 3;
 }
 
+// pkt_type = 0x11. Client -> server: replace this user's presence roster.
+// Until the first SubscribePresence, the gateway broadcasts all presence
+// (legacy). After SubscribePresence, only listed contacts receive updates
+// about this user AND this user only receives presence for listed contacts.
+message SubscribePresence {
+  string user_id = 1; // overwritten with authenticated user
+  repeated string contact_ids = 2;
+}
+
 // ---- Chat ------------------------------------------------------------------
 
 // pkt_type = 0x20. Client -> server -> recipient.
@@ -198,6 +207,19 @@ enum GroupOp {
   ADD_MEMBER = 2;
   REMOVE_MEMBER = 3;
   LEAVE = 4;
+}
+
+// pkt_type = 0x42. Server -> sender: aggregated delivery/read receipts for
+// one group message (WhatsApp-style "read by N of M").
+message GroupAckSummary {
+  string message_id = 1;
+  string group_id = 2;
+  // Sender who should receive this summary (set on inter-node links).
+  string to_user = 3;
+  repeated string delivered_by = 4;
+  repeated string read_by = 5;
+  // Members excluding the sender at fan-out time.
+  uint32 member_count = 6;
 }
 
 // ---- Inter-node (peer) links -------------------------------------------------

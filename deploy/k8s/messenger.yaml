@@ -1,0 +1,134 @@
+# Kubernetes manifests for a 3-node messenger cluster (example).
+# Adjust images, secrets, and ServiceMesh registry address for your environment.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: lane-messenger
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: messenger-secrets
+  namespace: lane-messenger
+type: Opaque
+stringData:
+  auth-secret: "change-me-client-hmac"
+  peer-secret: "change-me-peer-hmac"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: messenger-config
+  namespace: lane-messenger
+data:
+  LISTEN_ADDR: "0.0.0.0:9000"
+  OBSERVABILITY_ADDR: "0.0.0.0:9100"
+  # Optional: MeshRegistry for peer discovery
+  # MESH_REGISTRY: "http://mesh-registry.lane-messenger.svc:50051"
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: messenger
+  namespace: lane-messenger
+spec:
+  serviceName: messenger
+  replicas: 3
+  selector:
+    matchLabels:
+      app: messenger
+  template:
+    metadata:
+      labels:
+        app: messenger
+    spec:
+      containers:
+        - name: gateway
+          image: ghcr.io/example/lane-messenger:0.9.2
+          ports:
+            - name: messenger
+              containerPort: 9000
+            - name: metrics
+              containerPort: 9100
+          envFrom:
+            - configMapRef:
+                name: messenger-config
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: messenger-secrets
+                  key: auth-secret
+            - name: PEER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: messenger-secrets
+                  key: peer-secret
+            - name: DURABLE_DIR
+              value: /data
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: metrics
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: messenger
+  namespace: lane-messenger
+spec:
+  clusterIP: None
+  selector:
+    app: messenger
+  ports:
+    - name: messenger
+      port: 9000
+      targetPort: messenger
+    - name: metrics
+      port: 9100
+      targetPort: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: messenger-lb
+  namespace: lane-messenger
+spec:
+  type: LoadBalancer
+  selector:
+    app: messenger
+  ports:
+    - name: messenger
+      port: 9000
+      targetPort: messenger

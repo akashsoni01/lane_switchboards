@@ -24,19 +24,27 @@ pub mod auth;
 pub mod client;
 pub mod codec;
 mod cluster;
+pub mod discovery;
+pub mod e2ee;
+pub mod inbox_storage;
 mod journal;
 mod key_store;
 #[cfg(feature = "metrics")]
 pub mod metrics;
-pub mod e2ee;
 pub mod server;
+#[cfg(feature = "ws")]
+pub mod ws;
 
 pub use crate::proto::messenger as wire;
 pub use auth::{Authenticator, HmacAuthenticator};
 pub use client::MessengerClient;
 pub use codec::{FrameCodec, Packet, PacketType, PROTOCOL_VERSION};
+pub use discovery::{spawn_mesh_discovery, MeshDiscoveryConfig, MESSENGER_SERVICE};
 pub use e2ee::{E2eeDevice, E2eeError, PeerKeyBundle};
+pub use inbox_storage::InboxStorage;
 pub use server::{ClusterConfig, MessengerServer, PeerAddr, ServerConfig};
+#[cfg(feature = "ws")]
+pub use ws::{bind_ws, decode_frame, encode_frame, WsServerHandle};
 
 /// Errors surfaced by the messenger layer.
 #[derive(Debug, thiserror::Error)]

@@ -39,6 +39,7 @@ pub enum PacketType {
     Pong = 0x04,
     Error = 0x0F,
     Presence = 0x10,
+    SubscribePresence = 0x11,
     ChatMessage = 0x20,
     ServerAck = 0x21,
     DeliveredAck = 0x22,
@@ -50,6 +51,7 @@ pub enum PacketType {
     MediaFetch = 0x33,
     GroupMessage = 0x40,
     GroupEvent = 0x41,
+    GroupAckSummary = 0x42,
     PeerHello = 0x50,
     PeerPresence = 0x51,
     PeerSync = 0x52,
@@ -75,6 +77,7 @@ impl TryFrom<u8> for PacketType {
             0x04 => Self::Pong,
             0x0F => Self::Error,
             0x10 => Self::Presence,
+            0x11 => Self::SubscribePresence,
             0x20 => Self::ChatMessage,
             0x21 => Self::ServerAck,
             0x22 => Self::DeliveredAck,
@@ -86,6 +89,7 @@ impl TryFrom<u8> for PacketType {
             0x33 => Self::MediaFetch,
             0x40 => Self::GroupMessage,
             0x41 => Self::GroupEvent,
+            0x42 => Self::GroupAckSummary,
             0x50 => Self::PeerHello,
             0x51 => Self::PeerPresence,
             0x52 => Self::PeerSync,
@@ -112,6 +116,7 @@ pub enum Packet {
     Pong(wire::Pong),
     Error(wire::ProtocolError),
     Presence(wire::Presence),
+    SubscribePresence(wire::SubscribePresence),
     ChatMessage(wire::ChatMessage),
     ServerAck(wire::ServerAck),
     DeliveredAck(wire::DeliveredAck),
@@ -123,6 +128,7 @@ pub enum Packet {
     MediaFetch(wire::MediaFetch),
     GroupMessage(wire::GroupMessage),
     GroupEvent(wire::GroupEvent),
+    GroupAckSummary(wire::GroupAckSummary),
     PeerHello(wire::PeerHello),
     PeerPresence(wire::PeerPresence),
     PeerSync(wire::PeerSync),
@@ -147,6 +153,7 @@ impl Packet {
             Packet::Pong(_) => PacketType::Pong,
             Packet::Error(_) => PacketType::Error,
             Packet::Presence(_) => PacketType::Presence,
+            Packet::SubscribePresence(_) => PacketType::SubscribePresence,
             Packet::ChatMessage(_) => PacketType::ChatMessage,
             Packet::ServerAck(_) => PacketType::ServerAck,
             Packet::DeliveredAck(_) => PacketType::DeliveredAck,
@@ -158,6 +165,7 @@ impl Packet {
             Packet::MediaFetch(_) => PacketType::MediaFetch,
             Packet::GroupMessage(_) => PacketType::GroupMessage,
             Packet::GroupEvent(_) => PacketType::GroupEvent,
+            Packet::GroupAckSummary(_) => PacketType::GroupAckSummary,
             Packet::PeerHello(_) => PacketType::PeerHello,
             Packet::PeerPresence(_) => PacketType::PeerPresence,
             Packet::PeerSync(_) => PacketType::PeerSync,
@@ -181,6 +189,7 @@ impl Packet {
             Packet::Pong(m) => m.encoded_len(),
             Packet::Error(m) => m.encoded_len(),
             Packet::Presence(m) => m.encoded_len(),
+            Packet::SubscribePresence(m) => m.encoded_len(),
             Packet::ChatMessage(m) => m.encoded_len(),
             Packet::ServerAck(m) => m.encoded_len(),
             Packet::DeliveredAck(m) => m.encoded_len(),
@@ -192,6 +201,7 @@ impl Packet {
             Packet::MediaFetch(m) => m.encoded_len(),
             Packet::GroupMessage(m) => m.encoded_len(),
             Packet::GroupEvent(m) => m.encoded_len(),
+            Packet::GroupAckSummary(m) => m.encoded_len(),
             Packet::PeerHello(m) => m.encoded_len(),
             Packet::PeerPresence(m) => m.encoded_len(),
             Packet::PeerSync(m) => m.encoded_len(),
@@ -216,6 +226,7 @@ impl Packet {
             Packet::Pong(m) => m.encode(buf),
             Packet::Error(m) => m.encode(buf),
             Packet::Presence(m) => m.encode(buf),
+            Packet::SubscribePresence(m) => m.encode(buf),
             Packet::ChatMessage(m) => m.encode(buf),
             Packet::ServerAck(m) => m.encode(buf),
             Packet::DeliveredAck(m) => m.encode(buf),
@@ -227,6 +238,7 @@ impl Packet {
             Packet::MediaFetch(m) => m.encode(buf),
             Packet::GroupMessage(m) => m.encode(buf),
             Packet::GroupEvent(m) => m.encode(buf),
+            Packet::GroupAckSummary(m) => m.encode(buf),
             Packet::PeerHello(m) => m.encode(buf),
             Packet::PeerPresence(m) => m.encode(buf),
             Packet::PeerSync(m) => m.encode(buf),
@@ -251,6 +263,9 @@ impl Packet {
             PacketType::Pong => Packet::Pong(wire::Pong::decode(payload)?),
             PacketType::Error => Packet::Error(wire::ProtocolError::decode(payload)?),
             PacketType::Presence => Packet::Presence(wire::Presence::decode(payload)?),
+            PacketType::SubscribePresence => {
+                Packet::SubscribePresence(wire::SubscribePresence::decode(payload)?)
+            }
             PacketType::ChatMessage => Packet::ChatMessage(wire::ChatMessage::decode(payload)?),
             PacketType::ServerAck => Packet::ServerAck(wire::ServerAck::decode(payload)?),
             PacketType::DeliveredAck => Packet::DeliveredAck(wire::DeliveredAck::decode(payload)?),
@@ -262,6 +277,9 @@ impl Packet {
             PacketType::MediaFetch => Packet::MediaFetch(wire::MediaFetch::decode(payload)?),
             PacketType::GroupMessage => Packet::GroupMessage(wire::GroupMessage::decode(payload)?),
             PacketType::GroupEvent => Packet::GroupEvent(wire::GroupEvent::decode(payload)?),
+            PacketType::GroupAckSummary => {
+                Packet::GroupAckSummary(wire::GroupAckSummary::decode(payload)?)
+            }
             PacketType::PeerHello => Packet::PeerHello(wire::PeerHello::decode(payload)?),
             PacketType::PeerPresence => Packet::PeerPresence(wire::PeerPresence::decode(payload)?),
             PacketType::PeerSync => Packet::PeerSync(wire::PeerSync::decode(payload)?),
@@ -390,6 +408,10 @@ mod tests {
             kind: wire::PresenceKind::Available as i32,
             last_seen: 0,
         }));
+        round_trip(Packet::SubscribePresence(wire::SubscribePresence {
+            user_id: "john".into(),
+            contact_ids: vec!["akash".into(), "carol".into()],
+        }));
         round_trip(Packet::ChatMessage(wire::ChatMessage {
             message_id: "m-1".into(),
             from_user: "akash".into(),
@@ -455,6 +477,14 @@ mod tests {
             subject_user: "john".into(),
             version: 2,
             to_user: String::new(),
+        }));
+        round_trip(Packet::GroupAckSummary(wire::GroupAckSummary {
+            message_id: "gm-1".into(),
+            group_id: "g-1".into(),
+            to_user: "akash".into(),
+            delivered_by: vec!["john".into()],
+            read_by: vec!["john".into()],
+            member_count: 2,
         }));
         round_trip(Packet::PeerHello(wire::PeerHello {
             node_id: "node-1".into(),

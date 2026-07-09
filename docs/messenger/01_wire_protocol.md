@@ -35,6 +35,7 @@ is 52 bytes of markup for 5 bytes of content. The equivalent binary frame is
 | 0x04 | `Pong` | S→C | Heartbeat reply |
 | 0x0F | `ProtocolError` | S→C | Typed fatal error, then close |
 | 0x10 | `Presence` | both | Available / Unavailable / LastSeen |
+| 0x11 | `SubscribePresence` | C→S | Contact roster for presence filtering |
 | 0x20 | `ChatMessage` | both | 1:1 message (body opaque bytes) |
 | 0x21 | `ServerAck` | S→C | Message persisted (single tick) |
 | 0x22 | `DeliveredAck` | both | Device received (double tick) |
@@ -46,6 +47,7 @@ is 52 bytes of markup for 5 bytes of content. The equivalent binary frame is
 | 0x33 | `MediaFetch` | C→S | Request stored blob (resumable) |
 | 0x40 | `GroupMessage` | both | Group chat message |
 | 0x41 | `GroupEvent` | both | Create / add / remove / leave |
+| 0x42 | `GroupAckSummary` | S→C | Aggregated delivery/read receipts |
 | 0x50 | `PeerHello` | node→node | Authenticate an inter-node link |
 | 0x51 | `PeerPresence` | node→node | User login/logout location broadcast |
 | 0x52 | `PeerSync` | node→node | Ask a home shard to replay an inbox |

@@ -1,0 +1,36 @@
+# lane-messenger — systemd unit (TCP gateway)
+#
+# Install:
+#   sudo cp deploy/systemd/lane-messenger.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now lane-messenger
+
+[Unit]
+Description=lane_switchboards FunXMPP messenger gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lane
+Group=lane
+WorkingDirectory=/var/lib/lane-messenger
+EnvironmentFile=-/etc/lane-messenger/env
+ExecStart=/usr/local/bin/lane-messenger \
+  --listen ${LISTEN_ADDR:-0.0.0.0:9000} \
+  --auth-secret-file /etc/lane-messenger/auth.secret \
+  --durable-dir /var/lib/lane-messenger/data \
+  --tls-cert /etc/lane-messenger/tls/cert.pem \
+  --tls-key /etc/lane-messenger/tls/key.pem
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65535
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/lane-messenger
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

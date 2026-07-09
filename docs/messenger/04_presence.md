@@ -41,9 +41,14 @@ user A disconnects
   → all sessions except A receive Presence{ A, UNAVAILABLE, last_seen }
 ```
 
-**Limitation (documented):** there is no contact-list subscription filter yet.
-Every online user sees every other user's presence. Filtering to a roster is
-a follow-up (would need server-side contact graph or client-side ignore).
+**Contact filtering:** clients send `SubscribePresence { contact_ids }`
+(`pkt_type = 0x11`). Until the first subscribe, behaviour is legacy
+broadcast-to-all. After subscribe:
+
+- Subject with a roster: only listed contacts receive that user's presence.
+- Observer with a roster: only receives presence for their contacts.
+
+Empty roster = visible to nobody / see nobody (privacy lockdown).
 
 ## Multi-node propagation
 

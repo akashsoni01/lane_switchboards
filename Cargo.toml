@@ -50,6 +50,7 @@ tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 prometheus = { version = "0.13", optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
 vodozemac = { version = "0.10.0", optional = true }
 olm-rs = { version = "2.2.0", optional = true }
 
@@ -60,6 +61,7 @@ metrics = ["lane_core/metrics", "monitor", "dep:prometheus"]
 watch_sync = []
 messenger = ["dep:vodozemac"]
 libolm-compat = ["messenger", "dep:olm-rs"]
+ws = ["messenger", "dep:tokio-tungstenite"]
 tls = [
     "dep:rustls",
     "dep:tokio-rustls",

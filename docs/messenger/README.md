@@ -19,6 +19,7 @@ overview, then dive into the layer you care about.
 | [10_e2ee.md](10_e2ee.md) | Olm + Megolm E2EE: key directory, encrypted payloads, client API |
 | [11_security_review.md](11_security_review.md) | Pre-production E2EE security checklist |
 | [limits.md](limits.md) | Every configurable limit with defaults and rationale |
+| [../../deploy/README.md](../../deploy/README.md) | systemd + Kubernetes deployment examples |
 
 Code map:
 

@@ -266,6 +266,37 @@ impl MessengerClient {
         Ok(())
     }
 
+    /// Replace this user's presence contact roster. Until called, presence is
+    /// broadcast to all online users (legacy). After subscribe, only listed
+    /// contacts exchange presence with this user.
+    pub async fn subscribe_presence(
+        &mut self,
+        contact_ids: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<(), MessengerError> {
+        self.framed
+            .send(Packet::SubscribePresence(wire::SubscribePresence {
+                user_id: self.user_id.clone(),
+                contact_ids: contact_ids.into_iter().map(Into::into).collect(),
+            }))
+            .await?;
+        Ok(())
+    }
+
+    /// Send a client-initiated presence update (e.g. Available / Unavailable).
+    pub async fn framed_send_presence(
+        &mut self,
+        kind: wire::PresenceKind,
+    ) -> Result<(), MessengerError> {
+        self.framed
+            .send(Packet::Presence(wire::Presence {
+                user_id: self.user_id.clone(),
+                kind: kind as i32,
+                last_seen: 0,
+            }))
+            .await?;
+        Ok(())
+    }
+
     /// Upload a blob (e.g. a PDF) in 64 KiB chunks. Waits for the final
     /// verified `MediaAck`. Returns total bytes stored on the server.
     pub async fn upload_media(

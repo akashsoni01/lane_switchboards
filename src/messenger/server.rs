@@ -254,11 +254,25 @@ pub(super) struct State {
     journal: Option<Mutex<super::journal::Journal>>,
     /// E2EE key directory (multi-device; homed on user's shard in cluster).
     key_directory: Arc<super::key_store::KeyDirectory>,
+    /// user_id -> contact roster for presence filtering. Absent = legacy
+    /// broadcast-to-all. Present (even empty) = only listed contacts.
+    presence_rosters: RwLock<HashMap<String, HashSet<String>>>,
+    /// message_id -> pending group ack aggregation (home shard of group).
+    group_ack_trackers: Mutex<HashMap<String, GroupAckTracker>>,
     /// user_id -> node_id where the user's session lives (cluster mode;
     /// maintained via PeerPresence broadcasts).
     user_locations: RwLock<HashMap<String, String>>,
     /// Outbound peer link tasks (cluster mode only).
     peer_tasks: Option<Arc<StdMutex<HashMap<String, JoinHandle<()>>>>>,
+}
+
+/// Tracks per-member DeliveredAck / ReadAck for one group message.
+struct GroupAckTracker {
+    group_id: String,
+    sender: String,
+    members: HashSet<String>,
+    delivered: HashSet<String>,
+    read: HashSet<String>,
 }
 
 /// A running messenger gateway. Dropping the handle aborts the accept loop.
@@ -445,6 +459,8 @@ impl MessengerServer {
             cluster,
             journal,
             key_directory,
+            presence_rosters: RwLock::new(HashMap::new()),
+            group_ack_trackers: Mutex::new(HashMap::new()),
             user_locations: RwLock::new(HashMap::new()),
             peer_tasks: peer_tasks.clone(),
         });
@@ -782,25 +798,56 @@ async fn broadcast_presence(state: &Arc<State>, user: &str, kind: wire::Presence
     }
 }
 
-/// Send a presence update about `user` to every local online session (roster
-/// model intentionally simple: all online users; contact filtering is a
-/// follow-up).
+/// Send a presence update about `user` to local online sessions that care.
+///
+/// Filtering rules:
+/// - If `user` has a roster: only contacts in that roster receive the update.
+/// - If a recipient has a roster: they only receive updates for contacts they
+///   subscribed to (and always receive their own? — skipped; we never send to self).
+/// - If neither has a roster: legacy broadcast to all online users.
 async fn broadcast_presence_local(state: &Arc<State>, user: &str, kind: wire::PresenceKind) {
-    let last_seen = if kind == wire::PresenceKind::Unavailable { unix_secs() } else { 0 };
+    let last_seen = if kind == wire::PresenceKind::Unavailable {
+        unix_secs()
+    } else {
+        0
+    };
     let pkt = Packet::Presence(wire::Presence {
         user_id: user.to_string(),
         kind: kind as i32,
         last_seen,
     });
+    let rosters = state.presence_rosters.read().await;
     let sessions = state.sessions.read().await;
     for (other, handles) in sessions.iter() {
         if other == user {
+            continue;
+        }
+        if !should_receive_presence(&rosters, user, other) {
             continue;
         }
         for h in handles {
             let _ = h.tx.try_send(pkt.clone());
         }
     }
+}
+
+/// True when `observer` should be notified about presence changes for `subject`.
+fn should_receive_presence(
+    rosters: &HashMap<String, HashSet<String>>,
+    subject: &str,
+    observer: &str,
+) -> bool {
+    // Subject opted into filtering: only their contacts see them.
+    if let Some(subject_roster) = rosters.get(subject) {
+        if !subject_roster.contains(observer) {
+            return false;
+        }
+    }
+    // Observer opted into filtering: only see their contacts.
+    if let Some(observer_roster) = rosters.get(observer) {
+        return observer_roster.contains(subject);
+    }
+    true
 }
 
 /// Deliver `pkt` to `user`: local sessions first; in cluster mode, forward to
@@ -888,6 +935,8 @@ fn message_id_of(pkt: &Packet) -> Option<&str> {
 }
 
 /// Mark a message delivered (tombstone) once the recipient acks it.
+/// Group copies use dedup key `message_id:member` in `seen`, but the packet's
+/// `message_id` field is the original id.
 async fn mark_delivered(state: &Arc<State>, user: &str, message_id: &str) {
     let mut changed = false;
     {
@@ -1143,6 +1192,10 @@ async fn session_loop(
                             .unwrap_or(wire::PresenceKind::Available);
                         broadcast_presence(state, user, kind).await;
                     }
+                    Packet::SubscribePresence(mut s) => {
+                        s.user_id = user.to_string();
+                        handle_subscribe_presence(state, s).await;
+                    }
                     Packet::ChatMessage(mut m) => {
                         m.from_user = user.to_string(); // never trust the client field
                         handle_chat(state, framed, m).await?;
@@ -1319,10 +1372,18 @@ async fn dispatch_peer_packet(state: &Arc<State>, peer_node: &str, pkt: Packet) 
             if is_home(state, &a.from_user) {
                 mark_delivered(state, &a.from_user, &a.message_id).await;
             }
-            broadcast_to_local_sessions(state, &Packet::DeliveredAck(a)).await;
+            if !record_group_ack(state, &a.message_id, &a.from_user, false).await {
+                broadcast_to_local_sessions(state, &Packet::DeliveredAck(a)).await;
+            }
         }
         Packet::ReadAck(a) => {
-            broadcast_to_local_sessions(state, &Packet::ReadAck(a)).await;
+            if !record_group_ack(state, &a.message_id, &a.from_user, true).await {
+                broadcast_to_local_sessions(state, &Packet::ReadAck(a)).await;
+            }
+        }
+        Packet::GroupAckSummary(s) => {
+            let target = s.to_user.clone();
+            deliver_online(state, &target, &Packet::GroupAckSummary(s)).await;
         }
         // Marker for a user syncing on this gateway.
         Packet::SyncComplete(s) => {
@@ -1554,18 +1615,74 @@ async fn handle_delivered_ack(state: &Arc<State>, acking_user: &str, a: wire::De
     if is_home(state, acking_user) {
         mark_delivered(state, acking_user, &a.message_id).await;
     }
-    // Relay the double-tick to the original sender. The stored packet is gone
-    // after tombstoning, so the relay is broadcast-addressed: sessions match
-    // it to their pending sends by message_id.
+    // Group ack aggregation: if this message_id is tracked, update summary
+    // and skip the broadcast-style 1:1 DeliveredAck relay.
+    if record_group_ack(state, &a.message_id, acking_user, false).await {
+        return;
+    }
     let pkt = Packet::DeliveredAck(a);
     broadcast_to_local_sessions(state, &pkt).await;
     send_to_all_peers(state, &pkt);
 }
 
 async fn handle_read_ack(state: &Arc<State>, a: wire::ReadAck) {
+    let acking_user = a.from_user.clone();
+    if record_group_ack(state, &a.message_id, &acking_user, true).await {
+        return;
+    }
     let pkt = Packet::ReadAck(a);
     broadcast_to_local_sessions(state, &pkt).await;
     send_to_all_peers(state, &pkt);
+}
+
+async fn handle_subscribe_presence(state: &Arc<State>, s: wire::SubscribePresence) {
+    let contacts: HashSet<String> = s.contact_ids.into_iter().collect();
+    state
+        .presence_rosters
+        .write()
+        .await
+        .insert(s.user_id, contacts);
+}
+
+/// Record a member's delivered/read ack against a group tracker.
+/// Returns `true` when the message_id is a tracked group send (caller should
+/// not also broadcast the raw 1:1-style ack).
+async fn record_group_ack(
+    state: &Arc<State>,
+    message_id: &str,
+    acking_user: &str,
+    is_read: bool,
+) -> bool {
+    let summary = {
+        let mut trackers = state.group_ack_trackers.lock().await;
+        let Some(t) = trackers.get_mut(message_id) else {
+            return false;
+        };
+        if !t.members.contains(acking_user) {
+            return true; // tracked but unexpected member — swallow
+        }
+        if is_read {
+            t.read.insert(acking_user.to_string());
+            t.delivered.insert(acking_user.to_string()); // read implies delivered
+        } else {
+            t.delivered.insert(acking_user.to_string());
+        }
+        Some(wire::GroupAckSummary {
+            message_id: message_id.to_string(),
+            group_id: t.group_id.clone(),
+            to_user: t.sender.clone(),
+            delivered_by: t.delivered.iter().cloned().collect(),
+            read_by: t.read.iter().cloned().collect(),
+            member_count: t.members.len() as u32,
+        })
+    };
+    if let Some(summary) = summary {
+        let sender = summary.to_user.clone();
+        deliver_online(state, &sender, &Packet::GroupAckSummary(summary)).await;
+        true
+    } else {
+        false
+    }
 }
 
 // ---- Media (bulk data: PDFs, images, …) --------------------------------------
@@ -2088,10 +2205,26 @@ async fn route_group_fanout(state: &Arc<State>, m: wire::GroupMessage) {
 async fn fanout_group(state: &Arc<State>, m: wire::GroupMessage, members: Vec<String>) {
     #[cfg(feature = "metrics")]
     let started = std::time::Instant::now();
-    for member in members {
-        if member == m.from_user {
-            continue;
-        }
+    let recipients: Vec<String> = members
+        .iter()
+        .filter(|u| *u != &m.from_user)
+        .cloned()
+        .collect();
+    // Register ack tracker so DeliveredAck/ReadAck from members roll up.
+    {
+        let mut trackers = state.group_ack_trackers.lock().await;
+        trackers.insert(
+            m.message_id.clone(),
+            GroupAckTracker {
+                group_id: m.group_id.clone(),
+                sender: m.from_user.clone(),
+                members: recipients.iter().cloned().collect(),
+                delivered: HashSet::new(),
+                read: HashSet::new(),
+            },
+        );
+    }
+    for member in recipients {
         let mut copy = m.clone();
         copy.to_user = member.clone();
         copy.seq = 0;
@@ -2107,7 +2240,10 @@ async fn fanout_group(state: &Arc<State>, m: wire::GroupMessage, members: Vec<St
         }
     }
     #[cfg(feature = "metrics")]
-    super::metrics::observe_fanout(started.elapsed());
+    {
+        let _ = started;
+        super::metrics::observe_fanout(started.elapsed());
+    }
 }
 
 /// Persist a per-member group message copy on this node (the member's home)

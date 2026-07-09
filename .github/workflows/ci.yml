@@ -41,6 +41,32 @@ jobs:
           cargo test --features metrics --test metrics_export
           cargo check --examples --features metrics -p lane_switchboards
 
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    # Nightly + cargo-fuzz; smoke only (short budget). Full corpus runs offline.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build fuzz target
+        run: cargo +nightly fuzz build messenger_codec
+        working-directory: .
+        continue-on-error: true
+      - name: Smoke fuzz (30s)
+        run: cargo +nightly fuzz run messenger_codec -- -max_total_time=30
+        continue-on-error: true
+
   promtool:
     runs-on: ubuntu-latest
     steps:
