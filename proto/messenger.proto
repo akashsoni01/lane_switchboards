@@ -284,6 +284,7 @@ message PublishKeys {
 message FetchKeys {
   string user_id = 1;  // whose keys
   string for_user = 2; // requester; set by the server for reply routing
+  string device_id = 3; // empty = most recently published device
 }
 
 // pkt_type = 0x62. Server -> client: one single-use prekey bundle. The
@@ -295,6 +296,13 @@ message KeyBundle {
   string one_time_key = 4;
   string for_user = 5; // reply routing on inter-node links
   bool found = 6;
+  repeated string device_ids = 7; // all published devices (informational)
+}
+
+// pkt_type = 0x63. Client -> server: revoke a device's published keys.
+message RemoveDeviceKeys {
+  string user_id = 1;
+  string device_id = 2;
 }
 
 // Encoded into ChatMessage.body / GroupMessage.body by E2EE clients.
@@ -303,4 +311,19 @@ message EncryptedPayload {
   string sender_key = 1;  // sender's Curve25519 identity key, base64
   uint32 message_type = 2; // 0 = Olm pre-key message, 1 = normal message
   bytes ciphertext = 3;
+}
+
+// Encoded into GroupMessage.body by E2EE clients (Megolm sender-keys).
+// Not a frame type: the server never parses it.
+message EncryptedGroupPayload {
+  string session_id = 1; // Megolm session id (Ed25519 pubkey, base64)
+  bytes ciphertext = 2; // MegolmMessage bytes
+}
+
+// Olm-encrypted 1:1 side-channel for distributing a Megolm session key.
+// Plaintext inside an EncryptedPayload after pairwise decrypt.
+message GroupSessionKeyShare {
+  string group_id = 1;
+  string session_id = 2;
+  string session_key = 3; // SessionKey portable format, base64
 }

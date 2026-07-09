@@ -77,7 +77,12 @@ pub struct ServerConfig {
     /// in memory only. With `Some(dir)`, every message is fsynced to
     /// `dir/inbox.wal` before `ServerAck`, and inboxes are rebuilt (and the
     /// journal compacted) on startup — acked messages survive crashes.
+    /// When set without `keys_storage`, E2EE keys are also persisted under
+    /// `dir/keys/`.
     pub durable_dir: Option<std::path::PathBuf>,
+    /// Optional [`StorageNode`] backing for the E2EE key directory. When set,
+    /// takes precedence over file persistence under `durable_dir`.
+    pub keys_storage: Option<Arc<crate::storage::StorageNode>>,
 }
 
 impl Default for ServerConfig {
@@ -95,6 +100,7 @@ impl Default for ServerConfig {
             auth_backoff_max: Duration::from_secs(30),
             tcp_keepalive: Some(Duration::from_secs(60)),
             durable_dir: None,
+            keys_storage: None,
         }
     }
 }
@@ -220,16 +226,7 @@ pub(super) struct Group {
     pub(super) version: u64,
 }
 
-/// Published E2EE key material for one user (single device per user in this
-/// milestone). The server never sees private keys.
-struct DeviceKeys {
-    device_id: String,
-    identity_key: String,
-    /// Single-use prekeys, consumed one per `FetchKeys`.
-    one_time_keys: Vec<String>,
-}
-
-/// Shared state for one gateway node.
+/// Published E2EE key material lives in [`super::key_store::KeyDirectory`].
 pub(super) struct State {
     cfg: ServerConfig,
     auth: Arc<dyn Authenticator>,
@@ -255,9 +252,8 @@ pub(super) struct State {
     pub(super) cluster: Option<ClusterRuntime>,
     /// Durable inbox journal (None = memory-only inboxes).
     journal: Option<Mutex<super::journal::Journal>>,
-    /// E2EE key directory: user_id -> published public keys (homed on the
-    /// user's home node in cluster mode).
-    key_directory: Mutex<HashMap<String, DeviceKeys>>,
+    /// E2EE key directory (multi-device; homed on user's shard in cluster).
+    key_directory: Arc<super::key_store::KeyDirectory>,
     /// user_id -> node_id where the user's session lives (cluster mode;
     /// maintained via PeerPresence broadcasts).
     user_locations: RwLock<HashMap<String, String>>,
@@ -425,6 +421,14 @@ impl MessengerServer {
             }
         };
 
+        let key_directory = if let Some(storage) = &cfg.keys_storage {
+            Arc::new(super::key_store::KeyDirectory::with_storage(storage.clone()))
+        } else if let Some(dir) = &cfg.durable_dir {
+            Arc::new(super::key_store::KeyDirectory::with_persist_dir(dir).await?)
+        } else {
+            Arc::new(super::key_store::KeyDirectory::memory())
+        };
+
         let state = Arc::new(State {
             cfg,
             auth,
@@ -440,7 +444,7 @@ impl MessengerServer {
             auth_failures: Mutex::new(HashMap::new()),
             cluster,
             journal,
-            key_directory: Mutex::new(HashMap::new()),
+            key_directory,
             user_locations: RwLock::new(HashMap::new()),
             peer_tasks: peer_tasks.clone(),
         });
@@ -1175,6 +1179,10 @@ async fn session_loop(
                         f.for_user = user.to_string();
                         handle_fetch_keys(state, f).await;
                     }
+                    Packet::RemoveDeviceKeys(mut r) => {
+                        r.user_id = user.to_string();
+                        handle_remove_device_keys(state, r).await;
+                    }
                     other => {
                         framed.send(proto_error(
                             wire::ErrorCode::MalformedFrame,
@@ -1356,6 +1364,9 @@ async fn dispatch_peer_packet(state: &Arc<State>, peer_node: &str, pkt: Packet) 
         Packet::FetchKeys(f) => {
             handle_fetch_keys(state, f).await;
         }
+        Packet::RemoveDeviceKeys(r) => {
+            handle_remove_device_keys(state, r).await;
+        }
         Packet::KeyBundle(b) => {
             let target = b.for_user.clone();
             deliver_online(state, &target, &Packet::KeyBundle(b)).await;
@@ -1402,15 +1413,7 @@ async fn handle_publish_keys(state: &Arc<State>, k: wire::PublishKeys) {
         send_to_peer(state, &home, Packet::PublishKeys(k));
         return;
     }
-    let mut dir = state.key_directory.lock().await;
-    dir.insert(
-        k.user_id.clone(),
-        DeviceKeys {
-            device_id: k.device_id,
-            identity_key: k.identity_key,
-            one_time_keys: k.one_time_keys,
-        },
-    );
+    state.key_directory.publish(&k).await;
 }
 
 async fn handle_fetch_keys(state: &Arc<State>, f: wire::FetchKeys) {
@@ -1426,31 +1429,30 @@ async fn handle_fetch_keys(state: &Arc<State>, f: wire::FetchKeys) {
         send_to_peer(state, &home, Packet::FetchKeys(f));
         return;
     }
-    let bundle = {
-        let mut dir = state.key_directory.lock().await;
-        dir.get_mut(&f.user_id)
-            .map(|keys| {
-                let one_time = keys.one_time_keys.pop().unwrap_or_default();
-                let has_keys = !keys.identity_key.is_empty() && !one_time.is_empty();
-                wire::KeyBundle {
-                    user_id: f.user_id.clone(),
-                    device_id: keys.device_id.clone(),
-                    identity_key: keys.identity_key.clone(),
-                    one_time_key: one_time,
-                    for_user: f.for_user.clone(),
-                    found: has_keys,
-                }
-            })
-            .unwrap_or(wire::KeyBundle {
-                user_id: f.user_id.clone(),
-                device_id: String::new(),
-                identity_key: String::new(),
-                one_time_key: String::new(),
-                for_user: f.for_user.clone(),
-                found: false,
-            })
-    };
+    let bundle = state
+        .key_directory
+        .fetch_bundle(&f.user_id, &f.device_id, &f.for_user)
+        .await;
     deliver_online(state, &f.for_user, &Packet::KeyBundle(bundle)).await;
+}
+
+async fn handle_remove_device_keys(state: &Arc<State>, r: wire::RemoveDeviceKeys) {
+    if r.user_id.is_empty() || r.device_id.is_empty() {
+        return;
+    }
+    if !is_home(state, &r.user_id) {
+        let home = state
+            .cluster
+            .as_ref()
+            .map(|c| c.home_of(&r.user_id))
+            .unwrap_or_default();
+        send_to_peer(state, &home, Packet::RemoveDeviceKeys(r));
+        return;
+    }
+    state
+        .key_directory
+        .remove_device(&r.user_id, &r.device_id)
+        .await;
 }
 
 // ---- 1:1 chat ---------------------------------------------------------------

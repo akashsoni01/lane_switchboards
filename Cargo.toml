@@ -32,6 +32,7 @@ tokio = { version = "1.38", features = ["full"] }
 tracing = { version = "0.1", features = ["log", "max_level_info", "release_max_level_warn"] }
 # serde: ServiceRecord and ConsistencyConfig (HTTP/debug fixtures — not on gRPC wire)
 serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
 async-trait = "0.1"
 thiserror = "2"
 # messenger auth tokens (HMAC-SHA256) and media integrity checksums
@@ -50,12 +51,14 @@ rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 prometheus = { version = "0.13", optional = true }
 vodozemac = "0.10.0"
+olm-rs = { version = "2.2.0", optional = true }
 
 [features]
 default = []
 monitor = ["lane_core/monitor"]
 metrics = ["lane_core/metrics", "monitor", "dep:prometheus"]
 watch_sync = []
+libolm-compat = ["dep:olm-rs"]
 tls = [
     "dep:rustls",
     "dep:tokio-rustls",
@@ -238,6 +241,11 @@ required-features = ["metrics"]
 name = "metrics_export"
 path = "tests/metrics_export.rs"
 required-features = ["metrics"]
+
+[[test]]
+name = "libolm_compat"
+path = "tests/libolm_compat.rs"
+required-features = ["libolm-compat"]
 
 [[example]]
 name = "distributed_key_value"

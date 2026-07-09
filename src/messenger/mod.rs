@@ -25,6 +25,7 @@ pub mod client;
 pub mod codec;
 mod cluster;
 mod journal;
+mod key_store;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod e2ee;

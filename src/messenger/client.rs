@@ -434,11 +434,21 @@ impl MessengerClient {
 
     /// Request a peer's prekey bundle from the key directory.
     pub async fn fetch_key_bundle(&mut self, user_id: &str) -> Result<wire::KeyBundle, MessengerError> {
+        self.fetch_key_bundle_for_device(user_id, "").await
+    }
+
+    /// Request a specific device's prekey bundle (`device_id` empty = primary).
+    pub async fn fetch_key_bundle_for_device(
+        &mut self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<wire::KeyBundle, MessengerError> {
         let for_user = self.user_id.clone();
         self.framed
             .send(Packet::FetchKeys(wire::FetchKeys {
                 user_id: user_id.into(),
                 for_user: for_user.clone(),
+                device_id: device_id.into(),
             }))
             .await?;
         match self
@@ -450,6 +460,17 @@ impl MessengerClient {
             Packet::KeyBundle(b) => Ok(b),
             _ => unreachable!(),
         }
+    }
+
+    /// Revoke this device's published keys on the server.
+    pub async fn remove_device_keys(&mut self, device_id: &str) -> Result<(), MessengerError> {
+        self.framed
+            .send(Packet::RemoveDeviceKeys(wire::RemoveDeviceKeys {
+                user_id: self.user_id.clone(),
+                device_id: device_id.into(),
+            }))
+            .await?;
+        Ok(())
     }
 
     /// Publish keys from an [`E2eeDevice`] and mark them published locally.
@@ -496,5 +517,63 @@ impl MessengerClient {
         body: &[u8],
     ) -> Result<Vec<u8>, MessengerError> {
         Ok(e2ee.decrypt_from_sender(from_user, body)?)
+    }
+
+    /// Create a Megolm sender session for `group_id` (returns session id).
+    pub fn create_group_e2ee_session(e2ee: &mut E2eeDevice, group_id: &str) -> String {
+        e2ee.create_group_sender_session(group_id)
+    }
+
+    /// Distribute the group sender key to each member via Olm-encrypted 1:1 chat.
+    pub async fn distribute_group_session_key(
+        &mut self,
+        e2ee: &mut E2eeDevice,
+        group_id: &str,
+        members: &[&str],
+    ) -> Result<(), MessengerError> {
+        let share = e2ee.group_session_key_share(group_id)?;
+        for member in members {
+            if *member == self.user_id {
+                continue;
+            }
+            if !e2ee.has_olm_session(member) {
+                let bundle = self.fetch_key_bundle(member).await?;
+                e2ee.establish_outbound(member, &PeerKeyBundle::from_wire(&bundle)?)?;
+            }
+            let body = e2ee.encrypt_for_peer(member, &share)?;
+            let msg_id = format!("gsk-{group_id}-{member}");
+            self.send_chat_with_media(member, &msg_id, &body, "").await?;
+        }
+        Ok(())
+    }
+
+    /// Send an E2EE group message; `GroupMessage.body` carries Megolm ciphertext.
+    pub async fn send_encrypted_group(
+        &mut self,
+        e2ee: &mut E2eeDevice,
+        group_id: &str,
+        message_id: &str,
+        plaintext: &[u8],
+    ) -> Result<(), MessengerError> {
+        let body = e2ee.encrypt_group_message(group_id, plaintext)?;
+        self.send_group(group_id, message_id, &body).await
+    }
+
+    /// Decrypt a `GroupMessage` body (Megolm).
+    pub fn decrypt_group(
+        e2ee: &mut E2eeDevice,
+        group_id: &str,
+        body: &[u8],
+    ) -> Result<Vec<u8>, MessengerError> {
+        Ok(e2ee.decrypt_group_message(group_id, body)?)
+    }
+
+    /// Handle an incoming 1:1 message that may carry a group session key share.
+    pub fn try_import_group_key_from_chat(
+        e2ee: &mut E2eeDevice,
+        from_user: &str,
+        body: &[u8],
+    ) -> Result<bool, MessengerError> {
+        Ok(e2ee.try_import_group_key_share(from_user, body)?)
     }
 }

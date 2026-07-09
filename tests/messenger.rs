@@ -1111,8 +1111,141 @@ mod e2ee_tests {
     }
 
     #[tokio::test]
+    async fn e2ee_group_megolm_single_node() {
+        let (_server, addr, auth) = boot().await;
+        let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+        let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+        let (mut carol, _) = login(&addr, &auth, "carol", "d1").await;
+
+        let mut alice_e2ee = E2eeDevice::generate();
+        let mut bob_e2ee = E2eeDevice::generate();
+        let mut carol_e2ee = E2eeDevice::generate();
+
+        alice.publish_e2ee_device("d1", &mut alice_e2ee, 5).await.unwrap();
+        bob.publish_e2ee_device("d1", &mut bob_e2ee, 5).await.unwrap();
+        carol.publish_e2ee_device("d1", &mut carol_e2ee, 5).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        alice.create_group("g-e2ee").await.unwrap();
+        alice.add_member("g-e2ee", "bob").await.unwrap();
+        alice.add_member("g-e2ee", "carol").await.unwrap();
+
+        MessengerClient::create_group_e2ee_session(&mut alice_e2ee, "g-e2ee");
+        alice
+            .distribute_group_session_key(
+                &mut alice_e2ee,
+                "g-e2ee",
+                &["bob", "carol"],
+            )
+            .await
+            .unwrap();
+
+        for (client, e2ee) in [(&mut bob, &mut bob_e2ee), (&mut carol, &mut carol_e2ee)] {
+            let pkt = client
+                .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+                .await
+                .unwrap();
+            if let Packet::ChatMessage(m) = pkt {
+                assert!(MessengerClient::try_import_group_key_from_chat(
+                    e2ee,
+                    "alice",
+                    &m.body
+                )
+                .unwrap());
+            }
+        }
+
+        let secret = b"encrypted group payload";
+        alice
+            .send_encrypted_group(&mut alice_e2ee, "g-e2ee", "gm-e2ee-1", secret)
+            .await
+            .unwrap();
+
+        for (name, client, e2ee) in [
+            ("bob", &mut bob, &mut bob_e2ee),
+            ("carol", &mut carol, &mut carol_e2ee),
+        ] {
+            let pkt = client
+                .recv_until(|p| matches!(p, Packet::GroupMessage(g) if g.message_id == "gm-e2ee-1"))
+                .await
+                .unwrap_or_else(|e| panic!("{name} missed group message: {e}"));
+            if let Packet::GroupMessage(m) = pkt {
+                assert!(E2eeDevice::is_encrypted_group_body(&m.body));
+                assert!(!E2eeDevice::body_contains_substring(&m.body, secret));
+                let plain = MessengerClient::decrypt_group(e2ee, "g-e2ee", &m.body).unwrap();
+                assert_eq!(plain, secret);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_device_key_directory() {
+        let (_server, addr, auth) = boot().await;
+        let (mut alice, _) = login(&addr, &auth, "alice", "phone").await;
+        let (mut bob, _) = login(&addr, &auth, "bob", "d1").await;
+
+        let mut phone_e2ee = E2eeDevice::generate();
+        let mut laptop_e2ee = E2eeDevice::generate();
+
+        alice
+            .publish_e2ee_device("phone", &mut phone_e2ee, 3)
+            .await
+            .unwrap();
+        alice
+            .publish_e2ee_device("laptop", &mut laptop_e2ee, 3)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let laptop_bundle = bob.fetch_key_bundle_for_device("alice", "laptop").await.unwrap();
+        assert!(laptop_bundle.found);
+        assert_eq!(laptop_bundle.device_id, "laptop");
+        assert_eq!(laptop_bundle.device_ids.len(), 2);
+
+        let primary = bob.fetch_key_bundle("alice").await.unwrap();
+        assert!(primary.found);
+        assert_eq!(primary.device_id, "laptop");
+    }
+
+    #[tokio::test]
+    async fn keys_survive_restart_via_durable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = HmacAuthenticator::new(SECRET);
+        let cfg = ServerConfig {
+            durable_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg)
+            .await
+            .expect("bind");
+        let addr = server.local_addr().to_string();
+
+        {
+            let (mut alice, _) = login(&addr, &auth, "alice", "d1").await;
+            let mut e2ee = E2eeDevice::generate();
+            alice.publish_e2ee_device("d1", &mut e2ee, 2).await.unwrap();
+        }
+        drop(server);
+
+        let cfg = ServerConfig {
+            durable_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let _server = MessengerServer::bind("127.0.0.1:0", Arc::new(auth.clone()), cfg)
+            .await
+            .expect("rebind");
+        let addr2 = _server.local_addr().to_string();
+
+        let (mut bob, _) = login(&addr2, &auth, "bob", "d1").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let bundle = bob.fetch_key_bundle("alice").await.unwrap();
+        assert!(bundle.found);
+        assert_eq!(bundle.device_id, "d1");
+    }
+
+    #[tokio::test]
     async fn e2ee_chat_cross_node_cluster() {
-        use lane_switchboards::messenger::{ClusterConfig, E2eeDevice, PeerAddr};
+        use lane_switchboards::messenger::{ClusterConfig, PeerAddr};
 
         const PEER_SECRET: &str = "e2ee-peer-secret";
         let auth = HmacAuthenticator::new(SECRET);
@@ -1127,7 +1260,10 @@ mod e2ee_tests {
                 .iter()
                 .enumerate()
                 .filter(|(j, _)| *j != i)
-                .map(|(j, a)| PeerAddr { node_id: format!("node-{j}"), addr: a.clone() })
+                .map(|(j, a)| PeerAddr {
+                    node_id: format!("node-{j}"),
+                    addr: a.clone(),
+                })
                 .collect();
             servers.push(
                 MessengerServer::bind_cluster(
@@ -1148,12 +1284,20 @@ mod e2ee_tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let (mut alice, _) = MessengerClient::connect(
-            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+            &addrs[0],
+            "alice",
+            "d1",
+            &auth.mint_token("alice", "d1"),
+            0,
         )
         .await
         .unwrap();
         let (mut bob, _) = MessengerClient::connect(
-            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+            &addrs[1],
+            "bob",
+            "d1",
+            &auth.mint_token("bob", "d1"),
+            0,
         )
         .await
         .unwrap();

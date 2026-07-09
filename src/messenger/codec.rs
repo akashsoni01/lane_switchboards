@@ -61,6 +61,7 @@ pub enum PacketType {
     PublishKeys = 0x60,
     FetchKeys = 0x61,
     KeyBundle = 0x62,
+    RemoveDeviceKeys = 0x63,
 }
 
 impl TryFrom<u8> for PacketType {
@@ -96,6 +97,7 @@ impl TryFrom<u8> for PacketType {
             0x60 => Self::PublishKeys,
             0x61 => Self::FetchKeys,
             0x62 => Self::KeyBundle,
+            0x63 => Self::RemoveDeviceKeys,
             other => return Err(MessengerError::UnknownPacketType(other)),
         })
     }
@@ -132,6 +134,7 @@ pub enum Packet {
     PublishKeys(wire::PublishKeys),
     FetchKeys(wire::FetchKeys),
     KeyBundle(wire::KeyBundle),
+    RemoveDeviceKeys(wire::RemoveDeviceKeys),
 }
 
 impl Packet {
@@ -166,6 +169,7 @@ impl Packet {
             Packet::PublishKeys(_) => PacketType::PublishKeys,
             Packet::FetchKeys(_) => PacketType::FetchKeys,
             Packet::KeyBundle(_) => PacketType::KeyBundle,
+            Packet::RemoveDeviceKeys(_) => PacketType::RemoveDeviceKeys,
         }
     }
 
@@ -199,6 +203,7 @@ impl Packet {
             Packet::PublishKeys(m) => m.encoded_len(),
             Packet::FetchKeys(m) => m.encoded_len(),
             Packet::KeyBundle(m) => m.encoded_len(),
+            Packet::RemoveDeviceKeys(m) => m.encoded_len(),
         }
     }
 
@@ -233,6 +238,7 @@ impl Packet {
             Packet::PublishKeys(m) => m.encode(buf),
             Packet::FetchKeys(m) => m.encode(buf),
             Packet::KeyBundle(m) => m.encode(buf),
+            Packet::RemoveDeviceKeys(m) => m.encode(buf),
         };
         debug_assert!(r.is_ok(), "BytesMut encode cannot fail");
     }
@@ -273,6 +279,9 @@ impl Packet {
             PacketType::PublishKeys => Packet::PublishKeys(wire::PublishKeys::decode(payload)?),
             PacketType::FetchKeys => Packet::FetchKeys(wire::FetchKeys::decode(payload)?),
             PacketType::KeyBundle => Packet::KeyBundle(wire::KeyBundle::decode(payload)?),
+            PacketType::RemoveDeviceKeys => {
+                Packet::RemoveDeviceKeys(wire::RemoveDeviceKeys::decode(payload)?)
+            }
         })
     }
 }
@@ -489,6 +498,7 @@ mod tests {
         round_trip(Packet::FetchKeys(wire::FetchKeys {
             user_id: "john".into(),
             for_user: "akash".into(),
+            device_id: "d2".into(),
         }));
         round_trip(Packet::KeyBundle(wire::KeyBundle {
             user_id: "john".into(),
@@ -497,6 +507,11 @@ mod tests {
             one_time_key: "otk".into(),
             for_user: "akash".into(),
             found: true,
+            device_ids: vec!["d1".into(), "d2".into()],
+        }));
+        round_trip(Packet::RemoveDeviceKeys(wire::RemoveDeviceKeys {
+            user_id: "akash".into(),
+            device_id: "d1".into(),
         }));
     }
 

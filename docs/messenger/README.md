@@ -13,7 +13,8 @@ overview, then dive into the layer you care about.
 | [05_cluster.md](05_cluster.md) | Multi-node topology, home shards, peer links, cross-node flows |
 | [06_offline_store.md](06_offline_store.md) | Inbox model, durable WAL journal, crash recovery |
 | [09_operations.md](09_operations.md) | Scaling, observability, runbooks, benchmarks |
-| [10_e2ee.md](10_e2ee.md) | Olm E2EE: key directory, encrypted payloads, client API |
+| [10_e2ee.md](10_e2ee.md) | Olm + Megolm E2EE: key directory, encrypted payloads, client API |
+| [11_security_review.md](11_security_review.md) | Pre-production E2EE security checklist |
 | [limits.md](limits.md) | Every configurable limit with defaults and rationale |
 
 Code map:
