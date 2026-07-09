@@ -96,13 +96,13 @@ keeps the highest group version.
 
 ## Current limitations
 
-- Media blobs are stored on the uploader's gateway only; `MediaFetch` must
-  hit that node. Content-addressed replicated storage is Phase 6 work.
+- Media blobs are stored in memory on the uploader's gateway; cross-node
+  `MediaFetch` relays over the peer mesh but blobs are not replicated.
 - Group-operation errors (e.g. non-admin add) are logged on the home node
   but not relayed to remote actors; the client times out instead of getting
   a typed error.
-- Peer links are plain TCP; TLS between nodes is a follow-up (client TLS is
-  supported).
+- Client sockets support TLS (`bind_tls`); peer links support TLS via
+  `bind_cluster_tls`. Plain TCP remains the default for local development.
 
 ## Tests
 

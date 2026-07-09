@@ -936,6 +936,134 @@ mod cluster_tests {
         };
         assert!(got, "offline message survives join rebalance");
     }
+
+    #[tokio::test]
+    async fn cross_node_media_fetch() {
+        let (_servers, addrs, auth) = boot_cluster(2).await;
+        let pdf = b"%PDF-1.4 cluster media";
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        alice
+            .upload_media("pdf-x", "doc.pdf", "application/pdf", pdf)
+            .await
+            .expect("upload on node 0");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (mut bob, _) = MessengerClient::connect(
+            &addrs[1], "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .unwrap();
+        let dl = bob.fetch_media("pdf-x").await.expect("fetch from node 1");
+        assert_eq!(dl.data, pdf);
+        assert_eq!(dl.mime_type, "application/pdf");
+    }
+
+    #[tokio::test]
+    async fn node_failure_during_traffic() {
+        let (mut servers, addrs, auth) = boot_cluster(3).await;
+
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        alice.send_chat("bob", "chaos-0", b"x").await.expect("seed");
+        let home_idx = home_index(&servers, "bob").await.expect("bob homed");
+        let victim = (home_idx + 1) % servers.len();
+
+        for i in 1..10 {
+            let mid = format!("chaos-{i}");
+            alice.send_chat("bob", &mid, b"x").await.expect("send");
+            if i == 5 {
+                let doomed = servers.remove(victim);
+                let victim_id = if victim == 0 {
+                    "node-0"
+                } else if victim == 1 {
+                    "node-1"
+                } else {
+                    "node-2"
+                };
+                tokio::spawn(async move { doomed.shutdown().await });
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                for s in &servers {
+                    s.remove_peer(victim_id).await.expect("drop failed node");
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+
+        let login_addr = &addrs[(home_idx + 2) % addrs.len()];
+        let (mut bob, outcome) = MessengerClient::connect(
+            login_addr, "bob", "d1", &auth.mint_token("bob", "d1"), 0,
+        )
+        .await
+        .expect("bob login after node loss");
+
+        for i in 0..10 {
+            let mid = format!("chaos-{i}");
+            let got = outcome.replayed.iter().any(|p| {
+                matches!(p, Packet::ChatMessage(m) if m.message_id == mid)
+            }) || matches!(
+                bob.recv_until(|p| matches!(p, Packet::ChatMessage(m) if m.message_id == mid))
+                    .await,
+                Ok(_)
+            );
+            assert!(got, "missing {mid} after non-home node failure");
+        }
+    }
+
+    #[tokio::test]
+    async fn soak_short_burst() {
+        let (_servers, addrs, auth) = boot_cluster(2).await;
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut n = 0u64;
+        while tokio::time::Instant::now() < deadline {
+            alice
+                .send_chat("bob", &format!("soak-{n}"), b"z")
+                .await
+                .expect("send under load");
+            n += 1;
+        }
+        assert!(n >= 20, "expected sustained throughput, got {n} msgs");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual soak: cargo test soak_sustained -- --ignored"]
+    async fn soak_sustained() {
+        let (_servers, addrs, auth) = boot_cluster(2).await;
+        let (mut alice, _) = MessengerClient::connect(
+            &addrs[0], "alice", "d1", &auth.mint_token("alice", "d1"), 0,
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut n = 0u64;
+        while tokio::time::Instant::now() < deadline {
+            alice
+                .send_chat("bob", &format!("long-{n}"), b"z")
+                .await
+                .expect("send");
+            n += 1;
+            if n % 100 == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        assert!(n >= 500);
+    }
 }
 
 // ---- TLS (feature = "tls") ---------------------------------------------------------
@@ -1051,6 +1179,113 @@ mod tls_tests {
         let token = auth.mint_token("alice", "d1");
         let res = MessengerClient::connect(&addr, "alice", "d1", &token, 0).await;
         assert!(res.is_err(), "plaintext client must be rejected by TLS gateway");
+    }
+
+    #[tokio::test]
+    async fn cluster_peer_links_over_tls() {
+        use lane_switchboards::messenger::{ClusterConfig, PeerAddr};
+
+        let (cert, key) = make_cert();
+        let server_cfg = lane_switchboards::tls::server_config_from_pem(
+            cert.path(),
+            key.path(),
+            None::<&std::path::Path>,
+        )
+        .unwrap();
+        let acceptor = lane_switchboards::tls::build_acceptor(server_cfg);
+        let client_cfg = lane_switchboards::tls::client_config_from_pem(
+            Some(cert.path()),
+            None::<&std::path::Path>,
+            None::<&std::path::Path>,
+        )
+        .unwrap();
+        let connector = lane_switchboards::tls::build_connector(client_cfg);
+
+        let auth = HmacAuthenticator::new(SECRET);
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a0 = l0.local_addr().unwrap().to_string();
+        let a1 = l1.local_addr().unwrap().to_string();
+        drop(l0);
+        drop(l1);
+
+        let _s0 = MessengerServer::bind_cluster_tls(
+            &a0,
+            Arc::new(auth.clone()),
+            ServerConfig::default(),
+            ClusterConfig {
+                node_id: "node-0".into(),
+                peers: vec![PeerAddr { node_id: "node-1".into(), addr: a1.clone() }],
+                peer_secret: "peer-tls-secret".into(),
+            },
+            Some(acceptor.clone()),
+            Some(connector.clone()),
+        )
+        .await
+        .unwrap();
+        let s1 = MessengerServer::bind_cluster_tls(
+            &a1,
+            Arc::new(auth.clone()),
+            ServerConfig::default(),
+            ClusterConfig {
+                node_id: "node-1".into(),
+                peers: vec![PeerAddr { node_id: "node-0".into(), addr: a0.clone() }],
+                peer_secret: "peer-tls-secret".into(),
+            },
+            Some(acceptor),
+            Some(connector),
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(s1.is_ready().await);
+
+        let (mut alice, _) = MessengerClient::connect_tls(
+            &a0,
+            Some(&lane_switchboards::tls::build_connector(
+                lane_switchboards::tls::client_config_from_pem(
+                    Some(cert.path()),
+                    None::<&std::path::Path>,
+                    None::<&std::path::Path>,
+                )
+                .unwrap(),
+            )),
+            "alice",
+            "d1",
+            &auth.mint_token("alice", "d1"),
+            0,
+        )
+        .await
+        .unwrap();
+        let (mut bob, _) = MessengerClient::connect_tls(
+            &a1,
+            Some(&lane_switchboards::tls::build_connector(
+                lane_switchboards::tls::client_config_from_pem(
+                    Some(cert.path()),
+                    None::<&std::path::Path>,
+                    None::<&std::path::Path>,
+                )
+                .unwrap(),
+            )),
+            "bob",
+            "d1",
+            &auth.mint_token("bob", "d1"),
+            0,
+        )
+        .await
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        alice.send_chat("bob", "tls-peer", b"over tls mesh").await.unwrap();
+        let pkt = bob
+            .recv_until(|p| matches!(p, Packet::ChatMessage(_)))
+            .await
+            .unwrap();
+        match pkt {
+            Packet::ChatMessage(m) => assert_eq!(m.body, b"over tls mesh"),
+            _ => unreachable!(),
+        }
     }
 }
 

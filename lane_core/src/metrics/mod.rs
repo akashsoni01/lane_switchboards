@@ -93,6 +93,11 @@ impl MetricsHub {
     }
 }
 
+/// Process-wide registry for registering additional metric families (e.g. messenger).
+pub fn shared_registry() -> &'static Registry {
+    &HUB.registry
+}
+
 fn actor_metrics() -> &'static ActorMetricsRegistry {
     &HUB.actor
 }

@@ -258,6 +258,12 @@ message PeerHandoffGroup {
   uint64 version = 4;
 }
 
+// pkt_type = 0x57. Gossip: a completed media blob is stored on `node_id`.
+message PeerMediaReady {
+  string media_id = 1;
+  string node_id = 2;
+}
+
 // ---- End-to-end encryption key directory --------------------------------------
 //
 // The server only stores and hands out public key material; message bodies

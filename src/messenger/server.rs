@@ -31,6 +31,8 @@ use tracing::{debug, info, warn};
 
 use crate::hash_ring::{HashRing, RingNode};
 use crate::stream::{self, MaybeTlsStream, TlsAcceptor};
+#[cfg(feature = "tls")]
+use crate::stream::TlsConnector;
 
 use super::auth::HmacAuthenticator;
 use super::cluster::{self, ClusterRuntime};
@@ -143,6 +145,8 @@ pub(super) fn send_to_peer(state: &State, node_id: &str, pkt: Packet) {
         Some(tx) => {
             if let Err(e) = tx.try_send(pkt) {
                 warn!(node_id, error = %e, "peer link backpressure: frame dropped");
+                #[cfg(feature = "metrics")]
+                super::metrics::record_dropped_frame();
             }
         }
         None => warn!(node_id, "unknown peer node"),
@@ -237,6 +241,10 @@ pub(super) struct State {
     pub(super) inboxes: Mutex<HashMap<String, Inbox>>,
     /// media_id -> blob (in-memory store; swap for StorageNode later).
     media: Mutex<HashMap<String, MediaBlob>>,
+    /// media_id -> gateway node_id that completed the upload (cluster gossip).
+    media_owners: Mutex<HashMap<String, String>>,
+    /// media_id -> client session queue while a cross-node fetch is pending.
+    media_relays: Mutex<HashMap<String, mpsc::Sender<Packet>>>,
     pub(super) groups: Mutex<HashMap<String, Group>>,
     session_ids: AtomicU64,
     /// source IP -> (window start, connections accepted in window).
@@ -297,7 +305,14 @@ impl MessengerServer {
         cfg: ServerConfig,
         tls: Option<TlsAcceptor>,
     ) -> Result<Self, MessengerError> {
-        Self::bind_inner(addr, auth, cfg, tls, None).await
+        #[cfg(feature = "tls")]
+        {
+            Self::bind_inner(addr, auth, cfg, tls, None, None).await
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Self::bind_inner(addr, auth, cfg, tls, None).await
+        }
     }
 
     /// Bind `addr` as one node of a multi-node cluster. Peer links are
@@ -308,7 +323,27 @@ impl MessengerServer {
         cfg: ServerConfig,
         cluster: ClusterConfig,
     ) -> Result<Self, MessengerError> {
-        Self::bind_inner(addr, auth, cfg, None, Some(cluster)).await
+        #[cfg(feature = "tls")]
+        {
+            Self::bind_inner(addr, auth, cfg, None, Some(cluster), None).await
+        }
+        #[cfg(not(feature = "tls"))]
+        {
+            Self::bind_inner(addr, auth, cfg, None, Some(cluster)).await
+        }
+    }
+
+    /// Cluster bind with TLS on client sockets and peer links (`feature = "tls"`).
+    #[cfg(feature = "tls")]
+    pub async fn bind_cluster_tls(
+        addr: &str,
+        auth: Arc<dyn Authenticator>,
+        cfg: ServerConfig,
+        cluster: ClusterConfig,
+        tls: Option<TlsAcceptor>,
+        peer_tls: Option<TlsConnector>,
+    ) -> Result<Self, MessengerError> {
+        Self::bind_inner(addr, auth, cfg, tls, Some(cluster), peer_tls).await
     }
 
     async fn bind_inner(
@@ -317,13 +352,19 @@ impl MessengerServer {
         cfg: ServerConfig,
         tls: Option<TlsAcceptor>,
         cluster_cfg: Option<ClusterConfig>,
+        #[cfg(feature = "tls")] peer_tls: Option<TlsConnector>,
     ) -> Result<Self, MessengerError> {
         let listener = TcpListener::bind(addr).await?;
         let addr = listener.local_addr()?;
 
+        #[cfg(feature = "metrics")]
+        super::metrics::init();
+
         // Build cluster state: ring over all node ids + one reconnecting
         // outbound link task per peer.
         let mut peer_tasks_map: HashMap<String, JoinHandle<()>> = HashMap::new();
+        #[cfg(feature = "tls")]
+        let peer_tls_arc = peer_tls.map(std::sync::Arc::new);
         let cluster = cluster_cfg.map(|cc| {
             let mut ring = HashRing::new(64);
             ring.add_node(RingNode::new(cc.node_id.clone(), "local", 0));
@@ -340,6 +381,8 @@ impl MessengerServer {
                         peer.clone(),
                         peer_auth.mint_token(&cc.node_id, "peer"),
                         rx,
+                        #[cfg(feature = "tls")]
+                        peer_tls_arc.clone(),
                     )),
                 );
             }
@@ -350,6 +393,8 @@ impl MessengerServer {
                 ring: StdRwLock::new(ring),
                 peer_txs: StdRwLock::new(peer_txs),
                 peer_auth,
+                #[cfg(feature = "tls")]
+                peer_tls: peer_tls_arc,
             }
         });
         let peer_tasks = cluster.as_ref().map(|_| Arc::new(StdMutex::new(peer_tasks_map)));
@@ -387,6 +432,8 @@ impl MessengerServer {
             last_seen: RwLock::new(HashMap::new()),
             inboxes: Mutex::new(seeded_inboxes),
             media: Mutex::new(HashMap::new()),
+            media_owners: Mutex::new(HashMap::new()),
+            media_relays: Mutex::new(HashMap::new()),
             groups: Mutex::new(HashMap::new()),
             session_ids: AtomicU64::new(1),
             conn_rate: Mutex::new(HashMap::new()),
@@ -500,6 +547,92 @@ impl MessengerServer {
             .unwrap_or(1)
     }
 
+    /// Stable node id (`"local"` on single-node deployments).
+    pub fn node_id(&self) -> String {
+        self.state
+            .cluster
+            .as_ref()
+            .map(|c| c.node_id.clone())
+            .unwrap_or_else(|| "local".into())
+    }
+
+    /// Live client session count on this gateway.
+    pub async fn connected_sessions(&self) -> usize {
+        self.state
+            .sessions
+            .read()
+            .await
+            .values()
+            .map(|v| v.len())
+            .sum()
+    }
+
+    /// Readiness: accept loop running and all configured peer links established.
+    pub async fn is_ready(&self) -> bool {
+        if self.accept_task.is_finished() {
+            return false;
+        }
+        let Some(cluster) = self.state.cluster.as_ref() else {
+            return true;
+        };
+        let expected = cluster.node_count().saturating_sub(1);
+        cluster
+            .peer_txs
+            .read()
+            .ok()
+            .is_some_and(|t| t.len() >= expected)
+    }
+
+    /// HTTP `/health`, `/ready`, and `/metrics` (includes messenger series when
+    /// built with `feature = "metrics"`).
+    pub async fn serve_observability(&self, addr: &str) -> Result<(), MessengerError> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(addr).await?;
+        let state = self.state.clone();
+        info!(%addr, "messenger observability listening");
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let state = state.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body): (&str, String) = if req.starts_with("GET /metrics") {
+                    #[cfg(feature = "metrics")]
+                    {
+                        sync_messenger_scrape_gauges(&state).await;
+                        match lane_core::metrics::render_prometheus_text() {
+                            Ok(text) => ("200 OK", text),
+                            Err(e) => ("500 Internal Server Error", format!("render error: {e}")),
+                        }
+                    }
+                    #[cfg(not(feature = "metrics"))]
+                    {
+                        ("501 Not Implemented", "metrics feature disabled".into())
+                    }
+                } else if req.starts_with("GET /ready") {
+                    let ready = gateway_ready(&state).await;
+                    if ready {
+                        ("200 OK", "ready".into())
+                    } else {
+                        ("503 Service Unavailable", "not ready".into())
+                    }
+                } else if req.starts_with("GET /health") {
+                    ("200 OK", "ok".into())
+                } else {
+                    ("404 Not Found", "not found".into())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    }
+
     /// Graceful shutdown: stop accepting new connections, then close every
     /// session. Outbound queues drain because closing the sender side lets
     /// each session loop flush already-queued frames and return.
@@ -525,6 +658,47 @@ impl MessengerServer {
             last_seen.insert(user, now);
         }
         info!("messenger gateway shut down");
+    }
+}
+
+fn metric_node(state: &State) -> String {
+    state
+        .cluster
+        .as_ref()
+        .map(|c| c.node_id.clone())
+        .unwrap_or_else(|| "local".into())
+}
+
+async fn gateway_ready(state: &State) -> bool {
+    state.cluster.as_ref().map_or(true, |cluster| {
+        let expected = cluster.node_count().saturating_sub(1);
+        cluster
+            .peer_txs
+            .read()
+            .ok()
+            .is_some_and(|t| t.len() >= expected)
+    })
+}
+
+#[cfg(feature = "metrics")]
+async fn sync_messenger_scrape_gauges(state: &State) {
+    let node = metric_node(state);
+    let sessions = state
+        .sessions
+        .read()
+        .await
+        .values()
+        .map(|v| v.len())
+        .sum::<usize>();
+    super::metrics::set_sessions(&node, sessions as i64);
+    if let Some(cluster) = state.cluster.as_ref() {
+        let links = cluster.peer_txs.read().ok().map(|t| t.len()).unwrap_or(0);
+        super::metrics::set_peer_links(links as i64);
+    }
+    let inboxes = state.inboxes.lock().await;
+    for (user, inbox) in inboxes.iter() {
+        let depth = inbox.pending.iter().filter(|m| !m.delivered).count();
+        super::metrics::set_inbox_depth(&node, &super::metrics::hash_user_id(user), depth as i64);
     }
 }
 
@@ -984,7 +1158,7 @@ async fn session_loop(
                         handle_media_chunk(state, framed, &mut upload, c).await?;
                     }
                     Packet::MediaFetch(f) => {
-                        handle_media_fetch(state, framed, f).await?;
+                        handle_media_fetch(state, framed, f, user, session_id).await?;
                     }
                     Packet::GroupEvent(ev) => {
                         handle_group_event(state, framed, user, ev).await?;
@@ -1163,6 +1337,19 @@ async fn dispatch_peer_packet(state: &Arc<State>, peer_node: &str, pkt: Packet) 
         Packet::PeerHandoffGroup(h) => {
             cluster::merge_handoff_group(state, h).await;
         }
+        Packet::PeerMediaReady(m) => {
+            state
+                .media_owners
+                .lock()
+                .await
+                .insert(m.media_id, m.node_id);
+        }
+        Packet::MediaFetch(f) => {
+            stream_media_to_peer(state, peer_node, f).await;
+        }
+        Packet::MediaStart(_) | Packet::MediaChunk(_) => {
+            relay_media_from_peer(state, &pkt).await;
+        }
         Packet::PublishKeys(k) => {
             handle_publish_keys(state, k).await;
         }
@@ -1294,6 +1481,8 @@ async fn handle_chat(
     }
 
     // Persist first (ServerAck must mean "durable"), then attempt delivery.
+    #[cfg(feature = "metrics")]
+    let ack_timer = super::metrics::AckTimer::start(metric_node(state));
     let seq = store_message(state, &to_user, &message_id, |seq| {
         let mut stored = m.clone();
         stored.seq = seq;
@@ -1325,6 +1514,8 @@ async fn handle_chat(
             deliver_online(state, &to_user, &Packet::ChatMessage(delivered)).await;
         }
     }
+    #[cfg(feature = "metrics")]
+    ack_timer.observe();
     Ok(())
 }
 
@@ -1491,8 +1682,10 @@ async fn handle_media_chunk(
                 } else {
                     blob.complete = true;
                     *upload = None;
+                    let media_id = c.media_id.clone();
+                    announce_media_ready(state, &media_id).await;
                     wire::MediaAck {
-                        media_id: c.media_id.clone(),
+                        media_id,
                         ok: true,
                         complete: true,
                         received_bytes: received,
@@ -1514,34 +1707,91 @@ async fn handle_media_chunk(
     Ok(())
 }
 
+async fn announce_media_ready(state: &Arc<State>, media_id: &str) {
+    let node_id = metric_node(state);
+    state
+        .media_owners
+        .lock()
+        .await
+        .insert(media_id.to_string(), node_id.clone());
+    if state.cluster.is_some() {
+        send_to_all_peers(
+            state,
+            &Packet::PeerMediaReady(wire::PeerMediaReady {
+                media_id: media_id.to_string(),
+                node_id,
+            }),
+        );
+    }
+}
+
 async fn handle_media_fetch(
     state: &Arc<State>,
     framed: &mut ClientFramed,
     f: wire::MediaFetch,
+    user: &str,
+    session_id: u64,
 ) -> Result<(), MessengerError> {
-    // Copy out under the lock, stream without holding it.
-    let blob = {
-        let media = state.media.lock().await;
-        match media.get(&f.media_id) {
-            Some(b) if b.complete => Some((
+    if let Some(blob) = load_complete_media(state, &f.media_id).await {
+        stream_media_to_client(framed, &f.media_id, f.from_offset, blob).await?;
+        return Ok(());
+    }
+    if let Some(owner) = state.media_owners.lock().await.get(&f.media_id).cloned() {
+        if state.cluster.as_ref().is_some_and(|c| owner != c.node_id) {
+            let relay_tx = state
+                .sessions
+                .read()
+                .await
+                .get(user)
+                .and_then(|handles| {
+                    handles
+                        .iter()
+                        .find(|h| h.session_id == session_id)
+                        .map(|h| h.tx.clone())
+                });
+            if let Some(tx) = relay_tx {
+                state.media_relays.lock().await.insert(f.media_id.clone(), tx);
+            }
+            send_to_peer(state, &owner, Packet::MediaFetch(f));
+            return Ok(());
+        }
+    }
+    framed
+        .send(proto_error(wire::ErrorCode::MediaTransferFailed, "unknown or incomplete media"))
+        .await?;
+    Ok(())
+}
+
+async fn load_complete_media(
+    state: &Arc<State>,
+    media_id: &str,
+) -> Option<(String, String, u64, String, Vec<u8>)> {
+    let media = state.media.lock().await;
+    media.get(media_id).and_then(|b| {
+        if b.complete {
+            Some((
                 b.file_name.clone(),
                 b.mime_type.clone(),
                 b.total_size,
                 b.sha256.clone(),
                 b.data.clone(),
-            )),
-            _ => None,
+            ))
+        } else {
+            None
         }
-    };
-    let Some((file_name, mime_type, total_size, sha256, data)) = blob else {
-        framed
-            .send(proto_error(wire::ErrorCode::MediaTransferFailed, "unknown or incomplete media"))
-            .await?;
-        return Ok(());
-    };
+    })
+}
+
+async fn stream_media_to_client(
+    framed: &mut ClientFramed,
+    media_id: &str,
+    from_offset: u64,
+    blob: (String, String, u64, String, Vec<u8>),
+) -> Result<(), MessengerError> {
+    let (file_name, mime_type, total_size, sha256, data) = blob;
     framed
         .send(Packet::MediaStart(wire::MediaStart {
-            media_id: f.media_id.clone(),
+            media_id: media_id.to_string(),
             file_name,
             mime_type,
             total_size,
@@ -1549,13 +1799,13 @@ async fn handle_media_fetch(
         }))
         .await?;
     const CHUNK: usize = 64 * 1024;
-    let start = (f.from_offset as usize).min(data.len());
+    let start = (from_offset as usize).min(data.len());
     let mut offset = start;
     while offset < data.len() {
         let end = (offset + CHUNK).min(data.len());
         framed
             .send(Packet::MediaChunk(wire::MediaChunk {
-                media_id: f.media_id.clone(),
+                media_id: media_id.to_string(),
                 offset: offset as u64,
                 data: data[offset..end].to_vec(),
                 last: end == data.len(),
@@ -1566,7 +1816,7 @@ async fn handle_media_fetch(
     if data.is_empty() || start >= data.len() {
         framed
             .send(Packet::MediaChunk(wire::MediaChunk {
-                media_id: f.media_id,
+                media_id: media_id.to_string(),
                 offset: data.len() as u64,
                 data: Vec::new(),
                 last: true,
@@ -1574,6 +1824,68 @@ async fn handle_media_fetch(
             .await?;
     }
     Ok(())
+}
+
+async fn stream_media_to_peer(state: &Arc<State>, peer_node: &str, f: wire::MediaFetch) {
+    let Some(blob) = load_complete_media(state, &f.media_id).await else {
+        return;
+    };
+    let (file_name, mime_type, total_size, sha256, data) = blob;
+    send_to_peer(
+        state,
+        peer_node,
+        Packet::MediaStart(wire::MediaStart {
+            media_id: f.media_id.clone(),
+            file_name,
+            mime_type,
+            total_size,
+            sha256,
+        }),
+    );
+    const CHUNK: usize = 64 * 1024;
+    let start = (f.from_offset as usize).min(data.len());
+    let mut offset = start;
+    while offset < data.len() {
+        let end = (offset + CHUNK).min(data.len());
+        send_to_peer(
+            state,
+            peer_node,
+            Packet::MediaChunk(wire::MediaChunk {
+                media_id: f.media_id.clone(),
+                offset: offset as u64,
+                data: data[offset..end].to_vec(),
+                last: end == data.len(),
+            }),
+        );
+        offset = end;
+    }
+    if data.is_empty() || start >= data.len() {
+        send_to_peer(
+            state,
+            peer_node,
+            Packet::MediaChunk(wire::MediaChunk {
+                media_id: f.media_id,
+                offset: data.len() as u64,
+                data: Vec::new(),
+                last: true,
+            }),
+        );
+    }
+}
+
+async fn relay_media_from_peer(state: &Arc<State>, pkt: &Packet) {
+    let media_id = match pkt {
+        Packet::MediaStart(s) => &s.media_id,
+        Packet::MediaChunk(c) => &c.media_id,
+        _ => return,
+    };
+    let tx = state.media_relays.lock().await.get(media_id).cloned();
+    if let Some(tx) = tx {
+        let _ = tx.send(pkt.clone()).await;
+        if matches!(pkt, Packet::MediaChunk(c) if c.last) {
+            state.media_relays.lock().await.remove(media_id);
+        }
+    }
 }
 
 // ---- Groups -------------------------------------------------------------------
@@ -1771,6 +2083,8 @@ async fn route_group_fanout(state: &Arc<State>, m: wire::GroupMessage) {
 /// each member's home node (locally or via the mesh), then push to live
 /// sessions.
 async fn fanout_group(state: &Arc<State>, m: wire::GroupMessage, members: Vec<String>) {
+    #[cfg(feature = "metrics")]
+    let started = std::time::Instant::now();
     for member in members {
         if member == m.from_user {
             continue;
@@ -1789,6 +2103,8 @@ async fn fanout_group(state: &Arc<State>, m: wire::GroupMessage, members: Vec<St
             send_to_peer(state, &home, Packet::GroupMessage(copy));
         }
     }
+    #[cfg(feature = "metrics")]
+    super::metrics::observe_fanout(started.elapsed());
 }
 
 /// Persist a per-member group message copy on this node (the member's home)

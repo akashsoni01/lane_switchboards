@@ -25,6 +25,8 @@ pub(super) struct ClusterRuntime {
     pub ring: RwLock<HashRing>,
     pub peer_txs: RwLock<HashMap<String, mpsc::Sender<Packet>>>,
     pub peer_auth: HmacAuthenticator,
+    #[cfg(feature = "tls")]
+    pub peer_tls: Option<std::sync::Arc<crate::stream::TlsConnector>>,
 }
 
 impl ClusterRuntime {
@@ -52,6 +54,7 @@ pub(super) async fn peer_link(
     peer: PeerAddr,
     token: String,
     mut rx: mpsc::Receiver<Packet>,
+    #[cfg(feature = "tls")] peer_tls: Option<std::sync::Arc<crate::stream::TlsConnector>>,
 ) {
     use futures_util::SinkExt;
     use tokio_util::codec::Framed;
@@ -61,7 +64,11 @@ pub(super) async fn peer_link(
 
     let mut backoff = Duration::from_millis(100);
     loop {
-        let socket = match stream::connect(&peer.addr, None).await {
+        #[cfg(feature = "tls")]
+        let connector = peer_tls.as_deref();
+        #[cfg(not(feature = "tls"))]
+        let connector: Option<&crate::stream::TlsConnector> = None;
+        let socket = match stream::connect(&peer.addr, connector).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::debug!(peer = %peer.node_id, error = %e, "peer connect failed; retrying");
@@ -398,6 +405,8 @@ async fn ensure_outbound_link(
         peer.clone(),
         token,
         rx,
+        #[cfg(feature = "tls")]
+        cluster.peer_tls.clone(),
     ));
     if let Ok(mut tasks) = peer_tasks.lock() {
         if let Some(old) = tasks.insert(peer.node_id.clone(), handle) {

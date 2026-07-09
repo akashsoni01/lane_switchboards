@@ -48,12 +48,13 @@ rustls = { version = "0.23", optional = true, features = ["aws_lc_rs"] }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+prometheus = { version = "0.13", optional = true }
 vodozemac = "0.10.0"
 
 [features]
 default = []
 monitor = ["lane_core/monitor"]
-metrics = ["lane_core/metrics", "monitor"]
+metrics = ["lane_core/metrics", "monitor", "dep:prometheus"]
 watch_sync = []
 tls = [
     "dep:rustls",
@@ -222,6 +223,15 @@ required-features = ["metrics"]
 [[example]]
 name = "observability_demo"
 path = "examples/observability_demo.rs"
+required-features = ["metrics"]
+
+[[bench]]
+name = "messenger_cluster"
+harness = false
+
+[[test]]
+name = "messenger_metrics"
+path = "tests/messenger_metrics.rs"
 required-features = ["metrics"]
 
 [[test]]

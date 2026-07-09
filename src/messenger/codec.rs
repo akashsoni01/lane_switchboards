@@ -57,6 +57,7 @@ pub enum PacketType {
     PeerLeave = 0x54,
     PeerHandoffUser = 0x55,
     PeerHandoffGroup = 0x56,
+    PeerMediaReady = 0x57,
     PublishKeys = 0x60,
     FetchKeys = 0x61,
     KeyBundle = 0x62,
@@ -91,6 +92,7 @@ impl TryFrom<u8> for PacketType {
             0x54 => Self::PeerLeave,
             0x55 => Self::PeerHandoffUser,
             0x56 => Self::PeerHandoffGroup,
+            0x57 => Self::PeerMediaReady,
             0x60 => Self::PublishKeys,
             0x61 => Self::FetchKeys,
             0x62 => Self::KeyBundle,
@@ -126,6 +128,7 @@ pub enum Packet {
     PeerLeave(wire::PeerLeave),
     PeerHandoffUser(wire::PeerHandoffUser),
     PeerHandoffGroup(wire::PeerHandoffGroup),
+    PeerMediaReady(wire::PeerMediaReady),
     PublishKeys(wire::PublishKeys),
     FetchKeys(wire::FetchKeys),
     KeyBundle(wire::KeyBundle),
@@ -159,6 +162,7 @@ impl Packet {
             Packet::PeerLeave(_) => PacketType::PeerLeave,
             Packet::PeerHandoffUser(_) => PacketType::PeerHandoffUser,
             Packet::PeerHandoffGroup(_) => PacketType::PeerHandoffGroup,
+            Packet::PeerMediaReady(_) => PacketType::PeerMediaReady,
             Packet::PublishKeys(_) => PacketType::PublishKeys,
             Packet::FetchKeys(_) => PacketType::FetchKeys,
             Packet::KeyBundle(_) => PacketType::KeyBundle,
@@ -191,6 +195,7 @@ impl Packet {
             Packet::PeerLeave(m) => m.encoded_len(),
             Packet::PeerHandoffUser(m) => m.encoded_len(),
             Packet::PeerHandoffGroup(m) => m.encoded_len(),
+            Packet::PeerMediaReady(m) => m.encoded_len(),
             Packet::PublishKeys(m) => m.encoded_len(),
             Packet::FetchKeys(m) => m.encoded_len(),
             Packet::KeyBundle(m) => m.encoded_len(),
@@ -224,6 +229,7 @@ impl Packet {
             Packet::PeerLeave(m) => m.encode(buf),
             Packet::PeerHandoffUser(m) => m.encode(buf),
             Packet::PeerHandoffGroup(m) => m.encode(buf),
+            Packet::PeerMediaReady(m) => m.encode(buf),
             Packet::PublishKeys(m) => m.encode(buf),
             Packet::FetchKeys(m) => m.encode(buf),
             Packet::KeyBundle(m) => m.encode(buf),
@@ -260,6 +266,9 @@ impl Packet {
             }
             PacketType::PeerHandoffGroup => {
                 Packet::PeerHandoffGroup(wire::PeerHandoffGroup::decode(payload)?)
+            }
+            PacketType::PeerMediaReady => {
+                Packet::PeerMediaReady(wire::PeerMediaReady::decode(payload)?)
             }
             PacketType::PublishKeys => Packet::PublishKeys(wire::PublishKeys::decode(payload)?),
             PacketType::FetchKeys => Packet::FetchKeys(wire::FetchKeys::decode(payload)?),
@@ -466,6 +475,10 @@ mod tests {
             members: vec!["alice".into(), "bob".into()],
             admins: vec!["alice".into()],
             version: 2,
+        }));
+        round_trip(Packet::PeerMediaReady(wire::PeerMediaReady {
+            media_id: "pdf-1".into(),
+            node_id: "node-0".into(),
         }));
         round_trip(Packet::PublishKeys(wire::PublishKeys {
             user_id: "akash".into(),

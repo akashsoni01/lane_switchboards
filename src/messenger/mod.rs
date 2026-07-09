@@ -25,6 +25,8 @@ pub mod client;
 pub mod codec;
 mod cluster;
 mod journal;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod server;
 
 pub use crate::proto::messenger as wire;
