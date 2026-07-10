@@ -16,6 +16,12 @@ mod session;
 #[cfg(feature = "c-api")]
 pub mod c_api;
 
+#[cfg(feature = "jni")]
+pub mod jni;
+
+#[cfg(feature = "uniffi")]
+mod uniffi_api;
+
 pub use error::{FfiError, FfiErrorCode};
 pub use events::{
     ChatMessageEvent, DeliveredAckEvent, DownloadedMediaInfo, GroupAckSummaryEvent,
@@ -41,6 +47,18 @@ pub const DEFAULT_MAX_MEDIA: u64 = 64 * 1024 * 1024;
 pub const PING_INTERVAL_SECS: u64 = 30;
 
 /// Library version string (NUL-terminated for C via [`c_api::lane_version`]).
+#[cfg(not(feature = "uniffi"))]
 pub fn version() -> &'static str {
     VERSION
 }
+
+// UniFFI UDL scaffolding calls crate-root types/functions (stubs in the
+// generated file are discarded by `#[export_for_udl]` / `#[udl_derive]`).
+#[cfg(feature = "uniffi")]
+pub use uniffi_api::{
+    e2ee_import_pickle, protocol_version, safety_number, version, ConnectConfig, LaneE2ee,
+    LaneError, LaneSession,
+};
+
+#[cfg(feature = "uniffi")]
+uniffi::include_scaffolding!("lane_messenger");

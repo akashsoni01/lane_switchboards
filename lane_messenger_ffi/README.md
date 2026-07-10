@@ -10,9 +10,17 @@ hold opaque session / device handles and poll (or later: callback) events.
 ```bash
 cargo build -p lane_messenger_ffi --release
 cargo test -p lane_messenger_ffi
+cargo test -p lane_messenger_ffi --features uniffi,jni
 ```
 
-Features: `c-api` (default), `tls` (default), optional `ws`.
+Features: `c-api` (default), `tls` (default), `ws` (default), optional `uniffi`, optional `jni`.
+
+| Feature | Purpose |
+|---------|---------|
+| `uniffi` | UDL scaffolding + `uniffi-bindgen` (Swift/Kotlin) |
+| `jni` | `Java_com_lane_messenger_LaneSession_native*` glue |
+
+Platform packages / scripts: see [`docs/client-ffi/BUILD.md`](../docs/client-ffi/BUILD.md).
 
 Env: `LANE_MESSENGER_WORKER_THREADS` — Tokio worker count (default 2–8).
 

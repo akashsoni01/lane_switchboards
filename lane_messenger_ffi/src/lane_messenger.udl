@@ -1,0 +1,83 @@
+namespace lane_messenger {};
+
+[Error]
+interface LaneError {
+  Io(string message);
+  Protocol(string message);
+  AuthFailed();
+  Closed();
+  Timeout(string message);
+  Media(string message);
+  E2ee(string message);
+  InvalidArgument(string message);
+  NotConnected();
+  Internal(string message);
+};
+
+dictionary ConnectConfig {
+  string host;
+  u16 port;
+  boolean use_tls;
+  string user_id;
+  string device_id;
+  string auth_token;
+  string client_version;
+  u64 resume_after_seq;
+  u64 ping_interval_secs;
+  boolean auto_reconnect;
+  u32 max_reconnect_attempts;
+  boolean use_websocket;
+  string ws_url;
+};
+
+interface LaneSession {
+  [Throws=LaneError]
+  constructor(ConnectConfig config);
+  [Throws=LaneError]
+  void ping();
+  [Throws=LaneError]
+  u64 send_chat(string to_user, string message_id, bytes body);
+  [Throws=LaneError]
+  void ack_delivered(string message_id);
+  [Throws=LaneError]
+  void ack_read(string message_id);
+  [Throws=LaneError]
+  u64 create_group(string group_id);
+  [Throws=LaneError]
+  u64 add_member(string group_id, string user);
+  [Throws=LaneError]
+  void send_group(string group_id, string message_id, bytes body);
+  [Throws=LaneError]
+  void set_resume_seq(u64 seq);
+  u64 resume_seq();
+  string? poll_event_json(u64 timeout_ms);
+  [Throws=LaneError]
+  void close();
+};
+
+interface LaneE2ee {
+  constructor();
+  string identity_key();
+  [Throws=LaneError]
+  void publish(LaneSession session, string device_id, u32 otk_count);
+  [Throws=LaneError]
+  u64 send_encrypted_chat(LaneSession session, string to_user, string message_id, bytes plaintext);
+  [Throws=LaneError]
+  bytes decrypt_chat(string from_user, bytes body);
+  string create_group_session(string group_id);
+  [Throws=LaneError]
+  void distribute_group_key(LaneSession session, string group_id, sequence<string> members);
+  [Throws=LaneError]
+  void send_encrypted_group(LaneSession session, string group_id, string message_id, bytes plaintext);
+  [Throws=LaneError]
+  bytes decrypt_group(string group_id, bytes body);
+  bytes export_pickle(string passphrase);
+};
+
+namespace lane_messenger {
+  string version();
+  u8 protocol_version();
+  string safety_number(string local_identity_b64, string remote_identity_b64);
+  [Throws=LaneError]
+  LaneE2ee e2ee_import_pickle(bytes pickle, string passphrase);
+};

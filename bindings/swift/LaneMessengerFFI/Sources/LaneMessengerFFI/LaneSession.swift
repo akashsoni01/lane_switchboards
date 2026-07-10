@@ -91,7 +91,7 @@ public enum LaneFFIError: Error {
 }
 
 // Declarations mirror `lane_messenger_ffi/include/lane_messenger_ffi.h`.
-// Prefer generating these via UniFFI (`uniffi/lane_messenger.udl`) in CI.
+// Prefer UniFFI-generated Swift under `generated/` (see scripts/generate_uniffi_bindings.sh).
 @_silgen_name("lane_session_connect")
 func lane_session_connect(
     _ host: UnsafePointer<CChar>, _ port: UInt16, _ useTls: Int32,

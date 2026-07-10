@@ -11,11 +11,18 @@ publish = false
 name = "lane_messenger_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["uniffi"]
+
 [features]
 default = ["c-api", "tls", "ws"]
 c-api = []
 tls = ["lane_switchboards/tls"]
 ws = ["lane_switchboards/ws"]
+uniffi = ["dep:uniffi"]
+jni = ["c-api", "dep:jni"]
 
 [dependencies]
 lane_switchboards = { path = "..", version = "0.9.2", default-features = false, features = ["messenger"] }
@@ -25,6 +32,11 @@ parking_lot = "0.12"
 thiserror = "2"
 tracing = "0.1"
 sha2 = "0.10"
+uniffi = { version = "0.28", optional = true, features = ["cli"] }
+jni = { version = "0.21", optional = true, default-features = false }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
 
 [dev-dependencies]
 lane_switchboards = { path = "..", version = "0.9.2", default-features = false, features = ["messenger", "ws"] }

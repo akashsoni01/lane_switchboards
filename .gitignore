@@ -22,3 +22,5 @@ target
 *.lock
 architecture.md
 /examples/gateway
+/dist/
+**/jniLibs/

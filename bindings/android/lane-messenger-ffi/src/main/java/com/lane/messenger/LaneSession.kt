@@ -1,10 +1,11 @@
 package com.lane.messenger
 
 /**
- * Thin Kotlin/JNI wrapper over `liblane_messenger_ffi.so`.
- * Load with: System.loadLibrary("lane_messenger_ffi")
+ * Thin Kotlin/JNI wrapper over `liblane_messenger_ffi.so`
+ * (`cargo build -p lane_messenger_ffi --features jni`).
  *
- * Full UniFFI Kotlin bindings will replace these stubs (Phase F7).
+ * UniFFI/JNA bindings also ship under `uniffi.lane_messenger` for hosts that
+ * prefer that stack; this class stays as the lightweight C-ABI path.
  */
 class LaneSession private constructor(private var handle: Long) {
     companion object {

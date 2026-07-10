@@ -37,6 +37,16 @@ jobs:
         run: cargo test -p lane_messenger_ffi
       - name: Messenger FFI (ws)
         run: cargo test -p lane_messenger_ffi --features ws
+      - name: Messenger FFI (uniffi + jni)
+        run: cargo test -p lane_messenger_ffi --features uniffi,jni
+      - name: UniFFI bindgen smoke
+        run: |
+          cargo build -p lane_messenger_ffi --release --features uniffi
+          mkdir -p /tmp/lane-uniffi-out
+          cargo run -p lane_messenger_ffi --features uniffi --bin uniffi-bindgen -- \
+            generate --library target/release/liblane_messenger_ffi.so \
+            --language kotlin --out-dir /tmp/lane-uniffi-out
+          test -f /tmp/lane-uniffi-out/uniffi/lane_messenger/lane_messenger.kt
       - name: TLS messenger tests
         run: cargo test --features tls --test messenger
       - name: WS messenger client smoke
@@ -46,6 +56,48 @@ jobs:
           cargo test --workspace --features metrics
           cargo test --features metrics --test metrics_export
           cargo check --examples --features metrics -p lane_switchboards
+
+  ffi-android-ndk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          link-to-sdk: true
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+      - name: Build Android .so (3 ABIs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          ./scripts/build_android_ndk.sh
+          test -f bindings/android/lane-messenger-ffi/src/main/jniLibs/arm64-v8a/liblane_messenger_ffi.so
+          test -f bindings/android/lane-messenger-ffi/src/main/jniLibs/armeabi-v7a/liblane_messenger_ffi.so
+          test -f bindings/android/lane-messenger-ffi/src/main/jniLibs/x86_64/liblane_messenger_ffi.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lane-messenger-ffi-android-so
+          path: bindings/android/lane-messenger-ffi/src/main/jniLibs
+
+  ffi-ios-xcframework:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+      - name: Build XCFramework
+        run: ./scripts/build_xcframework.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LaneMessengerFFI-xcframework
+          path: dist/LaneMessengerFFI.xcframework
 
   deny:
     runs-on: ubuntu-latest

@@ -1,34 +1,38 @@
 # Platform bindings (F7)
 
-Native packages are **not** fully generated yet. Until UniFFI CI is wired:
-
-1. Link `liblane_messenger_ffi` (cdylib/staticlib) from
-   `cargo build -p lane_messenger_ffi --release`.
-2. Use the C header
-   [`lane_messenger_ffi/include/lane_messenger_ffi.h`](../../lane_messenger_ffi/include/lane_messenger_ffi.h).
-3. Or call the Rust API from a thin host wrapper.
-
-## Planned layout
-
 ```text
 bindings/
-  swift/LaneMessengerFFI/     # SPM + XCFramework
-  android/lane-messenger-ffi/ # AAR
-  flutter/lane_messenger/     # plugin
+  swift/LaneMessengerFFI/     # SPM (C ABI) + UniFFI generated/
+  android/lane-messenger-ffi/ # Gradle module: JNI + UniFFI/JNA
+  flutter/lane_messenger/     # Dart FFI plugin (same .so / XCFramework)
 ```
 
-UDL scaffold: `lane_messenger_ffi/uniffi/lane_messenger.udl`.
+## Generate / build
+
+| Artifact | Command |
+|----------|---------|
+| UniFFI Swift + Kotlin | `./scripts/generate_uniffi_bindings.sh` |
+| XCFramework | `./scripts/build_xcframework.sh` |
+| Android `.so` (3 ABIs) | `./scripts/build_android_ndk.sh` |
+
+UDL: `lane_messenger_ffi/src/lane_messenger.udl`.
 
 ## iOS notes
 
 - Min iOS 15+; ATS requires TLS in production.
-- Custom CA for staging: pass via future connect option / pin set (F9).
+- Prefer UniFFI-generated Swift after linking the XCFramework; C ABI wrapper
+  remains for hosts that skip UniFFI.
+- Sample: `examples/ios_ffi_demo/`.
 
 ## Android notes
 
 - Min API 24; ship `arm64-v8a`, `armeabi-v7a`, `x86_64`.
-- Keep ProGuard rules for JNI once UniFFI Kotlin is generated.
+- **JNI path:** `com.lane.messenger.LaneSession` + `--features jni`.
+- **UniFFI path:** `uniffi.lane_messenger` (JNA) + `--features uniffi`.
+- ProGuard rules in `bindings/android/lane-messenger-ffi/proguard-rules.pro`.
+- Sample: `examples/android_ffi_demo/`.
 
 ## Flutter notes
 
-- Prefer Dart FFI to the same `.so` / XCFramework — do not reimplement frames.
+- Dart FFI to the same `.so` / XCFramework — do not reimplement frames.
+- Sample: `examples/flutter_ffi_demo/`.
