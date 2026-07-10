@@ -104,6 +104,9 @@ docs in [`docs/client-ffi/`](docs/client-ffi/00_overview.md).
 **End-to-end architecture + beginner runbook:**
 [`docs/ECOSYSTEM_GUIDE.md`](docs/ECOSYSTEM_GUIDE.md) (iOS → FFI → FunXMPP gateway).
 
+**WhatsApp fidelity / gaps (honest score + backlog):** [`gap.md`](gap.md).  
+**FunXMPP + Signal flows (Antunes Cap. 4 → todos):** [`funxmpp_todo.md`](funxmpp_todo.md).
+
 ```bash
 cargo test -p lane_messenger_ffi
 cargo build -p lane_messenger_ffi --release

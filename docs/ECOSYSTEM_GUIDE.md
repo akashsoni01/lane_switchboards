@@ -21,6 +21,7 @@ If you are new here, read this page first, then dive into the linked docs.
 | Mobile FFI | [`docs/client-ffi/`](client-ffi/00_overview.md) |
 | iOS product | [`docs/client-ios/`](client-ios/00_overview.md) |
 | Phase checklists | [`todo.md`](../todo.md), [`todo_ios.md`](../todo_ios.md), [`todo_client_ffi.md`](../todo_client_ffi.md) |
+| WA vs Lane gaps | [`gap.md`](../gap.md) — fidelity score + implementation backlog |
 
 ---
 

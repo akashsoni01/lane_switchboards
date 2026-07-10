@@ -6,6 +6,9 @@ overview, then dive into the layer you care about.
 **Full stack (iOS → FFI → gateway) for beginners:**
 [`../ECOSYSTEM_GUIDE.md`](../ECOSYSTEM_GUIDE.md)
 
+**FunXMPP + Signal Cap. 4 backlog (Antunes monograph):**
+[`../../funxmpp_todo.md`](../../funxmpp_todo.md)
+
 | Doc | Contents |
 |-----|----------|
 | [00_overview.md](00_overview.md) | Architecture, components, delivery guarantees, scope |
