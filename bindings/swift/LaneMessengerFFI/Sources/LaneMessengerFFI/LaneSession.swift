@@ -52,15 +52,28 @@ public final class LaneSession {
     }
 
     public func sendChat(to: String, messageId: String, body: Data) throws -> UInt64 {
+        try sendChat(to: to, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data, mediaId: String) throws -> UInt64 {
         var seq: UInt64 = 0
         let code = body.withUnsafeBytes { raw in
             to.withCString { t in
                 messageId.withCString { m in
-                    lane_send_chat(
-                        UnsafeMutablePointer(ptr), t, m,
-                        raw.bindMemory(to: UInt8.self).baseAddress,
-                        body.count, &seq
-                    )
+                    mediaId.withCString { mid in
+                        if mediaId.isEmpty {
+                            return lane_send_chat(
+                                UnsafeMutablePointer(ptr), t, m,
+                                raw.bindMemory(to: UInt8.self).baseAddress,
+                                body.count, &seq
+                            )
+                        }
+                        return lane_send_chat_with_media(
+                            UnsafeMutablePointer(ptr), t, m,
+                            raw.bindMemory(to: UInt8.self).baseAddress,
+                            body.count, mid, &seq
+                        )
+                    }
                 }
             }
         }
@@ -131,18 +144,88 @@ public final class LaneSession {
     }
 
     public func sendGroup(groupId: String, messageId: String, body: Data) throws {
+        try sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) throws {
         let code = body.withUnsafeBytes { raw in
             groupId.withCString { g in
                 messageId.withCString { m in
-                    lane_send_group(
-                        UnsafeMutablePointer(ptr), g, m,
-                        raw.bindMemory(to: UInt8.self).baseAddress,
-                        body.count
-                    )
+                    mediaId.withCString { mid in
+                        if mediaId.isEmpty {
+                            return lane_send_group(
+                                UnsafeMutablePointer(ptr), g, m,
+                                raw.bindMemory(to: UInt8.self).baseAddress,
+                                body.count
+                            )
+                        }
+                        return lane_send_group_with_media(
+                            UnsafeMutablePointer(ptr), g, m,
+                            raw.bindMemory(to: UInt8.self).baseAddress,
+                            body.count, mid
+                        )
+                    }
                 }
             }
         }
         try check(code)
+    }
+
+    public func uploadMedia(
+        mediaId: String,
+        fileName: String,
+        mimeType: String,
+        data: Data
+    ) throws -> UInt64 {
+        var out: UInt64 = 0
+        let code = data.withUnsafeBytes { raw in
+            mediaId.withCString { mid in
+                fileName.withCString { name in
+                    mimeType.withCString { mime in
+                        lane_upload_media(
+                            UnsafeMutablePointer(ptr), mid, name, mime,
+                            raw.bindMemory(to: UInt8.self).baseAddress,
+                            data.count, &out
+                        )
+                    }
+                }
+            }
+        }
+        try check(code)
+        return out
+    }
+
+    public func fetchMedia(mediaId: String) throws -> FetchedMedia {
+        var dataPtr: UnsafeMutablePointer<UInt8>?
+        var len: Int = 0
+        var fileNamePtr: UnsafeMutablePointer<CChar>?
+        var mimePtr: UnsafeMutablePointer<CChar>?
+        var shaPtr: UnsafeMutablePointer<CChar>?
+        let code = mediaId.withCString { mid in
+            lane_fetch_media(
+                UnsafeMutablePointer(ptr), mid,
+                &dataPtr, &len, &fileNamePtr, &mimePtr, &shaPtr
+            )
+        }
+        defer {
+            if let fileNamePtr { lane_string_free(fileNamePtr) }
+            if let mimePtr { lane_string_free(mimePtr) }
+            if let shaPtr { lane_string_free(shaPtr) }
+            if let dataPtr { lane_bytes_free(dataPtr, len) }
+        }
+        try check(code)
+        let bytes: Data
+        if let dataPtr, len > 0 {
+            bytes = Data(bytes: dataPtr, count: len)
+        } else {
+            bytes = Data()
+        }
+        return FetchedMedia(
+            data: bytes,
+            fileName: fileNamePtr.map { String(cString: $0) } ?? "",
+            mimeType: mimePtr.map { String(cString: $0) } ?? "",
+            sha256: shaPtr.map { String(cString: $0) } ?? ""
+        )
     }
 
     public func pollEvent(timeoutMs: UInt64) -> String? {
@@ -165,6 +248,20 @@ public final class LaneSession {
 public enum LaneFFIError: Error {
     case connect(String)
     case code(Int32)
+}
+
+public struct FetchedMedia: Sendable {
+    public var data: Data
+    public var fileName: String
+    public var mimeType: String
+    public var sha256: String
+
+    public init(data: Data, fileName: String, mimeType: String, sha256: String) {
+        self.data = data
+        self.fileName = fileName
+        self.mimeType = mimeType
+        self.sha256 = sha256
+    }
 }
 
 // Declarations mirror `lane_messenger_ffi/include/lane_messenger_ffi.h`.
@@ -197,6 +294,14 @@ func lane_send_chat(
     _ s: UnsafeMutableRawPointer?, _ to: UnsafePointer<CChar>,
     _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
     _ len: Int, _ seq: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_send_chat_with_media")
+func lane_send_chat_with_media(
+    _ s: UnsafeMutableRawPointer?, _ to: UnsafePointer<CChar>,
+    _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
+    _ len: Int, _ mediaId: UnsafePointer<CChar>,
+    _ seq: UnsafeMutablePointer<UInt64>
 ) -> Int32
 
 @_silgen_name("lane_ack_delivered")
@@ -238,6 +343,34 @@ func lane_send_group(
     _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
     _ len: Int
 ) -> Int32
+
+@_silgen_name("lane_send_group_with_media")
+func lane_send_group_with_media(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
+    _ len: Int, _ mediaId: UnsafePointer<CChar>
+) -> Int32
+
+@_silgen_name("lane_upload_media")
+func lane_upload_media(
+    _ s: UnsafeMutableRawPointer?, _ mediaId: UnsafePointer<CChar>,
+    _ fileName: UnsafePointer<CChar>, _ mimeType: UnsafePointer<CChar>,
+    _ data: UnsafePointer<UInt8>?, _ len: Int,
+    _ outBytes: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_fetch_media")
+func lane_fetch_media(
+    _ s: UnsafeMutableRawPointer?, _ mediaId: UnsafePointer<CChar>,
+    _ outData: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
+    _ outLen: UnsafeMutablePointer<Int>,
+    _ outFileName: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    _ outMime: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>,
+    _ outSha: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
+) -> Int32
+
+@_silgen_name("lane_bytes_free")
+func lane_bytes_free(_ p: UnsafeMutablePointer<UInt8>?, _ len: Int)
 
 @_silgen_name("lane_string_free")
 func lane_string_free(_ s: UnsafeMutablePointer<CChar>?)

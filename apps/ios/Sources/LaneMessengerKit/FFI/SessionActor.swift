@@ -94,11 +94,50 @@ public actor SessionActor {
         lastPingRttMs = UInt64(ms.rounded())
     }
 
-    public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+    public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        try await sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) async throws {
         guard state == .ready || state == .syncing || state == .awaitingLogin else {
             throw AppError.connection("not ready")
         }
-        return try await transport.sendChat(to: to, messageId: messageId, body: body)
+        try await transport.sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: mediaId)
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+        try await sendChat(to: to, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data, mediaId: String) async throws -> UInt64 {
+        guard state == .ready || state == .syncing || state == .awaitingLogin else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.sendChat(to: to, messageId: messageId, body: body, mediaId: mediaId)
+    }
+
+    public func uploadMedia(
+        mediaId: String,
+        fileName: String,
+        mimeType: String,
+        data: Data
+    ) async throws -> UInt64 {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.uploadMedia(
+            mediaId: mediaId,
+            fileName: fileName,
+            mimeType: mimeType,
+            data: data
+        )
+    }
+
+    public func fetchMedia(mediaId: String) async throws -> FetchedMediaBlob {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.fetchMedia(mediaId: mediaId)
     }
 
     public func ackDelivered(messageId: String) async throws {
@@ -139,13 +178,6 @@ public actor SessionActor {
             throw AppError.connection("not ready")
         }
         return try await transport.leaveGroup(groupId: groupId)
-    }
-
-    public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
-        guard state == .ready || state == .syncing || state == .awaitingLogin else {
-            throw AppError.connection("not ready")
-        }
-        try await transport.sendGroup(groupId: groupId, messageId: messageId, body: body)
     }
 
     public func close() async {

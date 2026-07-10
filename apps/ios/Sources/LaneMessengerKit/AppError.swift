@@ -11,6 +11,9 @@ public enum AppError: Error, Equatable, Sendable {
     case keychain(String)
     case cancelled
     case internalError(String)
+    case mediaTooLarge(size: Int, limit: Int)
+    case mediaIncomplete(String)
+    case mediaCorrupt(String)
 
     public var errorDescription: String {
         switch self {
@@ -32,6 +35,13 @@ public enum AppError: Error, Equatable, Sendable {
             return "Cancelled."
         case .internalError(let detail):
             return detail.isEmpty ? "Internal error." : detail
+        case .mediaTooLarge(_, let limit):
+            let mb = limit / (1024 * 1024)
+            return "File is too large (max \(mb) MiB)."
+        case .mediaIncomplete(let detail):
+            return detail.isEmpty ? "Media download incomplete." : detail
+        case .mediaCorrupt(let detail):
+            return detail.isEmpty ? "Media failed integrity check." : detail
         }
     }
 }

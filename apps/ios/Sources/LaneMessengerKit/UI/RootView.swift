@@ -178,6 +178,56 @@ struct HomeShellView: View {
         .sheet(isPresented: $model.showGroupInfo) {
             GroupInfoSheet(model: model)
         }
+        .sheet(isPresented: $model.showAttachMenu) {
+            AttachMenuView(model: model)
+        }
+        #if os(iOS)
+        .fullScreenCover(isPresented: Binding(
+            get: { model.previewMediaId != nil },
+            set: { if !$0 { model.previewMediaId = nil } }
+        )) {
+            MediaPreviewHost(model: model)
+        }
+        #else
+        .sheet(isPresented: Binding(
+            get: { model.previewMediaId != nil },
+            set: { if !$0 { model.previewMediaId = nil } }
+        )) {
+            MediaPreviewHost(model: model)
+        }
+        #endif
+        .fileImporter(
+            isPresented: $model.showFileImporter,
+            allowedContentTypes: [.pdf, .image, .data],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                Task {
+                    let accessed = url.startAccessingSecurityScopedResource()
+                    defer { if accessed { url.stopAccessingSecurityScopedResource() } }
+                    guard let data = try? Data(contentsOf: url) else { return }
+                    let mime: String
+                    if url.pathExtension.lowercased() == "pdf" {
+                        mime = "application/pdf"
+                    } else if ["png"].contains(url.pathExtension.lowercased()) {
+                        mime = "image/png"
+                    } else if ["jpg", "jpeg"].contains(url.pathExtension.lowercased()) {
+                        mime = "image/jpeg"
+                    } else {
+                        mime = "application/octet-stream"
+                    }
+                    await model.sendAttachment(
+                        data: data,
+                        fileName: url.lastPathComponent,
+                        mimeType: mime
+                    )
+                }
+            case .failure(let error):
+                model.errorBanner = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -384,7 +434,19 @@ public struct ChatThreadView: View {
                                 MessageBubble(
                                     message: message,
                                     showSender: isGroup && message.direction == .inbound,
-                                    onRetry: { Task { await model.retryMessage(message) } }
+                                    meta: message.mediaId.isEmpty
+                                        ? nil
+                                        : model.mediaMeta(message.mediaId),
+                                    progress: message.mediaId.isEmpty
+                                        ? nil
+                                        : model.mediaTransfers[message.mediaId],
+                                    completeURL: message.mediaId.isEmpty
+                                        ? nil
+                                        : model.mediaFileURL(message.mediaId),
+                                    onRetry: { Task { await model.retryMessage(message) } },
+                                    onOpenMedia: {
+                                        Task { await model.openMedia(message.mediaId) }
+                                    }
                                 )
                                 .id(message.messageId)
                             }
@@ -436,12 +498,12 @@ public struct ChatThreadView: View {
     private var composer: some View {
         HStack(alignment: .bottom, spacing: 8) {
             Button {
-                // Attachment affordance — media lands in I7.
+                model.showAttachMenu = true
             } label: {
                 Image(systemName: "paperclip")
             }
-            .disabled(true)
-            .accessibilityLabel("Attach (coming soon)")
+            .disabled(model.connectionState == .offline || model.isSending)
+            .accessibilityLabel("Attach")
 
             TextField("Message", text: Binding(
                 get: { model.composeText },
@@ -490,7 +552,11 @@ public struct ChatThreadView: View {
 struct MessageBubble: View {
     let message: StoredMessage
     var showSender: Bool = false
+    var meta: MediaBlobMeta? = nil
+    var progress: MediaTransferProgress? = nil
+    var completeURL: URL? = nil
     var onRetry: () -> Void
+    var onOpenMedia: () -> Void = {}
 
     var body: some View {
         if message.direction == .system {
@@ -509,15 +575,31 @@ struct MessageBubble: View {
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
-                    Text(message.body.isEmpty ? (message.mediaId.isEmpty ? " " : "📎 Media") : message.body)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            message.direction == .outbound
-                                ? Color.accentColor.opacity(0.18)
-                                : Color.secondary.opacity(0.12),
-                            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    if !message.mediaId.isEmpty {
+                        MediaAttachmentView(
+                            message: message,
+                            meta: meta,
+                            progress: progress,
+                            completeURL: completeURL,
+                            onOpen: onOpenMedia,
+                            onRetryDownload: onOpenMedia
                         )
+                    }
+                    if !message.body.isEmpty {
+                        Text(message.body)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(
+                                message.direction == .outbound
+                                    ? Color.accentColor.opacity(0.18)
+                                    : Color.secondary.opacity(0.12),
+                                in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            )
+                    } else if message.mediaId.isEmpty {
+                        Text(" ")
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                    }
                     HStack(spacing: 4) {
                         Text(message.createdAt, style: .time)
                             .font(.caption2)

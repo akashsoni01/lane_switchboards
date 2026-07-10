@@ -82,6 +82,13 @@ int32_t lane_send_group(
     const char *message_id,
     const uint8_t *body,
     size_t body_len);
+int32_t lane_send_group_with_media(
+    LaneSession *session,
+    const char *group_id,
+    const char *message_id,
+    const uint8_t *body,
+    size_t body_len,
+    const char *media_id);
 
 int32_t lane_upload_media(
     LaneSession *session,

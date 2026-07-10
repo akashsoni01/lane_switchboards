@@ -56,9 +56,13 @@ public final class LaneFFITransport: MessengerTransport, @unchecked Sendable {
     }
 
     public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+        try await sendChat(to: to, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data, mediaId: String) async throws -> UInt64 {
         #if canImport(LaneMessengerFFI)
         guard let session else { throw AppError.connection("not connected") }
-        return try session.sendChat(to: to, messageId: messageId, body: body)
+        return try session.sendChat(to: to, messageId: messageId, body: body, mediaId: mediaId)
         #else
         throw AppError.notConfigured
         #endif
@@ -128,9 +132,47 @@ public final class LaneFFITransport: MessengerTransport, @unchecked Sendable {
     }
 
     public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        try await sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) async throws {
         #if canImport(LaneMessengerFFI)
         guard let session else { throw AppError.connection("not connected") }
-        try session.sendGroup(groupId: groupId, messageId: messageId, body: body)
+        try session.sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: mediaId)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func uploadMedia(
+        mediaId: String,
+        fileName: String,
+        mimeType: String,
+        data: Data
+    ) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.uploadMedia(
+            mediaId: mediaId,
+            fileName: fileName,
+            mimeType: mimeType,
+            data: data
+        )
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func fetchMedia(mediaId: String) async throws -> FetchedMediaBlob {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        let m = try session.fetchMedia(mediaId: mediaId)
+        return FetchedMediaBlob(
+            data: m.data,
+            fileName: m.fileName,
+            mimeType: m.mimeType,
+            sha256: m.sha256
+        )
         #else
         throw AppError.notConfigured
         #endif

@@ -15,6 +15,24 @@ public protocol MessengerTransport: AnyObject, Sendable {
     func removeMember(groupId: String, user: String) async throws -> UInt64
     func leaveGroup(groupId: String) async throws -> UInt64
     func sendGroup(groupId: String, messageId: String, body: Data) async throws
+    func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) async throws
+    func sendChat(to: String, messageId: String, body: Data, mediaId: String) async throws -> UInt64
+    func uploadMedia(mediaId: String, fileName: String, mimeType: String, data: Data) async throws -> UInt64
+    func fetchMedia(mediaId: String) async throws -> FetchedMediaBlob
+}
+
+public struct FetchedMediaBlob: Sendable, Equatable {
+    public var data: Data
+    public var fileName: String
+    public var mimeType: String
+    public var sha256: String
+
+    public init(data: Data, fileName: String, mimeType: String, sha256: String) {
+        self.data = data
+        self.fileName = fileName
+        self.mimeType = mimeType
+        self.sha256 = sha256
+    }
 }
 
 public extension MessengerTransport {
@@ -45,9 +63,35 @@ public extension MessengerTransport {
     }
 
     func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        try await sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: "")
+    }
+
+    func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) async throws {
         _ = groupId
         _ = messageId
         _ = body
+        _ = mediaId
+        throw AppError.notConfigured
+    }
+
+    func sendChat(to: String, messageId: String, body: Data, mediaId: String) async throws -> UInt64 {
+        if mediaId.isEmpty {
+            return try await sendChat(to: to, messageId: messageId, body: body)
+        }
+        _ = mediaId
+        throw AppError.notConfigured
+    }
+
+    func uploadMedia(mediaId: String, fileName: String, mimeType: String, data: Data) async throws -> UInt64 {
+        _ = mediaId
+        _ = fileName
+        _ = mimeType
+        _ = data
+        throw AppError.notConfigured
+    }
+
+    func fetchMedia(mediaId: String) async throws -> FetchedMediaBlob {
+        _ = mediaId
         throw AppError.notConfigured
     }
 }
@@ -73,6 +117,8 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
     public private(set) var readAcks: [String] = []
     public private(set) var presenceSubscriptions: [String] = []
     public private(set) var createdGroups: [String] = []
+    public private(set) var uploadedMedia: [String] = []
+    public private(set) var fetchedMedia: [String] = []
 
     private var eventIndex = 0
     private var emittedDisconnect = false
@@ -80,6 +126,8 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
     private var groupVersions: [String: UInt64] = [:]
     private var groupMembers: [String: Set<String>] = [:]
     private var groupAdmins: [String: Set<String>] = [:]
+    private var mediaBlobs: [String: FetchedMediaBlob] = [:]
+    private var uploadBusy = false
 
     public init() {}
 
@@ -124,8 +172,15 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
     }
 
     public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+        try await sendChat(to: to, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data, mediaId: String) async throws -> UInt64 {
         guard didConnect, !didClose else { throw AppError.connection("not connected") }
         if let sendError { throw sendError }
+        if !mediaId.isEmpty, mediaBlobs[mediaId] == nil {
+            throw AppError.protocolError(code: "media", message: "unknown media_id")
+        }
         sent.append((to, messageId, body))
         seqCounter += 1
         let seq = seqCounter
@@ -134,7 +189,7 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
             if echoSendsToSelf, let user = lastRequest?.credentials.userId {
                 let b64 = body.base64EncodedString()
                 events.append(
-                    #"{"type":"ChatMessage","message_id":"\#(messageId)-echo","from_user":"\#(to)","to_user":"\#(user)","body_hex":"\#(b64)","sent_at":0,"seq":\#(seq + 1),"media_id":""}"#
+                    #"{"type":"ChatMessage","message_id":"\#(messageId)-echo","from_user":"\#(to)","to_user":"\#(user)","body_hex":"\#(b64)","sent_at":0,"seq":\#(seq + 1),"media_id":"\#(mediaId)"}"#
                 )
             }
         }
@@ -212,11 +267,18 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
     }
 
     public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        try await sendGroup(groupId: groupId, messageId: messageId, body: body, mediaId: "")
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data, mediaId: String) async throws {
         try requireReady()
         if let sendError { throw sendError }
         let me = lastRequest?.credentials.userId ?? "me"
         guard groupMembers[groupId]?.contains(me) == true else {
             throw AppError.protocolError(code: "authz", message: "not a member")
+        }
+        if !mediaId.isEmpty, mediaBlobs[mediaId] == nil {
+            throw AppError.protocolError(code: "media", message: "unknown media_id")
         }
         groupSent.append((groupId, messageId, body))
         seqCounter += 1
@@ -229,6 +291,44 @@ public final class MockMessengerTransport: MessengerTransport, @unchecked Sendab
                 #"{"type":"GroupAckSummary","message_id":"\#(messageId)","group_id":"\#(groupId)","member_count":\#(count),"delivered_count":\#(max(0, Int(count) - 1)),"read_count":0}"#
             )
         }
+    }
+
+    public func uploadMedia(mediaId: String, fileName: String, mimeType: String, data: Data) async throws -> UInt64 {
+        try requireReady()
+        if data.count > AppLimits.maxMediaBytes {
+            throw AppError.mediaTooLarge(size: data.count, limit: AppLimits.maxMediaBytes)
+        }
+        if uploadBusy {
+            throw AppError.protocolError(code: "media", message: "upload already in progress")
+        }
+        uploadBusy = true
+        defer { uploadBusy = false }
+        let sha = MediaHasher.sha256Hex(data)
+        mediaBlobs[mediaId] = FetchedMediaBlob(
+            data: data,
+            fileName: fileName,
+            mimeType: mimeType,
+            sha256: sha
+        )
+        uploadedMedia.append(mediaId)
+        events.append(
+            #"{"type":"MediaAck","media_id":"\#(mediaId)","ok":true,"complete":true,"received_bytes":\#(data.count)}"#
+        )
+        return UInt64(data.count)
+    }
+
+    public func fetchMedia(mediaId: String) async throws -> FetchedMediaBlob {
+        try requireReady()
+        guard let blob = mediaBlobs[mediaId] else {
+            throw AppError.protocolError(code: "media", message: "media not found")
+        }
+        fetchedMedia.append(mediaId)
+        return blob
+    }
+
+    /// Seed a blob for download tests without uploading.
+    public func seedMedia(_ blob: FetchedMediaBlob, mediaId: String) {
+        mediaBlobs[mediaId] = blob
     }
 
     public func enqueue(_ json: String) {

@@ -513,6 +513,18 @@ pub extern "C" fn lane_send_group(
     body: *const u8,
     body_len: usize,
 ) -> c_int {
+    lane_send_group_with_media(session, group_id, message_id, body, body_len, std::ptr::null())
+}
+
+#[no_mangle]
+pub extern "C" fn lane_send_group_with_media(
+    session: *mut LaneSession,
+    group_id: *const c_char,
+    message_id: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    media_id: *const c_char,
+) -> c_int {
     let Some(s) = (unsafe { session.as_ref() }) else {
         return FfiErrorCode::InvalidArgument.as_i32();
     };
@@ -528,7 +540,15 @@ pub extern "C" fn lane_send_group(
         Ok(b) => b,
         Err(c) => return c.as_i32(),
     };
-    match s.inner.send_group(gid, mid, body) {
+    let media = if media_id.is_null() {
+        ""
+    } else {
+        match cstr(media_id) {
+            Ok(t) => t,
+            Err(c) => return c.as_i32(),
+        }
+    };
+    match s.inner.send_group_with_media(gid, mid, body, media) {
         Ok(()) => FfiErrorCode::Ok.as_i32(),
         Err(e) => e.code().as_i32(),
     }
@@ -828,10 +848,12 @@ fn event_to_json(ev: &LaneEvent) -> String {
             e.version
         ),
         LaneEvent::MediaStart(m) => format!(
-            r#"{{"type":"MediaStart","media_id":"{}","file_name":"{}","total_size":{}}}"#,
+            r#"{{"type":"MediaStart","media_id":"{}","file_name":"{}","mime_type":"{}","total_size":{},"sha256":"{}"}}"#,
             json_escape(&m.media_id),
             json_escape(&m.file_name),
-            m.total_size
+            json_escape(&m.mime_type),
+            m.total_size,
+            json_escape(&m.sha256)
         ),
         LaneEvent::MediaChunk(c) => format!(
             r#"{{"type":"MediaChunk","media_id":"{}","offset":{},"last":{}}}"#,

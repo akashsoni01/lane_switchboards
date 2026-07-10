@@ -137,6 +137,7 @@ enum Cmd {
         group_id: String,
         message_id: String,
         body: Vec<u8>,
+        media_id: String,
         reply: oneshot::Sender<Result<(), FfiError>>,
     },
     UploadMedia {
@@ -481,10 +482,21 @@ impl SessionHandle {
         message_id: &str,
         body: &[u8],
     ) -> Result<(), FfiError> {
+        self.send_group_with_media(group_id, message_id, body, "")
+    }
+
+    pub fn send_group_with_media(
+        &self,
+        group_id: &str,
+        message_id: &str,
+        body: &[u8],
+        media_id: &str,
+    ) -> Result<(), FfiError> {
         self.call(|reply| Cmd::SendGroup {
             group_id: group_id.into(),
             message_id: message_id.into(),
             body: body.to_vec(),
+            media_id: media_id.into(),
             reply,
         })
     }
@@ -1390,6 +1402,7 @@ async fn handle_cmd(state: &mut ActorState, cmd: Cmd) -> bool {
             group_id,
             message_id,
             body,
+            media_id,
             reply,
         } => {
             let user = state.client.user_id().to_string();
@@ -1401,7 +1414,7 @@ async fn handle_cmd(state: &mut ActorState, cmd: Cmd) -> bool {
                     group_id,
                     body,
                     sent_at: unix_millis(),
-                    media_id: String::new(),
+                    media_id,
                     seq: 0,
                     to_user: String::new(),
                 }))

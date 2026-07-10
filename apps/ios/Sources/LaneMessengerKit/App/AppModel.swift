@@ -28,27 +28,35 @@ public final class AppModel {
     public var showNewChat = false
     public var showCreateGroup = false
     public var showGroupInfo = false
+    public var showAttachMenu = false
+    public var showFileImporter = false
+    public var previewMediaId: String?
     public var isBusy = false
     public var isSending = false
+    public private(set) var mediaTransfers: [String: MediaTransferProgress] = [:]
 
     public var config: AppConfig
     public let credentialsStore: CredentialStore
     public let authService: AuthService
     public let session: SessionActor
     public let store: LocalStore
+    public let mediaBlobs: MediaBlobStore
+    public let media: MediaService
     public var chat: ChatService { ChatService(store: store, session: session) }
     public var groups: GroupService { GroupService(store: store, session: session) }
 
     private var eventsTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
+    private var mediaPollTask: Task<Void, Never>?
 
     public init(
         config: AppConfig = .default,
         credentialsStore: CredentialStore = CredentialStore(),
         authService: AuthService? = nil,
         transport: MessengerTransport? = nil,
-        store: LocalStore? = nil
+        store: LocalStore? = nil,
+        mediaBlobs: MediaBlobStore? = nil
     ) {
         self.config = config
         self.credentialsStore = credentialsStore
@@ -71,6 +79,9 @@ public final class AppModel {
             self.store = (try? SQLiteLocalStore(path: SQLiteLocalStore.defaultPath()))
                 ?? InMemoryLocalStore()
         }
+        let blobs = mediaBlobs ?? ((try? MediaBlobStore()) ?? (try! MediaBlobStore.inMemoryTemp()))
+        self.mediaBlobs = blobs
+        self.media = MediaService(store: self.store, blobs: blobs, session: self.session)
     }
 
     public var selectedIsGroup: Bool {
@@ -136,6 +147,7 @@ public final class AppModel {
         await session.close()
         try? credentialsStore.clearSession()
         try? store.wipeUserData()
+        try? mediaBlobs.wipeAll()
         credentials = nil
         connectionState = .disconnected
         pendingMessagesHint = 0
@@ -144,6 +156,7 @@ public final class AppModel {
         threadMessages = []
         selectedPeer = nil
         selectedGroup = nil
+        mediaTransfers = [:]
         stopEvents()
         route = .login
     }
@@ -239,17 +252,73 @@ public final class AppModel {
     public func retryMessage(_ message: StoredMessage) async {
         guard let peer = selectedPeer else { return }
         do {
-            if let groupId = Conversation.groupId(fromConversationId: peer) {
+            if !message.mediaId.isEmpty {
+                try await media.retryFailedAttachment(message)
+            } else if let groupId = Conversation.groupId(fromConversationId: peer) {
                 try await groups.retryFailed(message: message, groupId: groupId)
             } else {
                 try await chat.retryFailed(message: message, to: peer)
             }
+            await refreshMediaTransfers()
             reloadThread()
         } catch let err as AppError {
             errorBanner = err.errorDescription
         } catch {
             errorBanner = error.localizedDescription
         }
+    }
+
+    public func sendAttachment(data: Data, fileName: String, mimeType: String) async {
+        guard let peer = selectedPeer, let me = credentials?.userId else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            _ = try await media.sendAttachment(
+                conversationId: peer,
+                data: data,
+                fileName: fileName,
+                mimeType: mimeType,
+                caption: composeText.trimmingCharacters(in: .whitespacesAndNewlines),
+                fromUser: me
+            )
+            composeText = ""
+            await refreshMediaTransfers()
+            reloadThread()
+            refreshInbox()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+            await refreshMediaTransfers()
+            reloadThread()
+        } catch {
+            errorBanner = error.localizedDescription
+            reloadThread()
+        }
+    }
+
+    public func openMedia(_ mediaId: String) async {
+        do {
+            _ = try await media.ensureDownloaded(mediaId: mediaId)
+            await refreshMediaTransfers()
+            previewMediaId = mediaId
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+            await refreshMediaTransfers()
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    public func mediaMeta(_ mediaId: String) -> MediaBlobMeta? {
+        try? mediaBlobs.meta(for: mediaId)
+    }
+
+    public func mediaFileURL(_ mediaId: String) -> URL? {
+        guard mediaBlobs.hasComplete(mediaId) else { return nil }
+        return mediaBlobs.blobURL(for: mediaId)
+    }
+
+    public func refreshMediaTransfers() async {
+        mediaTransfers = await media.transfers
     }
 
     public func startChat(with userId: String) async {
@@ -387,6 +456,7 @@ public final class AppModel {
                 self.connectionState = await self.session.state
                 self.pendingMessagesHint = await self.session.pendingMessagesHint
                 self.lastPingRttMs = await self.session.lastPingRttMs
+                await self.refreshMediaTransfers()
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
@@ -395,8 +465,10 @@ public final class AppModel {
     private func stopEvents() {
         eventsTask?.cancel()
         stateTask?.cancel()
+        mediaPollTask?.cancel()
         eventsTask = nil
         stateTask = nil
+        mediaPollTask = nil
     }
 
     private func handle(_ event: LaneEvent) async {
@@ -439,6 +511,9 @@ public final class AppModel {
                 try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
                 try? store.markConversationRead(conversationId: stored.conversationId)
             }
+            if !mediaId.isEmpty {
+                Task { try? await media.ensureDownloaded(mediaId: mediaId) }
+            }
             refreshInbox()
             if selectedPeer == stored.conversationId { reloadThread() }
         case .groupMessage(let messageId, let fromUser, let groupId, let body, let seq, let mediaId, let sentAt):
@@ -465,6 +540,9 @@ public final class AppModel {
                 try? await session.ackRead(messageId: messageId)
                 try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
                 try? store.markConversationRead(conversationId: convoId)
+            }
+            if !mediaId.isEmpty {
+                Task { try? await media.ensureDownloaded(mediaId: mediaId) }
             }
             refreshInbox()
             if selectedPeer == convoId { reloadThread() }

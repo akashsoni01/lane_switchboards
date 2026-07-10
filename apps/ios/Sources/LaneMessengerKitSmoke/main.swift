@@ -28,6 +28,9 @@ struct Smoke {
         failed += check("group version gate", testGroupVersionGate())
         failed += await checkAsync("create add send group", testGroupCreateAddSend)
         failed += await checkAsync("non-member group send", testNonMemberGroupSend)
+        failed += check("media sha roundtrip", testMediaShaStore())
+        failed += await checkAsync("media size cap", testMediaTooLarge)
+        failed += await checkAsync("media upload send fetch", testMediaUploadSendFetch)
 
         if failed > 0 {
             fputs("FAILED \(failed) check(s)\n", stderr)
@@ -416,4 +419,109 @@ private func testNonMemberGroupSend() async -> Bool {
             return true
         }
     } catch { return false }
+}
+
+private func testMediaTooLarge() async -> Bool {
+    let over = Data(count: AppLimits.maxMediaBytes + 1)
+    do {
+        let blobs = try MediaBlobStore.inMemoryTemp()
+        let store = InMemoryLocalStore()
+        let transport = MockMessengerTransport()
+        let session = SessionActor(transport: transport)
+        let media = MediaService(store: store, blobs: blobs, session: session)
+        do {
+            _ = try await media.sendAttachment(
+                conversationId: "bob",
+                data: over,
+                fileName: "big.bin",
+                mimeType: "application/octet-stream",
+                caption: "",
+                fromUser: "alice"
+            )
+            return false
+        } catch let err as AppError {
+            if case .mediaTooLarge = err { return true }
+            return false
+        }
+    } catch { return false }
+}
+
+private func testMediaShaStore() -> Bool {
+    do {
+        let blobs = try MediaBlobStore.inMemoryTemp()
+        let data = Data("hello-media".utf8)
+        let sha = MediaHasher.sha256Hex(data)
+        _ = try blobs.write(
+            mediaId: "m1",
+            fileName: "a.txt",
+            mimeType: "text/plain",
+            data: data,
+            expectedSha256: sha,
+            complete: true
+        )
+        do {
+            _ = try blobs.write(
+                mediaId: "m2",
+                fileName: "b.txt",
+                mimeType: "text/plain",
+                data: data,
+                expectedSha256: "deadbeef",
+                complete: true
+            )
+            return false
+        } catch let err as AppError {
+            guard case .mediaCorrupt = err else { return false }
+        }
+        return blobs.hasComplete("m1") && !blobs.hasComplete("m2")
+    } catch { return false }
+}
+
+private func testMediaUploadSendFetch() async -> Bool {
+    let transport = MockMessengerTransport()
+    let store = InMemoryLocalStore()
+    do {
+        let blobs = try MediaBlobStore.inMemoryTemp()
+        let session = SessionActor(transport: transport)
+        let media = MediaService(store: store, blobs: blobs, session: session)
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let pdf = Data("%PDF-1.4 smoke".utf8)
+        let msg = try await media.sendAttachment(
+            conversationId: "bob",
+            data: pdf,
+            fileName: "report.pdf",
+            mimeType: "application/pdf",
+            caption: "see attached",
+            fromUser: "alice"
+        )
+        guard !msg.mediaId.isEmpty, transport.uploadedMedia.contains(msg.mediaId) else {
+            await session.close()
+            return false
+        }
+        // Simulate peer fetch from same mock blob store.
+        let fetched = try await session.fetchMedia(mediaId: msg.mediaId)
+        let peerBlobs = try MediaBlobStore.inMemoryTemp()
+        _ = try peerBlobs.write(
+            mediaId: msg.mediaId,
+            fileName: fetched.fileName,
+            mimeType: fetched.mimeType,
+            data: fetched.data,
+            expectedSha256: fetched.sha256,
+            complete: true
+        )
+        let ok = peerBlobs.hasComplete(msg.mediaId)
+            && fetched.data == pdf
+            && transport.fetchedMedia.contains(msg.mediaId)
+        await session.close()
+        return ok
+    } catch {
+        print("  media path error: \(error)")
+        return false
+    }
 }

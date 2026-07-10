@@ -177,6 +177,9 @@ public struct GroupInfo: Sendable, Equatable, Identifiable {
 
 public enum AppLimits {
     public static let maxGroupMembers = 1024
+    /// Matches `ServerConfig.max_media_bytes` default.
+    public static let maxMediaBytes = 64 * 1024 * 1024
+    public static let maxMediaChunkBytes = 64 * 1024
 }
 
 /// Offline-first local store. `resume_after_seq` is the reconnect high-water mark.
