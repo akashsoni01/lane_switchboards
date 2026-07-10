@@ -3,6 +3,9 @@
 FunXMPP-style (WhatsApp-like) compact binary messaging plane. Start with the
 overview, then dive into the layer you care about.
 
+**Full stack (iOS → FFI → gateway) for beginners:**
+[`../ECOSYSTEM_GUIDE.md`](../ECOSYSTEM_GUIDE.md)
+
 | Doc | Contents |
 |-----|----------|
 | [00_overview.md](00_overview.md) | Architecture, components, delivery guarantees, scope |

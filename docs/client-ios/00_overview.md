@@ -1,7 +1,10 @@
 # Client iOS overview
 
 Production SwiftUI app for the FunXMPP messenger. **Wire / E2EE stay in Rust**
-(`lane_messenger_ffi`); iOS owns UI, Keychain, and (later) SQLite.
+(`lane_messenger_ffi`); iOS owns UI, Keychain, and SQLite.
+
+**New here?** Start with the full-stack beginner guide:
+[`docs/ECOSYSTEM_GUIDE.md`](../ECOSYSTEM_GUIDE.md).
 
 ```text
 SwiftUI (LaneMessenger)

@@ -101,6 +101,9 @@ Cross-platform client library: [`lane_messenger_ffi/`](lane_messenger_ffi/) (C A
 Platform scaffolds under [`bindings/`](bindings/); plan in [`todo_client_ffi.md`](todo_client_ffi.md);
 docs in [`docs/client-ffi/`](docs/client-ffi/00_overview.md).
 
+**End-to-end architecture + beginner runbook:**
+[`docs/ECOSYSTEM_GUIDE.md`](docs/ECOSYSTEM_GUIDE.md) (iOS → FFI → FunXMPP gateway).
+
 ```bash
 cargo test -p lane_messenger_ffi
 cargo build -p lane_messenger_ffi --release
