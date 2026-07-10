@@ -53,11 +53,20 @@ public final class AppModel {
     public var e2eeImportPassphrase = ""
     public private(set) var e2eeReady = false
     public private(set) var e2eeLocalIdentity = ""
+    public private(set) var isAppInBackground = false
+    public private(set) var badgeCount = 0
+    public private(set) var pushTokenHex: String?
+    public private(set) var notificationsAuthorized = false
+
+    public let notifications: NotificationPresenting
+    public let pushRegistrar: PushTokenRegistering
 
     private var eventsTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
     private var draftSaveTask: Task<Void, Never>?
     private var mediaPollTask: Task<Void, Never>?
+    /// Pending deep link / notification open before home is ready.
+    private var pendingOpenConversationId: String?
 
     public init(
         config: AppConfig = .default,
@@ -66,7 +75,9 @@ public final class AppModel {
         transport: MessengerTransport? = nil,
         store: LocalStore? = nil,
         mediaBlobs: MediaBlobStore? = nil,
-        e2eeEnabled: Bool = FeatureFlags.e2eeEnabled
+        e2eeEnabled: Bool = FeatureFlags.e2eeEnabled,
+        notifications: NotificationPresenting? = nil,
+        pushRegistrar: PushTokenRegistering? = nil
     ) {
         self.config = config
         self.credentialsStore = credentialsStore
@@ -93,6 +104,13 @@ public final class AppModel {
         self.mediaBlobs = blobs
         self.media = MediaService(store: self.store, blobs: blobs, session: self.session)
         self.e2ee = E2eeService(session: self.session, enabled: e2eeEnabled)
+        #if canImport(UserNotifications)
+        self.notifications = notifications ?? SystemNotificationPresenter()
+        #else
+        self.notifications = notifications ?? RecordingNotificationPresenter()
+        #endif
+        self.pushRegistrar = pushRegistrar ?? StubPushTokenRegistrar()
+        self.notifications.previewPolicy = .default
     }
 
     public var selectedIsGroup: Bool {
@@ -118,6 +136,9 @@ public final class AppModel {
                 refreshContacts()
                 await seedDebugContactsIfNeeded()
                 await subscribePresenceRoster()
+                await requestNotificationPermission()
+                await flushPendingOpen()
+                await refreshBadge()
             } else {
                 route = .login
             }
@@ -146,6 +167,16 @@ public final class AppModel {
             refreshContacts()
             await seedDebugContactsIfNeeded()
             await subscribePresenceRoster()
+            await requestNotificationPermission()
+            if let token = pushTokenHex {
+                try? await pushRegistrar.register(
+                    deviceTokenHex: token,
+                    userId: creds.userId,
+                    deviceId: creds.deviceId
+                )
+            }
+            await flushPendingOpen()
+            await refreshBadge()
         } catch let err as AppError {
             errorBanner = err.errorDescription
             if err == .replacedByNewSession { showReplacedAlert = true }
@@ -155,6 +186,9 @@ public final class AppModel {
     }
 
     public func signOut() async {
+        if let creds = credentials {
+            try? await pushRegistrar.unregister(userId: creds.userId, deviceId: creds.deviceId)
+        }
         await session.close()
         try? credentialsStore.clearSession()
         try? store.wipeUserData()
@@ -168,6 +202,8 @@ public final class AppModel {
         selectedPeer = nil
         selectedGroup = nil
         mediaTransfers = [:]
+        badgeCount = 0
+        await notifications.setBadge(0)
         stopEvents()
         route = .login
     }
@@ -182,12 +218,89 @@ public final class AppModel {
 
     public func handleScenePhase(_ phase: String) async {
         let foreground = phase == "active"
+        isAppInBackground = !foreground
         await session.setAppInForeground(foreground)
         connectionState = await session.state
+        if foreground {
+            await refreshBadge()
+            await flushPendingOpen()
+        }
     }
 
     public func refreshInbox() {
         inbox = (try? store.conversations()) ?? []
+        Task { await refreshBadge() }
+    }
+
+    public func refreshBadge() async {
+        let total = UnreadBadge.total(from: (try? store.conversations()) ?? inbox)
+        badgeCount = total
+        await notifications.setBadge(total)
+    }
+
+    /// Cold start / tap from APNs or local notification.
+    public func handleNotificationOpen(userInfo: [AnyHashable: Any]) async {
+        guard let payload = PushPayload.parse(userInfo: userInfo) else { return }
+        await openFromPush(payload)
+    }
+
+    public func handleDeepLink(_ url: URL) async {
+        guard let payload = PushPayload.parse(url: url) else { return }
+        await openFromPush(payload)
+    }
+
+    public func openFromPush(_ payload: PushPayload) async {
+        if route != .home {
+            pendingOpenConversationId = payload.conversationId
+            return
+        }
+        await openChat(peer: payload.conversationId)
+    }
+
+    public func didRegisterForRemoteNotifications(deviceToken: Data) async {
+        let hex = PushTokenFormat.hex(deviceToken)
+        pushTokenHex = hex
+        guard let creds = credentials else { return }
+        do {
+            try await pushRegistrar.register(
+                deviceTokenHex: hex,
+                userId: creds.userId,
+                deviceId: creds.deviceId
+            )
+        } catch {
+            LaneLog.ui.error("push token register failed")
+        }
+    }
+
+    public func requestNotificationPermission() async {
+        notificationsAuthorized = await notifications.requestAuthorization()
+    }
+
+    private func flushPendingOpen() async {
+        guard route == .home, let id = pendingOpenConversationId else { return }
+        pendingOpenConversationId = nil
+        await openChat(peer: id)
+    }
+
+    private func maybeNotifyInbound(
+        conversationId: String,
+        messageId: String,
+        senderId: String,
+        preview: String,
+        encrypted: Bool
+    ) async {
+        guard isAppInBackground else { return }
+        // Don't notify for the thread the user already has open (rare in background).
+        if selectedPeer == conversationId { return }
+        let payload = PushPayload(
+            conversationId: conversationId,
+            messageId: messageId,
+            senderId: senderId,
+            preview: preview,
+            encrypted: encrypted
+        )
+        await notifications.presentLocal(payload: payload)
+        await refreshBadge()
     }
 
     public func refreshContacts() {
@@ -215,6 +328,8 @@ public final class AppModel {
         reloadThread()
         refreshInbox()
         refreshSelectedGroup()
+        await notifications.clearNotifications(forConversationId: peer)
+        await refreshBadge()
     }
 
     public func closeChat() {
@@ -585,6 +700,15 @@ public final class AppModel {
             }
             refreshInbox()
             if selectedPeer == stored.conversationId { reloadThread() }
+            if direction == .inbound {
+                await maybeNotifyInbound(
+                    conversationId: stored.conversationId,
+                    messageId: messageId,
+                    senderId: fromUser,
+                    preview: text,
+                    encrypted: decrypted.wasEncrypted
+                )
+            }
         case .groupMessage(let messageId, let fromUser, let groupId, _, let bodyData, let seq, let mediaId, let sentAt):
             let decrypted = await e2ee.decryptInboundGroup(groupId: groupId, body: bodyData)
             let text = decrypted.text
@@ -617,6 +741,15 @@ public final class AppModel {
             }
             refreshInbox()
             if selectedPeer == convoId { reloadThread() }
+            if direction == .inbound {
+                await maybeNotifyInbound(
+                    conversationId: convoId,
+                    messageId: messageId,
+                    senderId: fromUser,
+                    preview: text,
+                    encrypted: decrypted.wasEncrypted
+                )
+            }
         case .keyBundle(let userId, _, let identityKey, let found):
             if found, !identityKey.isEmpty {
                 try? await e2ee.rememberPeerIdentity(userId: userId, identityKey: identityKey)

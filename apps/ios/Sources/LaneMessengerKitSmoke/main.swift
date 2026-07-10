@@ -35,6 +35,11 @@ struct Smoke {
         failed += await checkAsync("e2ee encrypt decrypt", testE2eeChatRoundTrip)
         failed += await checkAsync("e2ee pickle roundtrip", testE2eePickle)
         failed += await checkAsync("e2ee megolm group", testE2eeMegolm)
+        failed += check("push payload parse", testPushPayload())
+        failed += check("push deep link", testPushDeepLink())
+        failed += check("preview policy e2ee", testPreviewPolicy())
+        failed += check("badge unread sum", testBadgeSum())
+        failed += await checkAsync("background notify + open", testBackgroundNotifyAndOpen)
 
         if failed > 0 {
             fputs("FAILED \(failed) check(s)\n", stderr)
@@ -637,4 +642,96 @@ private func testE2eeMegolm() async -> Bool {
         print("  megolm error: \(error)")
         return false
     }
+}
+
+private func testPushPayload() -> Bool {
+    let info: [AnyHashable: Any] = [
+        "lane": [
+            "conversation_id": "bob",
+            "message_id": "m1",
+            "sender_id": "bob",
+            "preview": "hi",
+            "encrypted": true,
+        ] as [String: Any],
+    ]
+    let p = PushPayload.parse(userInfo: info)
+    return p?.conversationId == "bob" && p?.encrypted == true && p?.messageId == "m1"
+}
+
+private func testPushDeepLink() -> Bool {
+    let a = PushPayload.parse(url: URL(string: "lane://chat/bob")!)
+    let b = PushPayload.parse(url: URL(string: "https://lane.app/chat/group:g1")!)
+    return a?.conversationId == "bob" && b?.conversationId == "group:g1"
+}
+
+private func testPreviewPolicy() -> Bool {
+    let payload = PushPayload(
+        conversationId: "bob",
+        senderId: "bob",
+        preview: "secret text",
+        encrypted: true
+    )
+    let hide = NotificationPreviewPolicy.hideBodyWhenE2EE.displayBody(for: payload)
+    let show = NotificationPreviewPolicy.showPreview.displayBody(for: payload)
+    return hide == "New message" && show == "secret text"
+}
+
+private func testBadgeSum() -> Bool {
+    let rows = [
+        Conversation(id: "a", unread: 2),
+        Conversation(id: "b", unread: 3),
+        Conversation(id: "c", unread: 0),
+    ]
+    return UnreadBadge.total(from: rows) == 5
+}
+
+@MainActor
+private func testBackgroundNotifyAndOpen() async -> Bool {
+    let transport = MockMessengerTransport()
+    let notes = RecordingNotificationPresenter()
+    let registrar = StubPushTokenRegistrar()
+    let creds = CredentialStore(
+        keychain: KeychainStore(service: "com.lane.smoke.push.\(UUID().uuidString)")
+    )
+    let model = AppModel(
+        credentialsStore: creds,
+        transport: transport,
+        store: InMemoryLocalStore(),
+        mediaBlobs: try? MediaBlobStore.inMemoryTemp(),
+        e2eeEnabled: false,
+        notifications: notes,
+        pushRegistrar: registrar
+    )
+    notes.previewPolicy = .showPreview
+    // Cold-start deep link before session is home.
+    await model.handleDeepLink(URL(string: "lane://chat/bob")!)
+    #if DEBUG
+    await model.signIn(userId: "alice", secret: "")
+    #else
+    return true
+    #endif
+    for _ in 0..<50 {
+        if model.route == .home { break }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+    let opened = model.selectedPeer == "bob"
+    model.closeChat()
+    await model.handleScenePhase("background")
+    let body = Data("hello push".utf8).base64EncodedString()
+    transport.enqueue(
+        #"{"type":"ChatMessage","message_id":"push-1","from_user":"bob","to_user":"alice","body_hex":"\#(body)","sent_at":1,"seq":50,"media_id":""}"#
+    )
+    for _ in 0..<80 {
+        if notes.presented.contains(where: { $0.conversationId == "bob" && $0.messageId == "push-1" }) {
+            break
+        }
+        try? await Task.sleep(nanoseconds: 25_000_000)
+    }
+    let notified = notes.presented.contains(where: { $0.messageId == "push-1" })
+    await model.refreshBadge()
+    await model.didRegisterForRemoteNotifications(deviceToken: Data([0xAB, 0xCD]))
+    let registered = registrar.registeredTokens.contains("abcd")
+    let badgeOk = model.badgeCount >= 1
+    await model.signOut()
+    return opened && notified && registered && badgeOk
 }
