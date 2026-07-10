@@ -26,4 +26,6 @@ TLS + FunXMPP → gateway
 
 - **I0** — kit + `SessionActor` + mock/FFI transport
 - **I1** — Keychain credentials, login/splash/home, kick alert
-- I2+ — reconnect, GRDB, chat UI, … (see `todo_ios.md`)
+- **I2** — reconnect / ping / protocol errors / scene phase
+- **I3** — SQLite local store + resume seq
+- I4+ — inbox/chat UI, presence, groups, … (see `todo_ios.md`)

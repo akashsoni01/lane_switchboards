@@ -11,7 +11,10 @@ let package = Package(
     targets: [
         .target(
             name: "LaneMessengerKit",
-            path: "Sources/LaneMessengerKit"
+            path: "Sources/LaneMessengerKit",
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+            ]
         ),
         .executableTarget(
             name: "LaneMessengerKitSmoke",

@@ -6,8 +6,8 @@ wire codec, E2EE, or framing in Swift.
 
 Legend: `[ ]` pending · `[~]` in progress / partial · `[x]` done
 
-**Status:** I0–I1 in progress (2026-07-10). Kit + auth/Keychain/login shell
-under `apps/ios/`; server + FFI remain the foundation.
+**Status:** I0–I3 in progress (2026-07-10). Kit covers auth, session
+reconnect, and SQLite local store under `apps/ios/`.
 
 | Layer | Source of truth | iOS responsibility |
 |-------|-----------------|--------------------|
@@ -229,23 +229,24 @@ Disconnected → Connecting → AwaitingLogin → Syncing → Ready
                      ↑_______________|  (backoff reconnect)
 ```
 
-- [ ] Expose `ConnectionState` to UI (banner: Connecting / Syncing / Ready /
+- [x] Expose `ConnectionState` to UI (banner: Connecting / Syncing / Ready /
       Offline).
-- [ ] Auto-ping via FFI (`ping_interval_secs`); surface RTT in DEBUG only.
-- [ ] Foreground: resume connection; Background: expect disconnect.
-- [ ] On reconnect: set `resume_after_seq` from local DB high-water mark
+- [x] Auto-ping via FFI (`ping_interval_secs`); surface RTT in DEBUG only.
+- [x] Foreground: resume connection; Background: expect disconnect.
+- [x] On reconnect: set `resume_after_seq` from local DB high-water mark
       **before** connect (FFI `set_resume_seq` / connect option).
-- [ ] Sync progress UI when `LoginAck.pending_messages > 0`.
-- [ ] Map `ProtocolError` codes to UX (upgrade, re-auth, rate limit, etc.).
-- [ ] Backoff: exponential with jitter; cap; pause on `UNSUPPORTED_VERSION`.
+- [x] Sync progress UI when `LoginAck.pending_messages > 0`.
+- [x] Map `ProtocolError` codes to UX (upgrade, re-auth, rate limit, etc.).
+- [x] Backoff: exponential with jitter; cap; pause on `UNSUPPORTED_VERSION`.
 
 **Tests**
-- [ ] Integration (simulator + local gateway): LoginAck → SyncComplete.
+- [~] Integration (simulator + local gateway): LoginAck → SyncComplete
+      (mock + smoke; live gateway when XCFramework linked).
 - [ ] Kill Wi-Fi / toggle airplane → reconnect + catch-up.
-- [ ] Same-device second login kicks first (parity FFI smoke).
+- [x] Same-device second login kicks first (parity FFI / mock smoke).
 
 **Docs**
-- [ ] `docs/client-ios/02_session.md` — state machine + resume rules.
+- [x] `docs/client-ios/02_session.md` — state machine + resume rules.
 
 **Exit criteria**: stable Ready; idle reconnect restores inbox without
 duplicates (idempotent `message_id`).
@@ -256,29 +257,29 @@ duplicates (idempotent `message_id`).
 
 Offline-first UI; socket is the sync pipe, not the source of truth for display.
 
-- [ ] Adopt **GRDB** (or equivalent) with migrations.
-- [ ] Tables (minimum):
-      - [ ] `conversations` (peer or group id, sort_ts, unread, draft)
-      - [ ] `messages` (id, conversation_id, direction, body/ciphertext meta,
+- [x] Adopt SQLite (system `sqlite3`; GRDB optional later) with migrations.
+- [x] Tables (minimum):
+      - [x] `conversations` (peer or group id, sort_ts, unread, draft)
+      - [x] `messages` (id, conversation_id, direction, body/ciphertext meta,
             media_id, seq, status, created_at)
-      - [ ] `contacts` (user_id, display_name, presence, last_seen)
-      - [ ] `groups` / `group_members` (versioned membership)
-      - [ ] `meta` (`resume_after_seq`, schema_version)
-- [ ] Message status enum: `pending → sent(ServerAck) → delivered → read`
+      - [x] `contacts` (user_id, display_name, presence, last_seen)
+      - [x] `groups` / `group_members` (versioned membership)
+      - [x] `meta` (`resume_after_seq`, schema_version)
+- [x] Message status enum: `pending → sent(ServerAck) → delivered → read`
       (+ `failed`).
-- [ ] Idempotent upsert on `message_id` (replay-safe).
-- [ ] Apply inbound FFI events → DB → UI observation (`ValueObservation`
-      or `AsyncStream`).
-- [ ] Outbound: write pending row **first**, then FFI send; on failure mark
-      `failed` + retry affordance.
+- [x] Idempotent upsert on `message_id` (replay-safe).
+- [x] Apply inbound FFI events → DB → UI observation (`AsyncStream` +
+      inbox refresh).
+- [~] Outbound: write pending row **first**, then FFI send; on failure mark
+      `failed` + retry affordance. (wired in I4 with send UI)
 
 **Tests**
-- [ ] Migration up/down smoke.
-- [ ] Duplicate `message_id` does not double-insert.
-- [ ] `resume_after_seq` advances only on durable apply.
+- [x] Migration / in-memory smoke.
+- [x] Duplicate `message_id` does not double-insert.
+- [x] `resume_after_seq` advances only on durable apply.
 
 **Docs**
-- [ ] `docs/client-ios/03_storage.md` — schema, retention, wipe-on-logout
+- [x] `docs/client-ios/03_storage.md` — schema, retention, wipe-on-logout
       policy.
 
 **Exit criteria**: kill app mid-sync; relaunch shows consistent history;

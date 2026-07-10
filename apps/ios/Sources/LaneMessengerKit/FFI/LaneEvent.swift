@@ -10,10 +10,10 @@ public enum ConnectionState: String, Sendable, Equatable {
     case replaced
 }
 
-/// Parsed FFI poll JSON (see `lane_messenger_ffi` event_json).
+/// Parsed FFI poll JSON (see `lane_messenger_ffi` / C `event_to_json`).
 public enum LaneEvent: Sendable, Equatable {
-    case loginAck(sessionId: String, ok: Bool)
-    case syncComplete(latestSeq: UInt64)
+    case loginAck(sessionId: String, ok: Bool, pendingMessages: UInt32, error: String)
+    case syncComplete(latestSeq: UInt64, delivered: UInt32)
     case chatMessage(messageId: String, fromUser: String, seq: UInt64)
     case serverAck(messageId: String, seq: UInt64)
     case deliveredAck(messageId: String)
@@ -21,6 +21,7 @@ public enum LaneEvent: Sendable, Equatable {
     case groupMessage(messageId: String, groupId: String)
     case groupAckSummary(messageId: String, memberCount: UInt32)
     case presence(userId: String, kind: Int)
+    case protocolError(code: Int, detail: String)
     case replacedByNewSession
     case disconnected(reason: String)
     case other(raw: String)
@@ -36,24 +37,25 @@ public enum LaneEvent: Sendable, Equatable {
         case "LoginAck":
             return .loginAck(
                 sessionId: obj["session_id"] as? String ?? "",
-                ok: obj["ok"] as? Bool ?? false
+                ok: obj["ok"] as? Bool ?? false,
+                pendingMessages: uint32(obj["pending_messages"]),
+                error: obj["error"] as? String ?? ""
             )
         case "SyncComplete":
-            let seq: UInt64
-            if let n = obj["latest_seq"] as? NSNumber { seq = n.uint64Value }
-            else if let i = obj["latest_seq"] as? Int { seq = UInt64(i) }
-            else { seq = 0 }
-            return .syncComplete(latestSeq: seq)
+            return .syncComplete(
+                latestSeq: uint64(obj["latest_seq"]),
+                delivered: uint32(obj["delivered"])
+            )
         case "ChatMessage":
             return .chatMessage(
                 messageId: obj["message_id"] as? String ?? "",
                 fromUser: obj["from_user"] as? String ?? "",
-                seq: (obj["seq"] as? NSNumber)?.uint64Value ?? 0
+                seq: uint64(obj["seq"])
             )
         case "ServerAck":
             return .serverAck(
                 messageId: obj["message_id"] as? String ?? "",
-                seq: (obj["seq"] as? NSNumber)?.uint64Value ?? 0
+                seq: uint64(obj["seq"])
             )
         case "DeliveredAck":
             return .deliveredAck(messageId: obj["message_id"] as? String ?? "")
@@ -67,12 +69,17 @@ public enum LaneEvent: Sendable, Equatable {
         case "GroupAckSummary":
             return .groupAckSummary(
                 messageId: obj["message_id"] as? String ?? "",
-                memberCount: (obj["member_count"] as? NSNumber)?.uint32Value ?? 0
+                memberCount: uint32(obj["member_count"])
             )
         case "Presence":
             return .presence(
                 userId: obj["user_id"] as? String ?? "",
                 kind: obj["kind"] as? Int ?? 0
+            )
+        case "ProtocolError":
+            return .protocolError(
+                code: obj["code"] as? Int ?? (obj["code"] as? NSNumber)?.intValue ?? 0,
+                detail: obj["detail"] as? String ?? ""
             )
         case "ReplacedByNewSession":
             return .replacedByNewSession
@@ -101,4 +108,18 @@ public struct ConnectRequest: Sendable, Equatable {
         self.resumeAfterSeq = resumeAfterSeq
         self.clientVersion = clientVersion
     }
+}
+
+private func uint64(_ value: Any?) -> UInt64 {
+    if let n = value as? NSNumber { return n.uint64Value }
+    if let i = value as? Int { return UInt64(i) }
+    if let u = value as? UInt64 { return u }
+    return 0
+}
+
+private func uint32(_ value: Any?) -> UInt32 {
+    if let n = value as? NSNumber { return n.uint32Value }
+    if let i = value as? Int { return UInt32(i) }
+    if let u = value as? UInt32 { return u }
+    return 0
 }

@@ -2,6 +2,9 @@ import SwiftUI
 
 public struct RootView: View {
     @Bindable var model: AppModel
+    #if os(iOS)
+    @Environment(\.scenePhase) private var scenePhase
+    #endif
 
     public init(model: AppModel) {
         self.model = model
@@ -23,6 +26,18 @@ public struct RootView: View {
                 await model.bootstrap()
             }
         }
+        #if os(iOS)
+        .onChange(of: scenePhase) { _, phase in
+            Task {
+                switch phase {
+                case .active: await model.handleScenePhase("active")
+                case .inactive: await model.handleScenePhase("inactive")
+                case .background: await model.handleScenePhase("background")
+                @unknown default: break
+                }
+            }
+        }
+        #endif
         .alert(
             "Signed in elsewhere",
             isPresented: $model.showReplacedAlert
@@ -32,6 +47,14 @@ public struct RootView: View {
             }
         } message: {
             Text(AppError.replacedByNewSession.errorDescription)
+        }
+        .alert(
+            "Update required",
+            isPresented: $model.showUpgradeAlert
+        ) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(ProtocolErrorCode.unsupportedVersion.userMessage)
         }
     }
 }
@@ -84,7 +107,10 @@ public struct LoginView: View {
                 Section {
                     Button {
                         Task {
-                            await model.signIn(userId: userId.trimmingCharacters(in: .whitespaces), secret: secret)
+                            await model.signIn(
+                                userId: userId.trimmingCharacters(in: .whitespaces),
+                                secret: secret
+                            )
                         }
                     } label: {
                         if model.isBusy {
@@ -156,7 +182,41 @@ public struct HomeView: View {
                     LabeledContent("Device", value: shortDevice)
                     LabeledContent("State", value: model.connectionState.rawValue)
                     LabeledContent("Gateway", value: "\(model.config.host):\(model.config.port)")
+                    #if DEBUG
+                    if let rtt = model.lastPingRttMs {
+                        LabeledContent("Ping RTT", value: "\(rtt) ms")
+                    }
+                    #endif
                 }
+
+                Section("Chats") {
+                    if model.inbox.isEmpty {
+                        Text("No conversations yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.inbox) { convo in
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack {
+                                    Text(convo.title).font(.headline)
+                                    Spacer()
+                                    if convo.unread > 0 {
+                                        Text("\(convo.unread)")
+                                            .font(.caption2.weight(.bold))
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(.blue, in: Capsule())
+                                            .foregroundStyle(.white)
+                                    }
+                                }
+                                Text(convo.lastPreview.isEmpty ? " " : convo.lastPreview)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
+
                 Section {
                     Button("Sign out", role: .destructive) {
                         Task { await model.signOut() }
@@ -165,8 +225,8 @@ public struct HomeView: View {
             }
             .navigationTitle("Chats")
             .overlay(alignment: .top) {
-                if model.connectionState != .ready {
-                    Text(statusBanner)
+                if let banner = statusBanner {
+                    Text(banner)
                         .font(.footnote.weight(.medium))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
@@ -174,6 +234,7 @@ public struct HomeView: View {
                         .padding(.top, 8)
                 }
             }
+            .onAppear { model.refreshInbox() }
         }
     }
 
@@ -184,14 +245,23 @@ public struct HomeView: View {
         return String(id.prefix(8)) + "…"
     }
 
-    private var statusBanner: String {
+    private var statusBanner: String? {
         switch model.connectionState {
-        case .connecting, .awaitingLogin: return "Connecting…"
-        case .syncing: return "Syncing…"
-        case .offline: return "Offline"
-        case .replaced: return "Signed in elsewhere"
-        case .disconnected: return "Disconnected"
-        case .ready: return ""
+        case .connecting, .awaitingLogin:
+            return "Connecting…"
+        case .syncing:
+            if model.pendingMessagesHint > 0 {
+                return "Syncing \(model.pendingMessagesHint) messages…"
+            }
+            return "Syncing…"
+        case .offline:
+            return "Offline — reconnecting…"
+        case .replaced:
+            return "Signed in elsewhere"
+        case .disconnected:
+            return "Disconnected"
+        case .ready:
+            return nil
         }
     }
 }
