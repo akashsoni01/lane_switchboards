@@ -90,4 +90,49 @@ public final class LaneFFITransport: MessengerTransport, @unchecked Sendable {
         throw AppError.notConfigured
         #endif
     }
+
+    public func createGroup(groupId: String) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.createGroup(groupId: groupId)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func addMember(groupId: String, user: String) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.addMember(groupId: groupId, user: user)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func removeMember(groupId: String, user: String) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.removeMember(groupId: groupId, user: user)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func leaveGroup(groupId: String) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.leaveGroup(groupId: groupId)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        try session.sendGroup(groupId: groupId, messageId: messageId, body: body)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
 }

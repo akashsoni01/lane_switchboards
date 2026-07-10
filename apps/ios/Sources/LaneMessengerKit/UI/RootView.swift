@@ -172,6 +172,12 @@ struct HomeShellView: View {
         .sheet(isPresented: $model.showNewChat) {
             NewChatSheet(model: model)
         }
+        .sheet(isPresented: $model.showCreateGroup) {
+            CreateGroupSheet(model: model)
+        }
+        .sheet(isPresented: $model.showGroupInfo) {
+            GroupInfoSheet(model: model)
+        }
     }
 }
 
@@ -215,12 +221,21 @@ public struct InboxView: View {
         .navigationTitle("Chats")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button {
-                    model.showNewChat = true
+                Menu {
+                    Button {
+                        model.showNewChat = true
+                    } label: {
+                        Label("New chat", systemImage: "square.and.pencil")
+                    }
+                    Button {
+                        model.showCreateGroup = true
+                    } label: {
+                        Label("New group", systemImage: "person.3")
+                    }
                 } label: {
-                    Image(systemName: "square.and.pencil")
+                    Image(systemName: "plus")
                 }
-                .accessibilityLabel("New chat")
+                .accessibilityLabel("New")
             }
             ToolbarItem(placement: .navigation) {
                 Menu {
@@ -283,11 +298,18 @@ struct InboxRow: View {
         HStack(spacing: 12) {
             ZStack(alignment: .bottomTrailing) {
                 AvatarView(title: conversation.title)
-                PresenceDot(kind: conversation.presence)
-                    .offset(x: 2, y: 2)
+                if !conversation.isGroup {
+                    PresenceDot(kind: conversation.presence)
+                        .offset(x: 2, y: 2)
+                }
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
+                    if conversation.isGroup {
+                        Image(systemName: "person.3.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                     Text(conversation.title)
                         .font(.headline)
                         .foregroundStyle(.primary)
@@ -327,6 +349,19 @@ public struct ChatThreadView: View {
         self.peer = peer
     }
 
+    private var isGroup: Bool {
+        Conversation.groupId(fromConversationId: peer) != nil
+    }
+
+    private var title: String {
+        if isGroup {
+            return model.selectedGroup?.title
+                ?? model.inbox.first(where: { $0.id == peer })?.title
+                ?? peer
+        }
+        return peer
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             if model.connectionState != .ready {
@@ -346,9 +381,11 @@ public struct ChatThreadView: View {
                                 .foregroundStyle(.secondary)
                                 .padding(.vertical, 4)
                             ForEach(group.messages) { message in
-                                MessageBubble(message: message) {
-                                    Task { await model.retryMessage(message) }
-                                }
+                                MessageBubble(
+                                    message: message,
+                                    showSender: isGroup && message.direction == .inbound,
+                                    onRetry: { Task { await model.retryMessage(message) } }
+                                )
                                 .id(message.messageId)
                             }
                         }
@@ -366,10 +403,23 @@ public struct ChatThreadView: View {
             Divider()
             composer
         }
-        .navigationTitle(peer)
+        .navigationTitle(title)
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .toolbar {
+            if isGroup {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        model.refreshSelectedGroup()
+                        model.showGroupInfo = true
+                    } label: {
+                        Image(systemName: "info.circle")
+                    }
+                    .accessibilityLabel("Group info")
+                }
+            }
+        }
         .onAppear {
             Task { await model.openChat(peer: peer) }
         }
@@ -439,38 +489,68 @@ public struct ChatThreadView: View {
 
 struct MessageBubble: View {
     let message: StoredMessage
+    var showSender: Bool = false
     var onRetry: () -> Void
 
     var body: some View {
-        HStack {
-            if message.direction == .outbound { Spacer(minLength: 48) }
-            VStack(alignment: message.direction == .outbound ? .trailing : .leading, spacing: 4) {
-                Text(message.body.isEmpty ? (message.mediaId.isEmpty ? " " : "📎 Media") : message.body)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(
-                        message.direction == .outbound
-                            ? Color.accentColor.opacity(0.18)
-                            : Color.secondary.opacity(0.12),
-                        in: RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    )
-                HStack(spacing: 4) {
-                    Text(message.createdAt, style: .time)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                    MessageTicksView(
-                        status: message.status,
-                        isOutbound: message.direction == .outbound
-                    )
-                    if message.status == .failed {
-                        Button("Retry", action: onRetry)
+        if message.direction == .system {
+            Text(message.body)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 4)
+        } else {
+            HStack {
+                if message.direction == .outbound { Spacer(minLength: 48) }
+                VStack(alignment: message.direction == .outbound ? .trailing : .leading, spacing: 4) {
+                    if showSender, !message.fromUser.isEmpty {
+                        Text(message.fromUser)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(message.body.isEmpty ? (message.mediaId.isEmpty ? " " : "📎 Media") : message.body)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(
+                            message.direction == .outbound
+                                ? Color.accentColor.opacity(0.18)
+                                : Color.secondary.opacity(0.12),
+                            in: RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        )
+                    HStack(spacing: 4) {
+                        Text(message.createdAt, style: .time)
                             .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        MessageTicksView(
+                            status: message.status,
+                            isOutbound: message.direction == .outbound
+                        )
+                        if message.direction == .outbound, message.memberCount > 0 {
+                            Text(groupAckLabel)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        if message.status == .failed {
+                            Button("Retry", action: onRetry)
+                                .font(.caption2)
+                        }
                     }
                 }
+                if message.direction == .inbound { Spacer(minLength: 48) }
             }
-            if message.direction == .inbound { Spacer(minLength: 48) }
+            .accessibilityElement(children: .combine)
         }
-        .accessibilityElement(children: .combine)
+    }
+
+    private var groupAckLabel: String {
+        if message.readCount > 0 {
+            return "read \(message.readCount)/\(message.memberCount)"
+        }
+        if message.deliveredCount > 0 {
+            return "delivered \(message.deliveredCount)/\(message.memberCount)"
+        }
+        return ""
     }
 }
 
@@ -525,6 +605,138 @@ struct NewChatSheet: View {
                 }
             }
             .onAppear { model.refreshContacts() }
+        }
+    }
+}
+
+struct CreateGroupSheet: View {
+    @Bindable var model: AppModel
+    @State private var title = ""
+    @State private var selected: Set<String> = []
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Group name") {
+                    TextField("Title", text: $title)
+                }
+                Section {
+                    ForEach(model.contacts) { contact in
+                        Toggle(isOn: Binding(
+                            get: { selected.contains(contact.userId) },
+                            set: { on in
+                                if on { selected.insert(contact.userId) }
+                                else { selected.remove(contact.userId) }
+                            }
+                        )) {
+                            Text(contact.displayName)
+                        }
+                    }
+                } header: {
+                    Text("Members (\(selected.count)/\(AppLimits.maxGroupMembers - 1))")
+                } footer: {
+                    Text("Max \(AppLimits.maxGroupMembers) members including you.")
+                }
+                if let banner = model.errorBanner {
+                    Section { Text(banner).foregroundStyle(.red) }
+                }
+            }
+            .navigationTitle("New group")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { model.showCreateGroup = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        Task {
+                            await model.createGroup(
+                                title: title.trimmingCharacters(in: .whitespaces),
+                                memberIds: Array(selected)
+                            )
+                        }
+                    }
+                    .disabled(model.isBusy || selected.count >= AppLimits.maxGroupMembers)
+                }
+            }
+            .onAppear { model.refreshContacts() }
+        }
+    }
+}
+
+struct GroupInfoSheet: View {
+    @Bindable var model: AppModel
+    @State private var addUser = ""
+
+    private var me: String { model.credentials?.userId ?? "" }
+    private var isAdmin: Bool { model.selectedGroup?.isAdmin(me) == true }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if let group = model.selectedGroup {
+                    Section("Group") {
+                        Text(group.title)
+                        Text("\(group.memberCount) members · v\(group.version)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Section("Members") {
+                        ForEach(group.members) { member in
+                            HStack {
+                                Text(member.userId)
+                                if member.isAdmin {
+                                    Text("admin")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(Color.secondary.opacity(0.2), in: Capsule())
+                                }
+                                Spacer()
+                                if isAdmin, member.userId != me {
+                                    Button("Remove", role: .destructive) {
+                                        Task { await model.removeGroupMember(member.userId) }
+                                    }
+                                    .font(.caption)
+                                }
+                            }
+                        }
+                    }
+                    if isAdmin {
+                        Section("Add member") {
+                            TextField("user id", text: $addUser)
+                                #if os(iOS)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                                #endif
+                            Button("Add") {
+                                Task {
+                                    await model.addGroupMember(addUser)
+                                    addUser = ""
+                                }
+                            }
+                            .disabled(
+                                addUser.trimmingCharacters(in: .whitespaces).isEmpty
+                                    || (model.selectedGroup?.memberCount ?? 0) >= AppLimits.maxGroupMembers
+                            )
+                        }
+                    }
+                    Section {
+                        Button("Leave group", role: .destructive) {
+                            Task { await model.leaveSelectedGroup() }
+                        }
+                    }
+                } else {
+                    Text("Group not found")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Group info")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { model.showGroupInfo = false }
+                }
+            }
+            .onAppear { model.refreshSelectedGroup() }
         }
     }
 }

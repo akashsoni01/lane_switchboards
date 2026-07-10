@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Root app state: auth, session, store, chat (I4), presence (I5).
+/// Root app state: auth, session, store, chat, presence, groups (I6).
 @MainActor
 @Observable
 public final class AppModel {
@@ -19,12 +19,15 @@ public final class AppModel {
     public private(set) var inbox: [Conversation] = []
     public private(set) var contacts: [Contact] = []
     public private(set) var threadMessages: [StoredMessage] = []
+    public private(set) var selectedGroup: GroupInfo?
     public var selectedPeer: String?
     public var composeText: String = ""
     public var errorBanner: String?
     public var showReplacedAlert = false
     public var showUpgradeAlert = false
     public var showNewChat = false
+    public var showCreateGroup = false
+    public var showGroupInfo = false
     public var isBusy = false
     public var isSending = false
 
@@ -34,6 +37,7 @@ public final class AppModel {
     public let session: SessionActor
     public let store: LocalStore
     public var chat: ChatService { ChatService(store: store, session: session) }
+    public var groups: GroupService { GroupService(store: store, session: session) }
 
     private var eventsTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
@@ -67,6 +71,16 @@ public final class AppModel {
             self.store = (try? SQLiteLocalStore(path: SQLiteLocalStore.defaultPath()))
                 ?? InMemoryLocalStore()
         }
+    }
+
+    public var selectedIsGroup: Bool {
+        guard let peer = selectedPeer else { return false }
+        return Conversation.groupId(fromConversationId: peer) != nil
+    }
+
+    public var selectedGroupId: String? {
+        guard let peer = selectedPeer else { return nil }
+        return Conversation.groupId(fromConversationId: peer)
     }
 
     public func bootstrap() async {
@@ -129,6 +143,7 @@ public final class AppModel {
         contacts = []
         threadMessages = []
         selectedPeer = nil
+        selectedGroup = nil
         stopEvents()
         route = .login
     }
@@ -155,9 +170,18 @@ public final class AppModel {
         contacts = (try? store.contacts()) ?? []
     }
 
+    public func refreshSelectedGroup() {
+        guard let gid = selectedGroupId else {
+            selectedGroup = nil
+            return
+        }
+        selectedGroup = try? store.group(id: gid)
+    }
+
     public func openChat(peer: String) async {
         selectedPeer = peer
-        try? store.ensureConversation(id: peer, title: peer)
+        let isGroup = Conversation.groupId(fromConversationId: peer) != nil
+        try? store.ensureConversation(id: peer, title: peer, isGroup: isGroup)
         if let draft = try? store.conversations().first(where: { $0.id == peer })?.draft {
             composeText = draft
         } else {
@@ -166,12 +190,15 @@ public final class AppModel {
         try? await chat.openThread(peer: peer)
         reloadThread()
         refreshInbox()
+        refreshSelectedGroup()
     }
 
     public func closeChat() {
         selectedPeer = nil
+        selectedGroup = nil
         composeText = ""
         threadMessages = []
+        showGroupInfo = false
     }
 
     public func updateDraft(_ text: String) {
@@ -192,7 +219,11 @@ public final class AppModel {
         isSending = true
         defer { isSending = false }
         do {
-            _ = try await chat.sendText(to: peer, body: text, fromUser: me)
+            if let groupId = Conversation.groupId(fromConversationId: peer) {
+                _ = try await groups.sendText(groupId: groupId, body: text, fromUser: me)
+            } else {
+                _ = try await chat.sendText(to: peer, body: text, fromUser: me)
+            }
             composeText = ""
             reloadThread()
             refreshInbox()
@@ -208,7 +239,11 @@ public final class AppModel {
     public func retryMessage(_ message: StoredMessage) async {
         guard let peer = selectedPeer else { return }
         do {
-            try await chat.retryFailed(message: message, to: peer)
+            if let groupId = Conversation.groupId(fromConversationId: peer) {
+                try await groups.retryFailed(message: message, groupId: groupId)
+            } else {
+                try await chat.retryFailed(message: message, to: peer)
+            }
             reloadThread()
         } catch let err as AppError {
             errorBanner = err.errorDescription
@@ -222,10 +257,73 @@ public final class AppModel {
         guard !peer.isEmpty else { return }
         showNewChat = false
         try? store.upsertContact(Contact(userId: peer))
-        try? store.ensureConversation(id: peer, title: peer)
+        try? store.ensureConversation(id: peer, title: peer, isGroup: false)
         refreshContacts()
         await openChat(peer: peer)
         await subscribePresenceRoster()
+    }
+
+    public func createGroup(title: String, memberIds: [String]) async {
+        guard let me = credentials?.userId else { return }
+        isBusy = true
+        defer { isBusy = false }
+        let gid = "g-\(UUID().uuidString.lowercased().prefix(8))"
+        do {
+            _ = try await groups.createGroup(groupId: gid, title: title, creator: me)
+            for user in memberIds where user != me {
+                try await groups.addMember(groupId: gid, user: user, actor: me)
+            }
+            showCreateGroup = false
+            refreshInbox()
+            await openChat(peer: Conversation.groupConversationId(gid))
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    public func addGroupMember(_ userId: String) async {
+        guard let gid = selectedGroupId, let me = credentials?.userId else { return }
+        let user = userId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !user.isEmpty else { return }
+        do {
+            try await groups.addMember(groupId: gid, user: user, actor: me)
+            refreshSelectedGroup()
+            reloadThread()
+            refreshInbox()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    public func removeGroupMember(_ userId: String) async {
+        guard let gid = selectedGroupId, let me = credentials?.userId else { return }
+        do {
+            try await groups.removeMember(groupId: gid, user: userId, actor: me)
+            refreshSelectedGroup()
+            reloadThread()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    public func leaveSelectedGroup() async {
+        guard let gid = selectedGroupId, let me = credentials?.userId else { return }
+        do {
+            try await groups.leave(groupId: gid, user: me)
+            showGroupInfo = false
+            closeChat()
+            refreshInbox()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
     }
 
     public func reloadThread() {
@@ -331,7 +429,8 @@ public final class AppModel {
                 mediaId: mediaId,
                 seq: seq,
                 status: direction == .inbound ? .delivered : .sent,
-                createdAt: created
+                createdAt: created,
+                fromUser: fromUser
             )
             _ = try? store.upsertMessage(stored)
             if selectedPeer == stored.conversationId, direction == .inbound {
@@ -342,6 +441,59 @@ public final class AppModel {
             }
             refreshInbox()
             if selectedPeer == stored.conversationId { reloadThread() }
+        case .groupMessage(let messageId, let fromUser, let groupId, let body, let seq, let mediaId, let sentAt):
+            let convoId = Conversation.groupConversationId(groupId)
+            let direction: MessageDirection = fromUser == me ? .outbound : .inbound
+            let created = sentAt > 0
+                ? Date(timeIntervalSince1970: TimeInterval(sentAt))
+                : Date()
+            let stored = StoredMessage(
+                messageId: messageId,
+                conversationId: convoId,
+                direction: direction,
+                body: body,
+                mediaId: mediaId,
+                seq: seq,
+                status: direction == .inbound ? .delivered : .sent,
+                createdAt: created,
+                fromUser: fromUser
+            )
+            try? store.ensureConversation(id: convoId, title: groupId, isGroup: true)
+            _ = try? store.upsertMessage(stored)
+            if selectedPeer == convoId, direction == .inbound {
+                try? await session.ackDelivered(messageId: messageId)
+                try? await session.ackRead(messageId: messageId)
+                try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
+                try? store.markConversationRead(conversationId: convoId)
+            }
+            refreshInbox()
+            if selectedPeer == convoId { reloadThread() }
+        case .groupEvent(let groupId, let opRaw, let actor, let subject, let version):
+            let op = GroupOp(rawValue: opRaw) ?? .unspecified
+            let applied = (try? store.applyGroupEvent(
+                groupId: groupId,
+                op: op,
+                actor: actor,
+                subject: subject,
+                version: version
+            )) ?? false
+            if applied {
+                let text = GroupService.systemText(op: op, actor: actor, subject: subject)
+                try? groups.appendSystemLine(groupId: groupId, text: text, version: version)
+            }
+            refreshInbox()
+            refreshSelectedGroup()
+            if selectedPeer == Conversation.groupConversationId(groupId) {
+                reloadThread()
+            }
+        case .groupAckSummary(let messageId, _, let memberCount, let delivered, let read):
+            try? store.updateGroupAckSummary(
+                messageId: messageId,
+                deliveredCount: delivered,
+                readCount: read,
+                memberCount: memberCount
+            )
+            if selectedPeer != nil { reloadThread() }
         case .serverAck(let messageId, let seq):
             try? store.updateStatus(messageId: messageId, status: .sent, seq: seq)
             if selectedPeer != nil { reloadThread() }
@@ -352,7 +504,6 @@ public final class AppModel {
             try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
             if selectedPeer != nil { reloadThread() }
         case .presence(let userId, let kind, let lastSeen):
-            // Never invent last-seen: only store when server provided a value.
             let existing = try? store.contact(userId: userId)
             let presence = PresenceKind(rawValue: kind) ?? .unavailable
             let seen: Date? = {
@@ -367,7 +518,6 @@ public final class AppModel {
                 presence: presence,
                 lastSeen: presence == .lastSeen || presence == .unavailable ? seen : existing?.lastSeen
             )
-            // Privacy: if server omitted last_seen on LAST_SEEN, keep prior only; do not invent.
             if presence == .lastSeen, lastSeen == nil || lastSeen == 0 {
                 let c = Contact(
                     userId: userId,
@@ -403,7 +553,6 @@ public final class AppModel {
         #if DEBUG
         let existing = (try? store.contacts()) ?? []
         guard existing.isEmpty, let me = credentials?.userId else { return }
-        // Bootstrap peers for local gateway demos (messenger_demo uses alice/bob).
         let seeds = ["alice", "bob", "carol"].filter { $0 != me }
         for user in seeds {
             try? store.upsertContact(Contact(userId: user, presence: .unavailable))

@@ -24,6 +24,10 @@ struct Smoke {
         failed += await checkAsync("send pending then ack", testSendPath)
         failed += await checkAsync("failed send marks failed", testSendFail)
         failed += await checkAsync("open thread acks", testOpenThreadAcks)
+        failed += check("parse group events", testParseGroupEvents())
+        failed += check("group version gate", testGroupVersionGate())
+        failed += await checkAsync("create add send group", testGroupCreateAddSend)
+        failed += await checkAsync("non-member group send", testNonMemberGroupSend)
 
         if failed > 0 {
             fputs("FAILED \(failed) check(s)\n", stderr)
@@ -306,5 +310,110 @@ private func testOpenThreadAcks() async -> Bool {
         let ok = transport.deliveredAcks.contains("in-1") && transport.readAcks.contains("in-1")
         await session.close()
         return ok
+    } catch { return false }
+}
+
+private func testParseGroupEvents() -> Bool {
+    let msg = LaneEvent.parse(
+        json: #"{"type":"GroupMessage","message_id":"m1","from_user":"alice","group_id":"g1","body_hex":"aGk=","sent_at":1,"seq":3,"media_id":""}"#
+    )
+    let ev = LaneEvent.parse(
+        json: #"{"type":"GroupEvent","group_id":"g1","op":2,"actor_user":"alice","subject_user":"bob","version":2}"#
+    )
+    let ack = LaneEvent.parse(
+        json: #"{"type":"GroupAckSummary","message_id":"m1","group_id":"g1","member_count":3,"delivered_count":2,"read_count":1}"#
+    )
+    guard case .groupMessage("m1", "alice", "g1", "hi", 3, "", 1) = msg else { return false }
+    guard case .groupEvent("g1", 2, "alice", "bob", 2) = ev else { return false }
+    guard case .groupAckSummary("m1", "g1", 3, 2, 1) = ack else { return false }
+    return true
+}
+
+private func testGroupVersionGate() -> Bool {
+    do {
+        let store = InMemoryLocalStore()
+        let ok1 = try store.applyGroupEvent(
+            groupId: "g1", op: .create, actor: "alice", subject: "alice", version: 1
+        )
+        let stale = try store.applyGroupEvent(
+            groupId: "g1", op: .addMember, actor: "alice", subject: "bob", version: 1
+        )
+        let ok2 = try store.applyGroupEvent(
+            groupId: "g1", op: .addMember, actor: "alice", subject: "bob", version: 2
+        )
+        let g = try store.group(id: "g1")
+        return ok1 && !stale && ok2 && g?.memberCount == 2 && g?.isAdmin("alice") == true
+    } catch { return false }
+}
+
+private func testGroupCreateAddSend() async -> Bool {
+    let transport = MockMessengerTransport()
+    let store = InMemoryLocalStore()
+    let session = SessionActor(transport: transport)
+    let groups = GroupService(store: store, session: session)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        _ = try await groups.createGroup(groupId: "team", title: "Team", creator: "alice")
+        try await groups.addMember(groupId: "team", user: "bob", actor: "alice")
+        let msg = try await groups.sendText(groupId: "team", body: "hello group", fromUser: "alice")
+        for _ in 0..<60 {
+            try await Task.sleep(nanoseconds: 15_000_000)
+            if let updated = try? store.messages(
+                conversationId: Conversation.groupConversationId("team"),
+                limit: 20
+            ).first(where: { $0.messageId == msg.messageId }),
+               updated.memberCount > 0 || updated.status == .sent || updated.status == .delivered {
+                let g = try store.group(id: "team")
+                await session.close()
+                return g?.memberCount == 2
+                    && transport.createdGroups.contains("team")
+                    && transport.groupSent.contains(where: { $0.messageId == msg.messageId })
+            }
+        }
+        let g = try store.group(id: "team")
+        let rows = try store.messages(conversationId: Conversation.groupConversationId("team"), limit: 20)
+        await session.close()
+        return g?.memberCount == 2 && rows.contains(where: { $0.body == "hello group" })
+    } catch {
+        print("  group path error: \(error)")
+        return false
+    }
+}
+
+private func testNonMemberGroupSend() async -> Bool {
+    let transport = MockMessengerTransport()
+    let store = InMemoryLocalStore()
+    let session = SessionActor(transport: transport)
+    let groups = GroupService(store: store, session: session)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try store.upsertGroup(GroupInfo(
+            id: "other",
+            title: "Other",
+            version: 1,
+            members: [GroupMember(userId: "bob", isAdmin: true)]
+        ))
+        do {
+            _ = try await groups.sendText(groupId: "other", body: "nope", fromUser: "alice")
+            await session.close()
+            return false
+        } catch {
+            await session.close()
+            return true
+        }
     } catch { return false }
 }

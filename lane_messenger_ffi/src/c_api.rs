@@ -796,10 +796,12 @@ fn event_to_json(ev: &LaneEvent) -> String {
             json_escape(&a.from_user)
         ),
         LaneEvent::GroupAckSummary(s) => format!(
-            r#"{{"type":"GroupAckSummary","message_id":"{}","group_id":"{}","member_count":{}}}"#,
+            r#"{{"type":"GroupAckSummary","message_id":"{}","group_id":"{}","member_count":{},"delivered_count":{},"read_count":{}}}"#,
             json_escape(&s.message_id),
             json_escape(&s.group_id),
-            s.member_count
+            s.member_count,
+            s.delivered_by.len(),
+            s.read_by.len()
         ),
         LaneEvent::Presence(p) => format!(
             r#"{{"type":"Presence","user_id":"{}","kind":{},"last_seen":{}}}"#,
@@ -808,16 +810,21 @@ fn event_to_json(ev: &LaneEvent) -> String {
             p.last_seen
         ),
         LaneEvent::GroupMessage(m) => format!(
-            r#"{{"type":"GroupMessage","message_id":"{}","from_user":"{}","group_id":"{}","body_hex":"{}"}}"#,
+            r#"{{"type":"GroupMessage","message_id":"{}","from_user":"{}","group_id":"{}","body_hex":"{}","sent_at":{},"seq":{},"media_id":"{}"}}"#,
             json_escape(&m.message_id),
             json_escape(&m.from_user),
             json_escape(&m.group_id),
-            b64(&m.body)
+            b64(&m.body),
+            m.sent_at,
+            m.seq,
+            json_escape(&m.media_id)
         ),
         LaneEvent::GroupEvent(e) => format!(
-            r#"{{"type":"GroupEvent","group_id":"{}","op":{},"version":{}}}"#,
+            r#"{{"type":"GroupEvent","group_id":"{}","op":{},"actor_user":"{}","subject_user":"{}","version":{}}}"#,
             json_escape(&e.group_id),
             e.op,
+            json_escape(&e.actor_user),
+            json_escape(&e.subject_user),
             e.version
         ),
         LaneEvent::MediaStart(m) => format!(

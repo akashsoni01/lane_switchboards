@@ -26,8 +26,29 @@ public enum LaneEvent: Sendable, Equatable {
     case serverAck(messageId: String, seq: UInt64)
     case deliveredAck(messageId: String, fromUser: String)
     case readAck(messageId: String, fromUser: String)
-    case groupMessage(messageId: String, groupId: String)
-    case groupAckSummary(messageId: String, memberCount: UInt32)
+    case groupMessage(
+        messageId: String,
+        fromUser: String,
+        groupId: String,
+        body: String,
+        seq: UInt64,
+        mediaId: String,
+        sentAt: UInt64
+    )
+    case groupEvent(
+        groupId: String,
+        op: Int,
+        actorUser: String,
+        subjectUser: String,
+        version: UInt64
+    )
+    case groupAckSummary(
+        messageId: String,
+        groupId: String,
+        memberCount: UInt32,
+        deliveredCount: UInt32,
+        readCount: UInt32
+    )
     case presence(userId: String, kind: Int, lastSeen: UInt64?)
     case protocolError(code: Int, detail: String)
     case replacedByNewSession
@@ -81,14 +102,31 @@ public enum LaneEvent: Sendable, Equatable {
                 fromUser: obj["from_user"] as? String ?? ""
             )
         case "GroupMessage":
+            let encoded = obj["body_hex"] as? String ?? obj["body_b64"] as? String ?? ""
             return .groupMessage(
                 messageId: obj["message_id"] as? String ?? "",
-                groupId: obj["group_id"] as? String ?? ""
+                fromUser: obj["from_user"] as? String ?? "",
+                groupId: obj["group_id"] as? String ?? "",
+                body: decodeBody(encoded),
+                seq: uint64(obj["seq"]),
+                mediaId: obj["media_id"] as? String ?? "",
+                sentAt: uint64(obj["sent_at"])
+            )
+        case "GroupEvent":
+            return .groupEvent(
+                groupId: obj["group_id"] as? String ?? "",
+                op: obj["op"] as? Int ?? (obj["op"] as? NSNumber)?.intValue ?? 0,
+                actorUser: obj["actor_user"] as? String ?? "",
+                subjectUser: obj["subject_user"] as? String ?? "",
+                version: uint64(obj["version"])
             )
         case "GroupAckSummary":
             return .groupAckSummary(
                 messageId: obj["message_id"] as? String ?? "",
-                memberCount: uint32(obj["member_count"])
+                groupId: obj["group_id"] as? String ?? "",
+                memberCount: uint32(obj["member_count"]),
+                deliveredCount: uint32(obj["delivered_count"]),
+                readCount: uint32(obj["read_count"])
             )
         case "Presence":
             let last: UInt64? = {
@@ -140,7 +178,6 @@ private func decodeBody(_ encoded: String) -> String {
     if let data = Data(base64Encoded: encoded), let s = String(data: data, encoding: .utf8) {
         return s
     }
-    // Fallback: hex
     var bytes = [UInt8]()
     var idx = encoded.startIndex
     while idx < encoded.endIndex {

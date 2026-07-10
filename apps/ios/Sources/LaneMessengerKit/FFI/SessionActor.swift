@@ -113,6 +113,41 @@ public actor SessionActor {
         try await transport.subscribePresence(contactIds: contactIds)
     }
 
+    public func createGroup(groupId: String) async throws -> UInt64 {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.createGroup(groupId: groupId)
+    }
+
+    public func addMember(groupId: String, user: String) async throws -> UInt64 {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.addMember(groupId: groupId, user: user)
+    }
+
+    public func removeMember(groupId: String, user: String) async throws -> UInt64 {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.removeMember(groupId: groupId, user: user)
+    }
+
+    public func leaveGroup(groupId: String) async throws -> UInt64 {
+        guard state == .ready || state == .syncing else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.leaveGroup(groupId: groupId)
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data) async throws {
+        guard state == .ready || state == .syncing || state == .awaitingLogin else {
+            throw AppError.connection("not ready")
+        }
+        try await transport.sendGroup(groupId: groupId, messageId: messageId, body: body)
+    }
+
     public func close() async {
         autoReconnect = false
         reconnectTask?.cancel()

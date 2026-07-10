@@ -90,6 +90,61 @@ public final class LaneSession {
         try check(code)
     }
 
+    public func createGroup(groupId: String) throws -> UInt64 {
+        var version: UInt64 = 0
+        let code = groupId.withCString { g in
+            lane_create_group(UnsafeMutablePointer(ptr), g, &version)
+        }
+        try check(code)
+        return version
+    }
+
+    public func addMember(groupId: String, user: String) throws -> UInt64 {
+        var version: UInt64 = 0
+        let code = groupId.withCString { g in
+            user.withCString { u in
+                lane_add_member(UnsafeMutablePointer(ptr), g, u, &version)
+            }
+        }
+        try check(code)
+        return version
+    }
+
+    public func removeMember(groupId: String, user: String) throws -> UInt64 {
+        var version: UInt64 = 0
+        let code = groupId.withCString { g in
+            user.withCString { u in
+                lane_remove_member(UnsafeMutablePointer(ptr), g, u, &version)
+            }
+        }
+        try check(code)
+        return version
+    }
+
+    public func leaveGroup(groupId: String) throws -> UInt64 {
+        var version: UInt64 = 0
+        let code = groupId.withCString { g in
+            lane_leave_group(UnsafeMutablePointer(ptr), g, &version)
+        }
+        try check(code)
+        return version
+    }
+
+    public func sendGroup(groupId: String, messageId: String, body: Data) throws {
+        let code = body.withUnsafeBytes { raw in
+            groupId.withCString { g in
+                messageId.withCString { m in
+                    lane_send_group(
+                        UnsafeMutablePointer(ptr), g, m,
+                        raw.bindMemory(to: UInt8.self).baseAddress,
+                        body.count
+                    )
+                }
+            }
+        }
+        try check(code)
+    }
+
     public func pollEvent(timeoutMs: UInt64) -> String? {
         var json: UnsafeMutablePointer<CChar>?
         let n = lane_session_poll_event(UnsafeMutablePointer(ptr), timeoutMs, &json)
@@ -152,6 +207,37 @@ func lane_ack_read(_ s: UnsafeMutableRawPointer?, _ mid: UnsafePointer<CChar>) -
 
 @_silgen_name("lane_subscribe_presence")
 func lane_subscribe_presence(_ s: UnsafeMutableRawPointer?, _ csv: UnsafePointer<CChar>) -> Int32
+
+@_silgen_name("lane_create_group")
+func lane_create_group(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ outVersion: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_add_member")
+func lane_add_member(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ user: UnsafePointer<CChar>, _ outVersion: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_remove_member")
+func lane_remove_member(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ user: UnsafePointer<CChar>, _ outVersion: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_leave_group")
+func lane_leave_group(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ outVersion: UnsafeMutablePointer<UInt64>
+) -> Int32
+
+@_silgen_name("lane_send_group")
+func lane_send_group(
+    _ s: UnsafeMutableRawPointer?, _ groupId: UnsafePointer<CChar>,
+    _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
+    _ len: Int
+) -> Int32
 
 @_silgen_name("lane_string_free")
 func lane_string_free(_ s: UnsafeMutablePointer<CChar>?)

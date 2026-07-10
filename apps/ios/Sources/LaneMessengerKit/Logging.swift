@@ -8,4 +8,5 @@ public enum LaneLog {
     public static let e2ee = Logger(subsystem: "com.lane.messenger", category: "e2ee")
     public static let ui = Logger(subsystem: "com.lane.messenger", category: "ui")
     public static let auth = Logger(subsystem: "com.lane.messenger", category: "auth")
+    public static let groups = Logger(subsystem: "com.lane.messenger", category: "groups")
 }

@@ -30,4 +30,5 @@ TLS + FunXMPP → gateway
 - **I3** — SQLite local store + resume seq
 - **I4** — inbox + 1:1 thread, ticks, drafts, send path
 - **I5** — presence dots + contacts / subscribe
-- I6+ — groups, media, E2EE, push, … (see `todo_ios.md`)
+- **I6** — groups (create/add/remove/leave, version gate, ack summary)
+- I7+ — media, E2EE, push, … (see `todo_ios.md`)
