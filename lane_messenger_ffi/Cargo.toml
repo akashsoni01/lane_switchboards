@@ -12,7 +12,7 @@ name = "lane_messenger_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
-default = ["c-api", "tls"]
+default = ["c-api", "tls", "ws"]
 c-api = []
 tls = ["lane_switchboards/tls"]
 ws = ["lane_switchboards/ws"]
@@ -27,5 +27,6 @@ tracing = "0.1"
 sha2 = "0.10"
 
 [dev-dependencies]
-lane_switchboards = { path = "..", version = "0.9.2", default-features = false, features = ["messenger"] }
+lane_switchboards = { path = "..", version = "0.9.2", default-features = false, features = ["messenger", "ws"] }
 tokio = { version = "1.38", features = ["full", "test-util"] }
+tokio-tungstenite = "0.24"

@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - cargo-fuzz target `fuzz/fuzz_targets/messenger_codec.rs`
 - Deployment examples under `deploy/` (systemd + Kubernetes)
 - Criterion baseline notes under `benches/baselines/`
+- **`lane_messenger_ffi`** crate: Rust + C ABI, session actor, E2EE, auto-reconnect,
+  WebSocket dialer, platform binding scaffolds (`bindings/`), docs under `docs/client-ffi/`
+- Client `MessengerClient::connect_ws`; release profile LTO + `panic=abort` for FFI artifacts
+- `NOTICE` for third-party attributions
 
 ## [0.9.2] — 2026-07-10
 

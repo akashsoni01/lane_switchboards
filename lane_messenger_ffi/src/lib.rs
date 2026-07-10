@@ -24,7 +24,7 @@ pub use events::{
     ServerAckEvent, SyncCompleteEvent,
 };
 pub use e2ee_handle::E2eeHandle;
-pub use session::{ConnectOptions, SessionHandle};
+pub use session::{ConnectOptions, EventHandler, SessionHandle, Transport};
 
 /// Crate / library semver (tracks `lane_switchboards`).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

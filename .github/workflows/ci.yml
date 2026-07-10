@@ -35,8 +35,12 @@ jobs:
         run: cargo test --workspace
       - name: Messenger FFI
         run: cargo test -p lane_messenger_ffi
+      - name: Messenger FFI (ws)
+        run: cargo test -p lane_messenger_ffi --features ws
       - name: TLS messenger tests
         run: cargo test --features tls --test messenger
+      - name: WS messenger client smoke
+        run: cargo test -p lane_switchboards --features ws --lib -- messenger::ws
       - name: Metrics feature
         run: |
           cargo test --workspace --features metrics

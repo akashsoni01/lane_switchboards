@@ -95,6 +95,17 @@ Feature-level comparison between **lane_switchboards** and **Lunatic**.
 | `storage/` | **Distributed KV store** — `StorageNode`, `StorageClient`, WAL, Paxos SERIAL, read repair |
 | `messenger/` | **FunXMPP-style binary chat protocol** — gateway, sessions, presence, tick-ladder acks, offline inbox, groups, chunked media. See [`docs/messenger/`](docs/messenger/README.md) |
 
+## Mobile FFI
+
+Cross-platform client library: [`lane_messenger_ffi/`](lane_messenger_ffi/) (C ABI + Rust API).
+Platform scaffolds under [`bindings/`](bindings/); plan in [`todo_client_ffi.md`](todo_client_ffi.md);
+docs in [`docs/client-ffi/`](docs/client-ffi/00_overview.md).
+
+```bash
+cargo test -p lane_messenger_ffi
+cargo build -p lane_messenger_ffi --release
+```
+
 ## Core actor API
 
 Every actor runs a single mailbox loop. Application messages and lifecycle control both arrive as [`Envelope<M>`](src/actor.rs) variants; [`ActorRef<M>`](src/actor.rs) helpers wrap the common cases. See [`envelope_demo.md`](examples/envelope_demo.md) (`cargo run --example envelope_demo`) for runnable demos of each control envelope.

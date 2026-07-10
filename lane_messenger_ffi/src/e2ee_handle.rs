@@ -37,6 +37,25 @@ impl E2eeHandle {
         E2eeDevice::safety_number(local_b64, remote_b64)
     }
 
+    /// Export Olm account pickle (UTF-8 ciphertext). Derive a 32-byte key from
+    /// `passphrase` via SHA-256 (hosts should prefer a KDF in production).
+    pub fn export_pickle(&self, passphrase: &str) -> Vec<u8> {
+        let key = passphrase_to_key(passphrase);
+        self.inner.lock().export_account_pickle(&key).into_bytes()
+    }
+
+    pub fn import_pickle(bytes: &[u8], passphrase: &str) -> Result<Self, FfiError> {
+        let encrypted = std::str::from_utf8(bytes)
+            .map_err(|_| FfiError::InvalidArgument("pickle must be UTF-8".into()))?;
+        let key = passphrase_to_key(passphrase);
+        let device = E2eeDevice::import_account_pickle(encrypted, &key)
+            .map_err(|e| FfiError::E2ee(e.to_string()))?;
+        Ok(Self {
+            id: NEXT_DEVICE_ID.fetch_add(1, Ordering::Relaxed),
+            inner: Mutex::new(device),
+        })
+    }
+
     /// Publish identity + `otk_count` one-time keys on the connected session.
     pub fn publish(&self, session: &SessionHandle, device_id: &str, otk_count: u32) -> Result<(), FfiError> {
         let mut dev = self.inner.lock();
@@ -155,4 +174,12 @@ impl E2eeHandle {
             .try_import_group_key_share(from_user, body)
             .map_err(|e| FfiError::E2ee(e.to_string()))
     }
+}
+
+fn passphrase_to_key(passphrase: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(passphrase.as_bytes());
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&digest);
+    key
 }

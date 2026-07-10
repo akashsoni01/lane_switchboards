@@ -37,7 +37,7 @@ pub mod ws;
 
 pub use crate::proto::messenger as wire;
 pub use auth::{Authenticator, HmacAuthenticator};
-pub use client::MessengerClient;
+pub use client::{DownloadedMedia, LoginOutcome, MessengerClient};
 pub use codec::{FrameCodec, Packet, PacketType, PROTOCOL_VERSION};
 pub use discovery::{spawn_mesh_discovery, MeshDiscoveryConfig, MESSENGER_SERVICE};
 pub use e2ee::{E2eeDevice, E2eeError, PeerKeyBundle};

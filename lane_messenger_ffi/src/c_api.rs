@@ -37,6 +37,13 @@ fn set_err(out: *mut *mut c_char, msg: &str) {
     }
 }
 
+fn catch_code(f: impl FnOnce() -> c_int) -> c_int {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(code) => code,
+        Err(_) => FfiErrorCode::Internal.as_i32(),
+    }
+}
+
 fn cstr<'a>(p: *const c_char) -> Result<&'a str, FfiErrorCode> {
     if p.is_null() {
         return Err(FfiErrorCode::InvalidArgument);
@@ -104,36 +111,45 @@ pub extern "C" fn lane_session_connect(
     ping_interval_secs: u64,
     err_out: *mut *mut c_char,
 ) -> *mut LaneSession {
-    let run = || -> Result<*mut LaneSession, String> {
-        let host = cstr(host).map_err(|_| "host".to_string())?;
-        let user_id = cstr(user_id).map_err(|_| "user_id".to_string())?;
-        let device_id = cstr(device_id).map_err(|_| "device_id".to_string())?;
-        let auth_token = cstr(auth_token).map_err(|_| "auth_token".to_string())?;
-        let client_version = if client_version.is_null() {
-            format!("ffi-{}", crate::VERSION)
-        } else {
-            cstr(client_version)
-                .map_err(|_| "client_version".to_string())?
-                .to_string()
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let run = || -> Result<*mut LaneSession, String> {
+            let host = cstr(host).map_err(|_| "host".to_string())?;
+            let user_id = cstr(user_id).map_err(|_| "user_id".to_string())?;
+            let device_id = cstr(device_id).map_err(|_| "device_id".to_string())?;
+            let auth_token = cstr(auth_token).map_err(|_| "auth_token".to_string())?;
+            let client_version = if client_version.is_null() {
+                format!("ffi-{}", crate::VERSION)
+            } else {
+                cstr(client_version)
+                    .map_err(|_| "client_version".to_string())?
+                    .to_string()
+            };
+            let opts = ConnectOptions {
+                host: host.into(),
+                port,
+                use_tls: use_tls != 0,
+                user_id: user_id.into(),
+                device_id: device_id.into(),
+                auth_token: auth_token.into(),
+                client_version,
+                resume_after_seq,
+                ping_interval_secs,
+                ..Default::default()
+            };
+            let session = SessionHandle::connect(opts).map_err(|e| e.detail())?;
+            Ok(Box::into_raw(Box::new(LaneSession { inner: session })))
         };
-        let opts = ConnectOptions {
-            host: host.into(),
-            port,
-            use_tls: use_tls != 0,
-            user_id: user_id.into(),
-            device_id: device_id.into(),
-            auth_token: auth_token.into(),
-            client_version,
-            resume_after_seq,
-            ping_interval_secs,
-        };
-        let session = SessionHandle::connect(opts).map_err(|e| e.detail())?;
-        Ok(Box::into_raw(Box::new(LaneSession { inner: session })))
-    };
-    match run() {
+        match run() {
+            Ok(p) => p,
+            Err(e) => {
+                set_err(err_out, &e);
+                ptr::null_mut()
+            }
+        }
+    })) {
         Ok(p) => p,
-        Err(e) => {
-            set_err(err_out, &e);
+        Err(_) => {
+            set_err(err_out, "internal panic");
             ptr::null_mut()
         }
     }
@@ -162,13 +178,15 @@ pub extern "C" fn lane_session_close(session: *mut LaneSession) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn lane_session_ping(session: *mut LaneSession) -> c_int {
-    let Some(s) = (unsafe { session.as_ref() }) else {
-        return FfiErrorCode::InvalidArgument.as_i32();
-    };
-    match s.inner.ping() {
-        Ok(()) => FfiErrorCode::Ok.as_i32(),
-        Err(e) => e.code().as_i32(),
-    }
+    catch_code(|| {
+        let Some(s) = (unsafe { session.as_ref() }) else {
+            return FfiErrorCode::InvalidArgument.as_i32();
+        };
+        match s.inner.ping() {
+            Ok(()) => FfiErrorCode::Ok.as_i32(),
+            Err(e) => e.code().as_i32(),
+        }
+    })
 }
 
 /// Poll one event as a JSON-ish UTF-8 string. Returns 1 if an event was written
@@ -192,6 +210,17 @@ pub extern "C" fn lane_session_poll_event(
             1
         }
         None => 0,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_session_set_resume_seq(session: *mut LaneSession, seq: u64) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    match s.inner.set_resume_seq(seq) {
+        Ok(()) => FfiErrorCode::Ok.as_i32(),
+        Err(e) => e.code().as_i32(),
     }
 }
 
@@ -220,6 +249,82 @@ pub extern "C" fn lane_send_chat(
         Err(c) => return c.as_i32(),
     };
     match s.inner.send_chat(to, mid, body) {
+        Ok(seq) => {
+            if !out_seq.is_null() {
+                unsafe { *out_seq = seq };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_send_chat_with_media(
+    session: *mut LaneSession,
+    to_user: *const c_char,
+    message_id: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    media_id: *const c_char,
+    out_seq: *mut u64,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let to = match cstr(to_user) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let mid = match cstr(message_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let media = match cstr(media_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let body = match bytes_from(body, body_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match s.inner.send_chat_with_media(to, mid, body, media) {
+        Ok(seq) => {
+            if !out_seq.is_null() {
+                unsafe { *out_seq = seq };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_send_chat_retry(
+    session: *mut LaneSession,
+    to_user: *const c_char,
+    message_id: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    max_attempts: u32,
+    out_seq: *mut u64,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let to = match cstr(to_user) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let mid = match cstr(message_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let body = match bytes_from(body, body_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match s.inner.send_chat_with_retry(to, mid, body, max_attempts) {
         Ok(seq) => {
             if !out_seq.is_null() {
                 unsafe { *out_seq = seq };
@@ -348,6 +453,59 @@ pub extern "C" fn lane_add_member(
 }
 
 #[no_mangle]
+pub extern "C" fn lane_remove_member(
+    session: *mut LaneSession,
+    group_id: *const c_char,
+    user: *const c_char,
+    out_version: *mut u64,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let user = match cstr(user) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    match s.inner.remove_member(gid, user) {
+        Ok(v) => {
+            if !out_version.is_null() {
+                unsafe { *out_version = v };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_leave_group(
+    session: *mut LaneSession,
+    group_id: *const c_char,
+    out_version: *mut u64,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    match s.inner.leave_group(gid) {
+        Ok(v) => {
+            if !out_version.is_null() {
+                unsafe { *out_version = v };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
 pub extern "C" fn lane_send_group(
     session: *mut LaneSession,
     group_id: *const c_char,
@@ -409,6 +567,50 @@ pub extern "C" fn lane_upload_media(
         Ok(n) => {
             if !out_bytes.is_null() {
                 unsafe { *out_bytes = n };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_fetch_media(
+    session: *mut LaneSession,
+    media_id: *const c_char,
+    out_data: *mut *mut u8,
+    out_len: *mut usize,
+    out_file_name: *mut *mut c_char,
+    out_mime: *mut *mut c_char,
+    out_sha: *mut *mut c_char,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let media_id = match cstr(media_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    match s.inner.fetch_media(media_id) {
+        Ok(m) => {
+            if !out_file_name.is_null() {
+                set_err(out_file_name, &m.file_name);
+            }
+            if !out_mime.is_null() {
+                set_err(out_mime, &m.mime_type);
+            }
+            if !out_sha.is_null() {
+                set_err(out_sha, &m.sha256);
+            }
+            if !out_data.is_null() && !out_len.is_null() {
+                let mut buf = m.data;
+                let len = buf.len();
+                let ptr = buf.as_mut_ptr();
+                std::mem::forget(buf);
+                unsafe {
+                    *out_data = ptr;
+                    *out_len = len;
+                }
             }
             FfiErrorCode::Ok.as_i32()
         }
@@ -653,6 +855,90 @@ fn event_to_json(ev: &LaneEvent) -> String {
         }
         LaneEvent::ReplacedByNewSession => r#"{"type":"ReplacedByNewSession"}"#.into(),
         LaneEvent::Pong { seq } => format!(r#"{{"type":"Pong","seq":{seq}}}"#),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_decrypt_chat(
+    device: *mut LaneE2eeDevice,
+    from_user: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    out_plain: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let from = match cstr(from_user) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let body = match bytes_from(body, body_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match d.inner.decrypt_chat(from, body) {
+        Ok(mut plain) => {
+            if !out_plain.is_null() && !out_len.is_null() {
+                let len = plain.len();
+                let ptr = plain.as_mut_ptr();
+                std::mem::forget(plain);
+                unsafe {
+                    *out_plain = ptr;
+                    *out_len = len;
+                }
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_e2ee_export_pickle(
+    device: *mut LaneE2eeDevice,
+    passphrase: *const c_char,
+    out_bytes: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let pass = match cstr(passphrase) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let mut bytes = d.inner.export_pickle(pass);
+    if !out_bytes.is_null() && !out_len.is_null() {
+        let len = bytes.len();
+        let ptr = bytes.as_mut_ptr();
+        std::mem::forget(bytes);
+        unsafe {
+            *out_bytes = ptr;
+            *out_len = len;
+        }
+    }
+    FfiErrorCode::Ok.as_i32()
+}
+
+#[no_mangle]
+pub extern "C" fn lane_e2ee_import_pickle(
+    bytes: *const u8,
+    len: usize,
+    passphrase: *const c_char,
+) -> *mut LaneE2eeDevice {
+    let pass = match cstr(passphrase) {
+        Ok(t) => t,
+        Err(_) => return ptr::null_mut(),
+    };
+    let data = match bytes_from(bytes, len) {
+        Ok(b) => b,
+        Err(_) => return ptr::null_mut(),
+    };
+    match E2eeHandle::import_pickle(data, pass) {
+        Ok(inner) => Box::into_raw(Box::new(LaneE2eeDevice { inner })),
+        Err(_) => ptr::null_mut(),
     }
 }
 

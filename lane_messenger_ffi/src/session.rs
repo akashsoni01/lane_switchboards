@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lane_switchboards::messenger::{
-    wire, E2eeDevice, MessengerClient, MessengerError, Packet, PeerKeyBundle,
+    wire, E2eeDevice, LoginOutcome, MessengerClient, MessengerError, Packet, PeerKeyBundle,
 };
 use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
@@ -16,12 +16,25 @@ use crate::runtime;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Wire transport for connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    #[default]
+    Tcp,
+    /// Requires `feature = "ws"` on `lane_messenger_ffi` / switchboards.
+    WebSocket,
+}
+
 /// Connect / login options (Phase F2).
 #[derive(Debug, Clone)]
 pub struct ConnectOptions {
     pub host: String,
     pub port: u16,
     pub use_tls: bool,
+    /// When [`Transport::WebSocket`], full URL (e.g. `ws://127.0.0.1:9001/`).
+    /// If empty, built as `ws(s)://{host}:{port}/`.
+    pub ws_url: String,
+    pub transport: Transport,
     pub user_id: String,
     pub device_id: String,
     pub auth_token: String,
@@ -29,6 +42,12 @@ pub struct ConnectOptions {
     pub resume_after_seq: u64,
     /// Auto-ping interval; `0` disables.
     pub ping_interval_secs: u64,
+    /// Reconnect after unexpected disconnect (not after `ReplacedByNewSession`).
+    pub auto_reconnect: bool,
+    /// Cap reconnect attempts (`0` = unlimited while session lives).
+    pub max_reconnect_attempts: u32,
+    /// Optional PEM path for custom CA (TLS pinning / enterprise).
+    pub ca_pem_path: Option<String>,
 }
 
 impl Default for ConnectOptions {
@@ -37,13 +56,35 @@ impl Default for ConnectOptions {
             host: "127.0.0.1".into(),
             port: 9000,
             use_tls: false,
+            ws_url: String::new(),
+            transport: Transport::Tcp,
             user_id: String::new(),
             device_id: String::new(),
             auth_token: String::new(),
             client_version: format!("ffi-{}", crate::VERSION),
             resume_after_seq: 0,
             ping_interval_secs: crate::PING_INTERVAL_SECS,
+            auto_reconnect: false,
+            max_reconnect_attempts: 5,
+            ca_pem_path: None,
         }
+    }
+}
+
+/// Host push callback (may run on a Tokio worker thread).
+pub type EventHandler = Arc<dyn Fn(LaneEvent) + Send + Sync>;
+
+struct EventBus {
+    tx: mpsc::UnboundedSender<LaneEvent>,
+    handler: Arc<Mutex<Option<EventHandler>>>,
+}
+
+impl EventBus {
+    fn emit(&self, ev: LaneEvent) {
+        if let Some(cb) = self.handler.lock().as_ref() {
+            cb(ev.clone());
+        }
+        let _ = self.tx.send(ev);
     }
 }
 
@@ -136,6 +177,10 @@ enum Cmd {
         ciphertext: Vec<u8>,
         reply: oneshot::Sender<Result<(), FfiError>>,
     },
+    SetResumeSeq {
+        seq: u64,
+        reply: oneshot::Sender<Result<(), FfiError>>,
+    },
     Close {
         reply: oneshot::Sender<Result<(), FfiError>>,
     },
@@ -182,11 +227,16 @@ enum Waiter {
 
 struct ActorState {
     client: MessengerClient,
-    events: mpsc::UnboundedSender<LaneEvent>,
+    events: EventBus,
     waiters: Vec<Waiter>,
     ping_interval: Duration,
     /// Packets to send after processing an inbound frame (media chunk pipeline).
     outbox: Vec<Packet>,
+    opts: ConnectOptions,
+    resume_seq: Arc<AtomicU64>,
+    /// Stop auto-reconnect after same-device kick.
+    block_reconnect: bool,
+    reconnect_attempts: u32,
 }
 
 /// Opaque session: commands go to a background actor; events are polled.
@@ -194,6 +244,8 @@ pub struct SessionHandle {
     id: u64,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     events: Arc<Mutex<mpsc::UnboundedReceiver<LaneEvent>>>,
+    event_handler: Arc<Mutex<Option<EventHandler>>>,
+    resume_seq: Arc<AtomicU64>,
     closed: Arc<Mutex<bool>>,
 }
 
@@ -213,61 +265,16 @@ impl SessionHandle {
     }
 
     async fn connect_async(opts: ConnectOptions) -> Result<Self, FfiError> {
-        let addr = format!("{}:{}", opts.host, opts.port);
-        let (client, outcome) = if opts.use_tls {
-            #[cfg(feature = "tls")]
-            {
-                let cfg = lane_switchboards::tls::client_config_from_pem(
-                    None::<&str>,
-                    None::<&str>,
-                    None::<&str>,
-                )
-                    .map_err(|e| FfiError::Messenger(MessengerError::Io(e)))?;
-                let connector = lane_switchboards::tls::build_connector(cfg);
-                MessengerClient::connect_tls(
-                    &addr,
-                    Some(&connector),
-                    &opts.user_id,
-                    &opts.device_id,
-                    &opts.auth_token,
-                    opts.resume_after_seq,
-                )
-                .await?
-            }
-            #[cfg(not(feature = "tls"))]
-            {
-                return Err(FfiError::InvalidArgument(
-                    "use_tls=true requires the tls feature".into(),
-                ));
-            }
-        } else {
-            MessengerClient::connect(
-                &addr,
-                &opts.user_id,
-                &opts.device_id,
-                &opts.auth_token,
-                opts.resume_after_seq,
-            )
-            .await?
-        };
+        let resume_seq = Arc::new(AtomicU64::new(opts.resume_after_seq));
+        let (client, outcome) = dial_client(&opts, resume_seq.load(Ordering::Relaxed)).await?;
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let _ = event_tx.send(LaneEvent::LoginAck(LoginAckEvent {
-            session_id: outcome.session_id.clone(),
-            pending_messages: outcome.replayed.len() as u32,
-            ok: true,
-            error: String::new(),
-        }));
-        let replay_count = outcome.replayed.len() as u32;
-        for pkt in outcome.replayed {
-            if let Some(ev) = packet_to_event(&pkt) {
-                let _ = event_tx.send(LaneEvent::SyncMessage(Box::new(ev)));
-            }
-        }
-        let _ = event_tx.send(LaneEvent::SyncComplete(SyncCompleteEvent {
-            delivered: replay_count,
-            latest_seq: outcome.latest_seq,
-        }));
+        let event_handler: Arc<Mutex<Option<EventHandler>>> = Arc::new(Mutex::new(None));
+        let bus = EventBus {
+            tx: event_tx,
+            handler: Arc::clone(&event_handler),
+        };
+        emit_login_sync_and_store(&bus, &resume_seq, &outcome);
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let ping_interval = if opts.ping_interval_secs == 0 {
@@ -276,20 +283,44 @@ impl SessionHandle {
             Duration::from_secs(opts.ping_interval_secs)
         };
 
-        runtime::runtime().spawn(session_actor(ActorState {
-            client,
-            events: event_tx,
-            waiters: Vec::new(),
-            ping_interval,
-            outbox: Vec::new(),
-        }, cmd_rx));
+        runtime::runtime().spawn(session_actor(
+            ActorState {
+                client,
+                events: bus,
+                waiters: Vec::new(),
+                ping_interval,
+                outbox: Vec::new(),
+                opts: opts.clone(),
+                resume_seq: Arc::clone(&resume_seq),
+                block_reconnect: false,
+                reconnect_attempts: 0,
+            },
+            cmd_rx,
+        ));
 
         Ok(Self {
             id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
             cmd_tx,
             events: Arc::new(Mutex::new(event_rx)),
+            event_handler,
+            resume_seq,
             closed: Arc::new(Mutex::new(false)),
         })
+    }
+
+    /// Push events to `handler` (in addition to the poll queue).
+    pub fn set_event_handler(&self, handler: Option<EventHandler>) {
+        *self.event_handler.lock() = handler;
+    }
+
+    /// Update resume cursor used on the next reconnect / reconnect dial.
+    pub fn set_resume_seq(&self, seq: u64) -> Result<(), FfiError> {
+        self.resume_seq.store(seq, Ordering::Relaxed);
+        self.call(|reply| Cmd::SetResumeSeq { seq, reply })
+    }
+
+    pub fn resume_seq(&self) -> u64 {
+        self.resume_seq.load(Ordering::Relaxed)
     }
 
     /// Poll next event; `timeout_ms == 0` returns immediately if empty.
@@ -572,6 +603,153 @@ impl SessionHandle {
     }
 }
 
+fn emit_login_sync(bus: &EventBus, outcome: &LoginOutcome) {
+    bus.emit(LaneEvent::LoginAck(LoginAckEvent {
+        session_id: outcome.session_id.clone(),
+        pending_messages: outcome.replayed.len() as u32,
+        ok: true,
+        error: String::new(),
+    }));
+    let replay_count = outcome.replayed.len() as u32;
+    for pkt in &outcome.replayed {
+        if let Some(ev) = packet_to_event(pkt) {
+            bus.emit(LaneEvent::SyncMessage(Box::new(ev)));
+        }
+    }
+    bus.emit(LaneEvent::SyncComplete(SyncCompleteEvent {
+        delivered: replay_count,
+        latest_seq: outcome.latest_seq,
+    }));
+}
+
+async fn dial_client(
+    opts: &ConnectOptions,
+    resume_after_seq: u64,
+) -> Result<(MessengerClient, LoginOutcome), FfiError> {
+    let tls_connector = build_tls_connector(opts)?;
+
+    match opts.transport {
+        Transport::WebSocket => {
+            #[cfg(feature = "ws")]
+            {
+                let url = if opts.ws_url.is_empty() {
+                    let scheme = if opts.use_tls { "wss" } else { "ws" };
+                    format!("{scheme}://{}:{}/", opts.host, opts.port)
+                } else {
+                    opts.ws_url.clone()
+                };
+                #[cfg(feature = "tls")]
+                {
+                    Ok(MessengerClient::connect_ws(
+                        &url,
+                        tls_connector.as_ref(),
+                        &opts.user_id,
+                        &opts.device_id,
+                        &opts.auth_token,
+                        resume_after_seq,
+                    )
+                    .await?)
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = tls_connector;
+                    Ok(MessengerClient::connect_ws(
+                        &url,
+                        None,
+                        &opts.user_id,
+                        &opts.device_id,
+                        &opts.auth_token,
+                        resume_after_seq,
+                    )
+                    .await?)
+                }
+            }
+            #[cfg(not(feature = "ws"))]
+            {
+                Err(FfiError::InvalidArgument(
+                    "WebSocket transport requires the ws feature".into(),
+                ))
+            }
+        }
+        Transport::Tcp => {
+            let addr = format!("{}:{}", opts.host, opts.port);
+            if opts.use_tls || tls_connector.is_some() {
+                #[cfg(feature = "tls")]
+                {
+                    let connector = match tls_connector {
+                        Some(c) => c,
+                        None => {
+                            let cfg = lane_switchboards::tls::client_config_from_pem(
+                                None::<&str>,
+                                None::<&str>,
+                                None::<&str>,
+                            )
+                            .map_err(|e| FfiError::Messenger(MessengerError::Io(e)))?;
+                            lane_switchboards::tls::build_connector(cfg)
+                        }
+                    };
+                    Ok(MessengerClient::connect_tls(
+                        &addr,
+                        Some(&connector),
+                        &opts.user_id,
+                        &opts.device_id,
+                        &opts.auth_token,
+                        resume_after_seq,
+                    )
+                    .await?)
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    Err(FfiError::InvalidArgument(
+                        "use_tls=true requires the tls feature".into(),
+                    ))
+                }
+            } else {
+                Ok(MessengerClient::connect(
+                    &addr,
+                    &opts.user_id,
+                    &opts.device_id,
+                    &opts.auth_token,
+                    resume_after_seq,
+                )
+                .await?)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "tls")]
+fn build_tls_connector(
+    opts: &ConnectOptions,
+) -> Result<Option<lane_switchboards::stream::TlsConnector>, FfiError> {
+    if !opts.use_tls && opts.ca_pem_path.is_none() {
+        return Ok(None);
+    }
+    let ca = opts.ca_pem_path.as_deref();
+    let cfg = lane_switchboards::tls::client_config_from_pem(ca, None::<&str>, None::<&str>)
+        .map_err(|e| FfiError::Messenger(MessengerError::Io(e)))?;
+    Ok(Some(lane_switchboards::tls::build_connector(cfg)))
+}
+
+#[cfg(not(feature = "tls"))]
+fn build_tls_connector(_opts: &ConnectOptions) -> Result<Option<()>, FfiError> {
+    if _opts.use_tls || _opts.ca_pem_path.is_some() {
+        return Err(FfiError::InvalidArgument(
+            "TLS / CA pinning requires the tls feature".into(),
+        ));
+    }
+    Ok(None)
+}
+
+fn emit_login_sync_and_store(
+    bus: &EventBus,
+    resume_seq: &AtomicU64,
+    outcome: &LoginOutcome,
+) {
+    emit_login_sync(bus, outcome);
+    resume_seq.store(outcome.latest_seq, Ordering::Relaxed);
+}
+
 fn is_retryable(e: &FfiError) -> bool {
     matches!(
         e.code(),
@@ -690,16 +868,18 @@ async fn session_actor(mut state: ActorState, mut cmd_rx: mpsc::UnboundedReceive
     let mut ping_tick = if state.ping_interval.is_zero() {
         None
     } else {
-        Some(tokio::time::interval(state.ping_interval))
+        let mut t = tokio::time::interval(state.ping_interval);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Some(t)
     };
 
     loop {
         while let Some(pkt) = state.outbox.pop() {
             if let Err(e) = state.client.send_packet(pkt).await {
-                let reason = e.to_string();
-                fail_all_waiters(&mut state, FfiError::Messenger(e));
-                let _ = state.events.send(LaneEvent::Disconnected { reason });
-                return;
+                if !try_reconnect(&mut state, e.to_string()).await {
+                    return;
+                }
+                break;
             }
         }
 
@@ -713,12 +893,17 @@ async fn session_actor(mut state: ActorState, mut cmd_rx: mpsc::UnboundedReceive
             }
             pkt = state.client.recv() => {
                 match pkt {
-                    Ok(p) => dispatch_packet(&mut state, p),
+                    Ok(p) => {
+                        if matches!(&p, Packet::Error(e) if e.code == wire::ErrorCode::ReplacedByNewSession as i32) {
+                            state.block_reconnect = true;
+                        }
+                        track_resume_seq(&state, &p);
+                        dispatch_packet(&mut state, p);
+                    }
                     Err(e) => {
-                        let reason = e.to_string();
-                        fail_all_waiters(&mut state, FfiError::Messenger(e));
-                        let _ = state.events.send(LaneEvent::Disconnected { reason });
-                        break;
+                        if !try_reconnect(&mut state, e.to_string()).await {
+                            return;
+                        }
                     }
                 }
             }
@@ -731,9 +916,71 @@ async fn session_actor(mut state: ActorState, mut cmd_rx: mpsc::UnboundedReceive
             } => {
                 let seq = state.client.alloc_ping_seq();
                 if let Err(e) = state.client.send_packet(Packet::Ping(wire::Ping { seq })).await {
-                    let _ = state.events.send(LaneEvent::Disconnected { reason: e.to_string() });
-                    break;
+                    if !try_reconnect(&mut state, e.to_string()).await {
+                        return;
+                    }
                 }
+            }
+        }
+    }
+}
+
+fn track_resume_seq(state: &ActorState, pkt: &Packet) {
+    let seq = match pkt {
+        Packet::ChatMessage(m) => m.seq,
+        Packet::GroupMessage(m) => m.seq,
+        Packet::SyncComplete(s) => s.latest_seq,
+        _ => 0,
+    };
+    if seq > 0 {
+        let cur = state.resume_seq.load(Ordering::Relaxed);
+        if seq > cur {
+            state.resume_seq.store(seq, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Returns `false` if the actor should exit (no reconnect).
+async fn try_reconnect(state: &mut ActorState, reason: String) -> bool {
+    fail_all_waiters(state, FfiError::Messenger(MessengerError::Closed));
+    state.events.emit(LaneEvent::Disconnected {
+        reason: reason.clone(),
+    });
+    if state.block_reconnect || !state.opts.auto_reconnect {
+        return false;
+    }
+    let max = state.opts.max_reconnect_attempts;
+    loop {
+        if max > 0 && state.reconnect_attempts >= max {
+            state.events.emit(LaneEvent::Disconnected {
+                reason: format!("reconnect exhausted after {max} attempts ({reason})"),
+            });
+            return false;
+        }
+        state.reconnect_attempts += 1;
+        let attempt = state.reconnect_attempts;
+        let backoff_ms = (50u64 << (attempt.min(6).saturating_sub(1))).min(5_000);
+        // Jitter ±25%.
+        let jitter = backoff_ms / 4;
+        let sleep_ms = backoff_ms.saturating_sub(jitter / 2)
+            + (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 % (jitter.max(1) + 1))
+                .unwrap_or(0));
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+
+        let resume = state.resume_seq.load(Ordering::Relaxed);
+        match dial_client(&state.opts, resume).await {
+            Ok((client, outcome)) => {
+                state.client = client;
+                state.outbox.clear();
+                state.reconnect_attempts = 0;
+                emit_login_sync_and_store(&state.events, &state.resume_seq, &outcome);
+                return true;
+            }
+            Err(e) => {
+                tracing::debug!(attempt, error = %e, "ffi reconnect failed");
+                continue;
             }
         }
     }
@@ -779,7 +1026,7 @@ fn dispatch_packet(state: &mut ActorState, pkt: Packet) {
     match &pkt {
         Packet::Pong(_) => return, // consumed by waiter or ignored for auto-ping
         Packet::Error(e) if e.code == wire::ErrorCode::ReplacedByNewSession as i32 => {
-            let _ = state.events.send(LaneEvent::ReplacedByNewSession);
+            let _ = state.events.emit(LaneEvent::ReplacedByNewSession);
             return;
         }
         _ => {}
@@ -788,7 +1035,7 @@ fn dispatch_packet(state: &mut ActorState, pkt: Packet) {
         match &ev {
             LaneEvent::Pong { .. } => {}
             _ => {
-                let _ = state.events.send(ev);
+                let _ = state.events.emit(ev);
             }
         }
     }
@@ -1312,7 +1559,13 @@ async fn handle_cmd(state: &mut ActorState, cmd: Cmd) -> bool {
             }
             false
         }
+        Cmd::SetResumeSeq { seq, reply } => {
+            state.resume_seq.store(seq, Ordering::Relaxed);
+            let _ = reply.send(Ok(()));
+            false
+        }
         Cmd::Close { reply } => {
+            state.block_reconnect = true;
             // Dropping the client closes the socket.
             let _ = reply.send(Ok(()));
             true

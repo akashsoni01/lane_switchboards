@@ -44,6 +44,8 @@ pub enum E2eeError {
     IncompleteBundle,
     #[error("expected a pre-key message to create a new session")]
     NotPreKeyMessage,
+    #[error("account pickle: {0}")]
+    Pickle(String),
 }
 
 /// Public key material fetched from the server's key directory.
@@ -279,6 +281,27 @@ impl E2eeDevice {
     /// True if raw `needle` appears in `body` (used to assert server opacity).
     pub fn body_contains_substring(body: &[u8], needle: &[u8]) -> bool {
         body.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Encrypt the Olm account pickle with a 32-byte key (sessions not included;
+    /// re-establish Olm/Megolm after import).
+    pub fn export_account_pickle(&self, pickle_key: &[u8; 32]) -> String {
+        self.account.pickle().encrypt(pickle_key)
+    }
+
+    /// Restore a device from [`Self::export_account_pickle`].
+    pub fn import_account_pickle(
+        encrypted: &str,
+        pickle_key: &[u8; 32],
+    ) -> Result<Self, E2eeError> {
+        let pickle = vodozemac::olm::AccountPickle::from_encrypted(encrypted, pickle_key)
+            .map_err(|e| E2eeError::Pickle(e.to_string()))?;
+        Ok(Self {
+            account: Account::from_pickle(pickle),
+            sessions: HashMap::new(),
+            group_outbound: HashMap::new(),
+            group_inbound: HashMap::new(),
+        })
     }
 }
 

@@ -17,6 +17,13 @@ use super::e2ee::{E2eeDevice, PeerKeyBundle};
 use super::wire;
 use super::MessengerError;
 
+#[cfg(feature = "ws")]
+use super::ws::{decode_frame, encode_frame};
+#[cfg(feature = "ws")]
+use tokio_tungstenite::tungstenite::Message;
+#[cfg(feature = "ws")]
+use tokio_tungstenite::WebSocketStream;
+
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn unix_millis() -> u64 {
@@ -43,12 +50,71 @@ pub struct DownloadedMedia {
     pub data: Vec<u8>,
 }
 
+enum ClientIo {
+    Tcp(Framed<MaybeTlsStream, FrameCodec>),
+    #[cfg(feature = "ws")]
+    Ws(WebSocketStream<MaybeTlsStream>),
+}
+
+impl ClientIo {
+    async fn send(&mut self, packet: Packet) -> Result<(), MessengerError> {
+        match self {
+            ClientIo::Tcp(framed) => framed.send(packet).await,
+            #[cfg(feature = "ws")]
+            ClientIo::Ws(ws) => {
+                let bytes = encode_frame(&packet)?;
+                ws.send(Message::Binary(bytes.into()))
+                    .await
+                    .map_err(|e| MessengerError::Io(std::io::Error::other(e.to_string())))
+            }
+        }
+    }
+
+    async fn recv(&mut self) -> Result<Packet, MessengerError> {
+        match self {
+            ClientIo::Tcp(framed) => match framed.next().await {
+                None => Err(MessengerError::Closed),
+                Some(r) => r,
+            },
+            #[cfg(feature = "ws")]
+            ClientIo::Ws(ws) => loop {
+                match ws.next().await {
+                    None => return Err(MessengerError::Closed),
+                    Some(Err(e)) => {
+                        return Err(MessengerError::Io(std::io::Error::other(e.to_string())));
+                    }
+                    Some(Ok(Message::Binary(data))) => return decode_frame(&data),
+                    Some(Ok(Message::Close(_))) => return Err(MessengerError::Closed),
+                    Some(Ok(Message::Ping(p))) => {
+                        ws.send(Message::Pong(p))
+                            .await
+                            .map_err(|e| MessengerError::Io(std::io::Error::other(e.to_string())))?;
+                    }
+                    Some(Ok(_)) => continue,
+                }
+            },
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), MessengerError> {
+        match self {
+            ClientIo::Tcp(framed) => framed.close().await,
+            #[cfg(feature = "ws")]
+            ClientIo::Ws(ws) => {
+                ws.close(None)
+                    .await
+                    .map_err(|e| MessengerError::Io(std::io::Error::other(e.to_string())))
+            }
+        }
+    }
+}
+
 /// Blocking-style protocol client. Reads are pull-based via [`recv`]; server
 /// pushes (chat, presence, acks) queue in the socket until consumed.
 ///
 /// [`recv`]: MessengerClient::recv
 pub struct MessengerClient {
-    framed: Framed<MaybeTlsStream, FrameCodec>,
+    io: ClientIo,
     user_id: String,
     ping_seq: u64,
 }
@@ -61,7 +127,7 @@ impl MessengerClient {
 
     /// Send a raw packet without waiting for a reply (FFI / advanced hosts).
     pub async fn send_packet(&mut self, packet: Packet) -> Result<(), MessengerError> {
-        self.framed.send(packet).await
+        self.io.send(packet).await
     }
 
     /// Allocate the next ping sequence number (does not send).
@@ -92,19 +158,62 @@ impl MessengerClient {
         resume_after_seq: u64,
     ) -> Result<(Self, LoginOutcome), MessengerError> {
         let socket = stream::connect(addr, tls).await?;
-        let mut framed = Framed::new(socket, FrameCodec::default());
+        let io = ClientIo::Tcp(Framed::new(socket, FrameCodec::default()));
+        Self::login(io, user_id, device_id, auth_token, resume_after_seq).await
+    }
 
-        framed
-            .send(Packet::Login(wire::Login {
-                user_id: user_id.into(),
-                device_id: device_id.into(),
-                auth_token: auth_token.into(),
-                client_version: env!("CARGO_PKG_VERSION").into(),
-                resume_after_seq,
-            }))
-            .await?;
+    /// Connect over WebSocket (`feature = "ws"`). `url` is e.g. `ws://127.0.0.1:9001/`
+    /// or `wss://host/messenger`. Each WS binary message is one full frame.
+    #[cfg(feature = "ws")]
+    pub async fn connect_ws(
+        url: &str,
+        tls: Option<&TlsConnector>,
+        user_id: &str,
+        device_id: &str,
+        auth_token: &str,
+        resume_after_seq: u64,
+    ) -> Result<(Self, LoginOutcome), MessengerError> {
+        let parsed = url::Url::parse(url)
+            .map_err(|e| MessengerError::Protocol(format!("bad ws url: {e}")))?;
+        let host = parsed.host_str().unwrap_or("127.0.0.1");
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addr = format!("{host}:{port}");
+        let use_tls = parsed.scheme() == "wss" || tls.is_some();
+        let socket = if use_tls {
+            stream::connect(&addr, tls).await?
+        } else {
+            stream::connect(&addr, None).await?
+        };
+        let (ws, _) = tokio_tungstenite::client_async(url, socket)
+            .await
+            .map_err(|e| MessengerError::Io(std::io::Error::other(e.to_string())))?;
+        Self::login(
+            ClientIo::Ws(ws),
+            user_id,
+            device_id,
+            auth_token,
+            resume_after_seq,
+        )
+        .await
+    }
 
-        let ack = match Self::next(&mut framed).await? {
+    async fn login(
+        mut io: ClientIo,
+        user_id: &str,
+        device_id: &str,
+        auth_token: &str,
+        resume_after_seq: u64,
+    ) -> Result<(Self, LoginOutcome), MessengerError> {
+        io.send(Packet::Login(wire::Login {
+            user_id: user_id.into(),
+            device_id: device_id.into(),
+            auth_token: auth_token.into(),
+            client_version: env!("CARGO_PKG_VERSION").into(),
+            resume_after_seq,
+        }))
+        .await?;
+
+        let ack = match Self::next_io(&mut io).await? {
             Packet::LoginAck(a) if a.ok => a,
             Packet::LoginAck(a) => return Err(MessengerError::Protocol(a.error)),
             Packet::Error(e) => return Err(MessengerError::Protocol(e.detail)),
@@ -116,34 +225,38 @@ impl MessengerClient {
             }
         };
 
-        // Drain replay until SyncComplete.
         let mut replayed = Vec::new();
         let latest_seq = loop {
-            match Self::next(&mut framed).await? {
+            match Self::next_io(&mut io).await? {
                 Packet::SyncComplete(s) => break s.latest_seq,
                 pkt => replayed.push(pkt),
             }
         };
 
         Ok((
-            Self { framed, user_id: user_id.into(), ping_seq: 0 },
-            LoginOutcome { session_id: ack.session_id, replayed, latest_seq },
+            Self {
+                io,
+                user_id: user_id.into(),
+                ping_seq: 0,
+            },
+            LoginOutcome {
+                session_id: ack.session_id,
+                replayed,
+                latest_seq,
+            },
         ))
     }
 
-    async fn next(
-        framed: &mut Framed<MaybeTlsStream, FrameCodec>,
-    ) -> Result<Packet, MessengerError> {
-        match tokio::time::timeout(RECV_TIMEOUT, framed.next()).await {
+    async fn next_io(io: &mut ClientIo) -> Result<Packet, MessengerError> {
+        match tokio::time::timeout(RECV_TIMEOUT, io.recv()).await {
             Err(_) => Err(MessengerError::Timeout("server frame")),
-            Ok(None) => Err(MessengerError::Closed),
-            Ok(Some(r)) => r,
+            Ok(r) => r,
         }
     }
 
     /// Receive the next server frame (chat, presence, acks, …).
     pub async fn recv(&mut self) -> Result<Packet, MessengerError> {
-        Self::next(&mut self.framed).await
+        Self::next_io(&mut self.io).await
     }
 
     /// Receive frames until `pred` matches, returning the matching packet.
@@ -165,7 +278,7 @@ impl MessengerClient {
     pub async fn ping(&mut self) -> Result<(), MessengerError> {
         self.ping_seq += 1;
         let seq = self.ping_seq;
-        self.framed.send(Packet::Ping(wire::Ping { seq })).await?;
+        self.io.send(Packet::Ping(wire::Ping { seq })).await?;
         match self.recv_until(|p| matches!(p, Packet::Pong(_))).await? {
             Packet::Pong(p) if p.seq == seq => Ok(()),
             _ => Err(MessengerError::Protocol("pong seq mismatch".into())),
@@ -191,8 +304,7 @@ impl MessengerClient {
         body: &[u8],
         media_id: &str,
     ) -> Result<u64, MessengerError> {
-        self.framed
-            .send(Packet::ChatMessage(wire::ChatMessage {
+        self.io.send(Packet::ChatMessage(wire::ChatMessage {
                 message_id: message_id.into(),
                 from_user: self.user_id.clone(),
                 to_user: to_user.into(),
@@ -262,8 +374,7 @@ impl MessengerClient {
 
     /// Acknowledge delivery of a received message (double tick).
     pub async fn ack_delivered(&mut self, message_id: &str) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::DeliveredAck(wire::DeliveredAck {
+        self.io.send(Packet::DeliveredAck(wire::DeliveredAck {
                 message_id: message_id.into(),
                 from_user: self.user_id.clone(),
             }))
@@ -273,8 +384,7 @@ impl MessengerClient {
 
     /// Acknowledge reading a message (blue tick).
     pub async fn ack_read(&mut self, message_id: &str) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::ReadAck(wire::ReadAck {
+        self.io.send(Packet::ReadAck(wire::ReadAck {
                 message_id: message_id.into(),
                 from_user: self.user_id.clone(),
             }))
@@ -289,8 +399,7 @@ impl MessengerClient {
         &mut self,
         contact_ids: impl IntoIterator<Item = impl Into<String>>,
     ) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::SubscribePresence(wire::SubscribePresence {
+        self.io.send(Packet::SubscribePresence(wire::SubscribePresence {
                 user_id: self.user_id.clone(),
                 contact_ids: contact_ids.into_iter().map(Into::into).collect(),
             }))
@@ -303,8 +412,7 @@ impl MessengerClient {
         &mut self,
         kind: wire::PresenceKind,
     ) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::Presence(wire::Presence {
+        self.io.send(Packet::Presence(wire::Presence {
                 user_id: self.user_id.clone(),
                 kind: kind as i32,
                 last_seen: 0,
@@ -331,8 +439,7 @@ impl MessengerClient {
             }
             s
         };
-        self.framed
-            .send(Packet::MediaStart(wire::MediaStart {
+        self.io.send(Packet::MediaStart(wire::MediaStart {
                 media_id: media_id.into(),
                 file_name: file_name.into(),
                 mime_type: mime_type.into(),
@@ -352,8 +459,7 @@ impl MessengerClient {
         loop {
             let end = (offset + CHUNK).min(data.len());
             let last = end == data.len();
-            self.framed
-                .send(Packet::MediaChunk(wire::MediaChunk {
+            self.io.send(Packet::MediaChunk(wire::MediaChunk {
                     media_id: media_id.into(),
                     offset: offset as u64,
                     data: data[offset..end].to_vec(),
@@ -382,8 +488,7 @@ impl MessengerClient {
 
     /// Download a stored blob, verifying its sha256 digest locally.
     pub async fn fetch_media(&mut self, media_id: &str) -> Result<DownloadedMedia, MessengerError> {
-        self.framed
-            .send(Packet::MediaFetch(wire::MediaFetch {
+        self.io.send(Packet::MediaFetch(wire::MediaFetch {
                 media_id: media_id.into(),
                 from_offset: 0,
             }))
@@ -463,8 +568,7 @@ impl MessengerClient {
         op: wire::GroupOp,
         subject: &str,
     ) -> Result<u64, MessengerError> {
-        self.framed
-            .send(Packet::GroupEvent(wire::GroupEvent {
+        self.io.send(Packet::GroupEvent(wire::GroupEvent {
                 group_id: group_id.into(),
                 op: op as i32,
                 actor_user: self.user_id.clone(),
@@ -493,8 +597,7 @@ impl MessengerClient {
         message_id: &str,
         body: &[u8],
     ) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::GroupMessage(wire::GroupMessage {
+        self.io.send(Packet::GroupMessage(wire::GroupMessage {
                 message_id: message_id.into(),
                 from_user: self.user_id.clone(),
                 group_id: group_id.into(),
@@ -519,7 +622,7 @@ impl MessengerClient {
 
     /// Close the connection gracefully.
     pub async fn close(mut self) -> Result<(), MessengerError> {
-        self.framed.close().await
+        self.io.close().await
     }
 
     // ---- E2EE (Phase 10) ----------------------------------------------------
@@ -531,8 +634,7 @@ impl MessengerClient {
         identity_key: &str,
         one_time_keys: Vec<String>,
     ) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::PublishKeys(wire::PublishKeys {
+        self.io.send(Packet::PublishKeys(wire::PublishKeys {
                 user_id: self.user_id.clone(),
                 device_id: device_id.into(),
                 identity_key: identity_key.into(),
@@ -554,8 +656,7 @@ impl MessengerClient {
         device_id: &str,
     ) -> Result<wire::KeyBundle, MessengerError> {
         let for_user = self.user_id.clone();
-        self.framed
-            .send(Packet::FetchKeys(wire::FetchKeys {
+        self.io.send(Packet::FetchKeys(wire::FetchKeys {
                 user_id: user_id.into(),
                 for_user: for_user.clone(),
                 device_id: device_id.into(),
@@ -574,8 +675,7 @@ impl MessengerClient {
 
     /// Revoke this device's published keys on the server.
     pub async fn remove_device_keys(&mut self, device_id: &str) -> Result<(), MessengerError> {
-        self.framed
-            .send(Packet::RemoveDeviceKeys(wire::RemoveDeviceKeys {
+        self.io.send(Packet::RemoveDeviceKeys(wire::RemoveDeviceKeys {
                 user_id: self.user_id.clone(),
                 device_id: device_id.into(),
             }))

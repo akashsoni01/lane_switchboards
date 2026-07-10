@@ -1,0 +1,18 @@
+# Third-party notices (lane_messenger_ffi)
+
+This product includes software developed by third parties:
+
+## vodozemac
+Apache-2.0 / matrix.org — Olm / Megolm cryptography.
+
+## rustls / tokio-rustls / webpki-roots
+Apache-2.0 / MIT / ISC — TLS stack.
+
+## tokio / tokio-tungstenite
+MIT — async runtime and WebSocket.
+
+## prost / tonic
+Apache-2.0 — protobuf.
+
+Full license texts are available in the respective crates on crates.io and in
+Cargo.lock. Ship this NOTICE with binary distributions of `liblane_messenger_ffi`.

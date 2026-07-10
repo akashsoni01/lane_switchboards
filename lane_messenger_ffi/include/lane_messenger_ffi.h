@@ -32,6 +32,7 @@ LaneSession *lane_session_connect(
 void lane_session_free(LaneSession *session);
 int32_t lane_session_close(LaneSession *session);
 int32_t lane_session_ping(LaneSession *session);
+int32_t lane_session_set_resume_seq(LaneSession *session, uint64_t seq);
 int32_t lane_session_poll_event(LaneSession *session, uint64_t timeout_ms, char **out_json);
 
 int32_t lane_send_chat(
@@ -40,6 +41,22 @@ int32_t lane_send_chat(
     const char *message_id,
     const uint8_t *body,
     size_t body_len,
+    uint64_t *out_seq);
+int32_t lane_send_chat_with_media(
+    LaneSession *session,
+    const char *to_user,
+    const char *message_id,
+    const uint8_t *body,
+    size_t body_len,
+    const char *media_id,
+    uint64_t *out_seq);
+int32_t lane_send_chat_retry(
+    LaneSession *session,
+    const char *to_user,
+    const char *message_id,
+    const uint8_t *body,
+    size_t body_len,
+    uint32_t max_attempts,
     uint64_t *out_seq);
 
 int32_t lane_ack_delivered(LaneSession *session, const char *message_id);
@@ -53,6 +70,12 @@ int32_t lane_add_member(
     const char *group_id,
     const char *user,
     uint64_t *out_version);
+int32_t lane_remove_member(
+    LaneSession *session,
+    const char *group_id,
+    const char *user,
+    uint64_t *out_version);
+int32_t lane_leave_group(LaneSession *session, const char *group_id, uint64_t *out_version);
 int32_t lane_send_group(
     LaneSession *session,
     const char *group_id,
@@ -68,6 +91,14 @@ int32_t lane_upload_media(
     const uint8_t *data,
     size_t data_len,
     uint64_t *out_bytes);
+int32_t lane_fetch_media(
+    LaneSession *session,
+    const char *media_id,
+    uint8_t **out_data,
+    size_t *out_len,
+    char **out_file_name,
+    char **out_mime,
+    char **out_sha);
 
 LaneE2eeDevice *lane_e2ee_generate(void);
 void lane_e2ee_free(LaneE2eeDevice *device);
@@ -86,6 +117,22 @@ int32_t lane_send_encrypted_chat(
     const uint8_t *plaintext,
     size_t plaintext_len,
     uint64_t *out_seq);
+int32_t lane_decrypt_chat(
+    LaneE2eeDevice *device,
+    const char *from_user,
+    const uint8_t *body,
+    size_t body_len,
+    uint8_t **out_plain,
+    size_t *out_len);
+int32_t lane_e2ee_export_pickle(
+    LaneE2eeDevice *device,
+    const char *passphrase,
+    uint8_t **out_bytes,
+    size_t *out_len);
+LaneE2eeDevice *lane_e2ee_import_pickle(
+    const uint8_t *bytes,
+    size_t len,
+    const char *passphrase);
 
 #ifdef __cplusplus
 }

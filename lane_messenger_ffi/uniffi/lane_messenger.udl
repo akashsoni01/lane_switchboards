@@ -1,0 +1,59 @@
+namespace lane.messenger.ffi;
+
+// Scaffolding for UniFFI codegen (Phase F7). The production C ABI already
+// ships in include/lane_messenger_ffi.h — this UDL is the target shape for
+// Swift/Kotlin generation once `uniffi` feature is wired.
+
+[Error]
+enum FfiError {
+  Io(string),
+  Protocol(string),
+  AuthFailed,
+  Closed,
+  Timeout(string),
+  Media(string),
+  E2ee(string),
+  InvalidArgument(string),
+  NotConnected,
+  Internal(string),
+};
+
+dictionary ConnectOptions {
+  string host;
+  u16 port;
+  boolean use_tls;
+  string user_id;
+  string device_id;
+  string auth_token;
+  string client_version;
+  u64 resume_after_seq;
+  u64 ping_interval_secs;
+  boolean auto_reconnect;
+  u32 max_reconnect_attempts;
+};
+
+interface SessionHandle {
+  [Throws=FfiError]
+  constructor(ConnectOptions opts);
+
+  [Throws=FfiError]
+  void ping();
+
+  [Throws=FfiError]
+  u64 send_chat(string to_user, string message_id, bytes body);
+
+  [Throws=FfiError]
+  void close();
+};
+
+interface E2eeHandle {
+  constructor();
+  string identity_key();
+  [Throws=FfiError]
+  u64 send_encrypted_chat(SessionHandle session, string to_user, string message_id, bytes plaintext);
+};
+
+namespace lane_messenger_ffi {
+  string version();
+  u8 protocol_version();
+};
