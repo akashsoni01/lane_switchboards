@@ -68,6 +68,28 @@ public final class LaneSession {
         return seq
     }
 
+    public func ackDelivered(messageId: String) throws {
+        let code = messageId.withCString { m in
+            lane_ack_delivered(UnsafeMutablePointer(ptr), m)
+        }
+        try check(code)
+    }
+
+    public func ackRead(messageId: String) throws {
+        let code = messageId.withCString { m in
+            lane_ack_read(UnsafeMutablePointer(ptr), m)
+        }
+        try check(code)
+    }
+
+    public func subscribePresence(contactIds: [String]) throws {
+        let csv = contactIds.joined(separator: ",")
+        let code = csv.withCString { c in
+            lane_subscribe_presence(UnsafeMutablePointer(ptr), c)
+        }
+        try check(code)
+    }
+
     public func pollEvent(timeoutMs: UInt64) -> String? {
         var json: UnsafeMutablePointer<CChar>?
         let n = lane_session_poll_event(UnsafeMutablePointer(ptr), timeoutMs, &json)
@@ -121,6 +143,15 @@ func lane_send_chat(
     _ mid: UnsafePointer<CChar>, _ body: UnsafePointer<UInt8>?,
     _ len: Int, _ seq: UnsafeMutablePointer<UInt64>
 ) -> Int32
+
+@_silgen_name("lane_ack_delivered")
+func lane_ack_delivered(_ s: UnsafeMutableRawPointer?, _ mid: UnsafePointer<CChar>) -> Int32
+
+@_silgen_name("lane_ack_read")
+func lane_ack_read(_ s: UnsafeMutableRawPointer?, _ mid: UnsafePointer<CChar>) -> Int32
+
+@_silgen_name("lane_subscribe_presence")
+func lane_subscribe_presence(_ s: UnsafeMutableRawPointer?, _ csv: UnsafePointer<CChar>) -> Int32
 
 @_silgen_name("lane_string_free")
 func lane_string_free(_ s: UnsafeMutablePointer<CChar>?)

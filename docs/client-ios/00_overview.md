@@ -28,4 +28,6 @@ TLS + FunXMPP → gateway
 - **I1** — Keychain credentials, login/splash/home, kick alert
 - **I2** — reconnect / ping / protocol errors / scene phase
 - **I3** — SQLite local store + resume seq
-- I4+ — inbox/chat UI, presence, groups, … (see `todo_ios.md`)
+- **I4** — inbox + 1:1 thread, ticks, drafts, send path
+- **I5** — presence dots + contacts / subscribe
+- I6+ — groups, media, E2EE, push, … (see `todo_ios.md`)

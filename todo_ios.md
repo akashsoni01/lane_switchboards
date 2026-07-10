@@ -6,8 +6,9 @@ wire codec, E2EE, or framing in Swift.
 
 Legend: `[ ]` pending · `[~]` in progress / partial · `[x]` done
 
-**Status:** I0–I3 in progress (2026-07-10). Kit covers auth, session
-reconnect, and SQLite local store under `apps/ios/`.
+**Status:** I0–I5 in progress (2026-07-10). Kit covers auth, session
+reconnect, SQLite store, 1:1 chat UI/ticks, and presence/contacts under
+`apps/ios/`.
 
 | Layer | Source of truth | iOS responsibility |
 |-------|-----------------|--------------------|
@@ -270,8 +271,8 @@ Offline-first UI; socket is the sync pipe, not the source of truth for display.
 - [x] Idempotent upsert on `message_id` (replay-safe).
 - [x] Apply inbound FFI events → DB → UI observation (`AsyncStream` +
       inbox refresh).
-- [~] Outbound: write pending row **first**, then FFI send; on failure mark
-      `failed` + retry affordance. (wired in I4 with send UI)
+- [x] Outbound: write pending row **first**, then FFI send; on failure mark
+      `failed` + retry affordance.
 
 **Tests**
 - [x] Migration / in-memory smoke.
@@ -289,26 +290,28 @@ resume seq correct.
 
 ## Phase I4 — Inbox + 1:1 chat UI
 
-- [ ] Inbox list: avatar placeholder, title, preview, time, unread badge,
+- [x] Inbox list: avatar placeholder, title, preview, time, unread badge,
       presence dot.
-- [ ] Thread: bubbles, timestamps, day separators, send box, attachment btn.
-- [ ] Ticks: clock (pending) → single (ServerAck) → double (Delivered) →
+- [x] Thread: bubbles, timestamps, day separators, send box, attachment btn
+      (attachment disabled until I7).
+- [x] Ticks: clock (pending) → single (ServerAck) → double (Delivered) →
       blue double (Read) — match product copy to server semantics.
-- [ ] Send text → Domain `SendMessage` → DB + FFI.
-- [ ] On open thread: emit `DeliveredAck` / `ReadAck` via FFI for inbound.
-- [ ] Drafts persisted per conversation.
-- [ ] Empty / error / offline states.
+- [x] Send text → Domain `SendMessage` / `ChatService` → DB + FFI.
+- [x] On open thread: emit `DeliveredAck` / `ReadAck` via FFI for inbound.
+- [x] Drafts persisted per conversation.
+- [x] Empty / error / offline states.
 
 **Tests**
-- [ ] UI snapshot or ViewInspector smoke for bubble + ticks.
-- [ ] Integration: A→B chat round-trip against local gateway (two simulators
-      or one sim + Rust peer).
+- [x] Smoke: send pending→ack, failed→retry path, open-thread acks,
+      draft persistence (`lane-messenger-kit-smoke`).
+- [~] Integration: A→B chat round-trip against local gateway (requires
+      XCFramework + two clients).
 
 **Docs**
-- [ ] `docs/client-ios/04_chat.md` — tick mapping table to packet types.
+- [x] `docs/client-ios/04_chat.md` — tick mapping table to packet types.
 
 **Exit criteria**: two users exchange messages with correct ticks after
-reconnect.
+reconnect (mock path green; live gateway when FFI linked).
 
 ---
 
@@ -317,18 +320,18 @@ reconnect.
 Wire: `Presence`, optional `SubscribePresence`
 ([`docs/messenger/04_presence.md`](docs/messenger/04_presence.md)).
 
-- [ ] Apply presence events into `contacts` + inbox rows.
-- [ ] Contact bootstrap: DEBUG seed list / manual add until server contact
+- [x] Apply presence events into `contacts` + inbox rows.
+- [x] Contact bootstrap: DEBUG seed list / manual add until server contact
       API exists (HTTP).
-- [ ] Privacy: never invent last-seen if server omitted it.
-- [ ] Do **not** invent typing packets (not in proto).
+- [x] Privacy: never invent last-seen if server omitted it.
+- [x] Do **not** invent typing packets (not in proto).
 
 **Tests**
-- [ ] Presence updates UI without scroll jump.
-- [ ] Integration parity with FFI presence smoke.
+- [x] Presence parse + contact upsert smoke.
+- [~] Integration parity with FFI presence smoke (live gateway).
 
 **Docs**
-- [ ] `docs/client-ios/05_presence.md`
+- [x] `docs/client-ios/05_presence.md`
 
 **Exit criteria**: online/offline reflects gateway; last-seen only when
 provided.

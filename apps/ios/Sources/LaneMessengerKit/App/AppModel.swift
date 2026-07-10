@@ -1,7 +1,7 @@
 import Foundation
 import Observation
 
-/// Root app state: auth (I1) + session lifecycle (I2) + local store (I3).
+/// Root app state: auth, session, store, chat (I4), presence (I5).
 @MainActor
 @Observable
 public final class AppModel {
@@ -17,19 +17,27 @@ public final class AppModel {
     public private(set) var pendingMessagesHint: UInt32 = 0
     public private(set) var lastPingRttMs: UInt64?
     public private(set) var inbox: [Conversation] = []
+    public private(set) var contacts: [Contact] = []
+    public private(set) var threadMessages: [StoredMessage] = []
+    public var selectedPeer: String?
+    public var composeText: String = ""
     public var errorBanner: String?
     public var showReplacedAlert = false
     public var showUpgradeAlert = false
+    public var showNewChat = false
     public var isBusy = false
+    public var isSending = false
 
     public var config: AppConfig
     public let credentialsStore: CredentialStore
     public let authService: AuthService
     public let session: SessionActor
     public let store: LocalStore
+    public var chat: ChatService { ChatService(store: store, session: session) }
 
     private var eventsTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
+    private var draftSaveTask: Task<Void, Never>?
 
     public init(
         config: AppConfig = .default,
@@ -71,6 +79,9 @@ public final class AppModel {
                 try await connect(with: creds)
                 route = .home
                 refreshInbox()
+                refreshContacts()
+                await seedDebugContactsIfNeeded()
+                await subscribePresenceRoster()
             } else {
                 route = .login
             }
@@ -96,6 +107,9 @@ public final class AppModel {
             try await connect(with: creds)
             route = .home
             refreshInbox()
+            refreshContacts()
+            await seedDebugContactsIfNeeded()
+            await subscribePresenceRoster()
         } catch let err as AppError {
             errorBanner = err.errorDescription
             if err == .replacedByNewSession { showReplacedAlert = true }
@@ -112,6 +126,9 @@ public final class AppModel {
         connectionState = .disconnected
         pendingMessagesHint = 0
         inbox = []
+        contacts = []
+        threadMessages = []
+        selectedPeer = nil
         stopEvents()
         route = .login
     }
@@ -125,7 +142,6 @@ public final class AppModel {
     }
 
     public func handleScenePhase(_ phase: String) async {
-        // "active" | "inactive" | "background"
         let foreground = phase == "active"
         await session.setAppInForeground(foreground)
         connectionState = await session.state
@@ -133,6 +149,91 @@ public final class AppModel {
 
     public func refreshInbox() {
         inbox = (try? store.conversations()) ?? []
+    }
+
+    public func refreshContacts() {
+        contacts = (try? store.contacts()) ?? []
+    }
+
+    public func openChat(peer: String) async {
+        selectedPeer = peer
+        try? store.ensureConversation(id: peer, title: peer)
+        if let draft = try? store.conversations().first(where: { $0.id == peer })?.draft {
+            composeText = draft
+        } else {
+            composeText = ""
+        }
+        try? await chat.openThread(peer: peer)
+        reloadThread()
+        refreshInbox()
+    }
+
+    public func closeChat() {
+        selectedPeer = nil
+        composeText = ""
+        threadMessages = []
+    }
+
+    public func updateDraft(_ text: String) {
+        composeText = text
+        guard let peer = selectedPeer else { return }
+        draftSaveTask?.cancel()
+        draftSaveTask = Task {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled else { return }
+            try? store.setDraft(conversationId: peer, draft: text)
+        }
+    }
+
+    public func sendCurrentCompose() async {
+        guard let peer = selectedPeer, let me = credentials?.userId else { return }
+        let text = composeText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        isSending = true
+        defer { isSending = false }
+        do {
+            _ = try await chat.sendText(to: peer, body: text, fromUser: me)
+            composeText = ""
+            reloadThread()
+            refreshInbox()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+            reloadThread()
+        } catch {
+            errorBanner = error.localizedDescription
+            reloadThread()
+        }
+    }
+
+    public func retryMessage(_ message: StoredMessage) async {
+        guard let peer = selectedPeer else { return }
+        do {
+            try await chat.retryFailed(message: message, to: peer)
+            reloadThread()
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
+    public func startChat(with userId: String) async {
+        let peer = userId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !peer.isEmpty else { return }
+        showNewChat = false
+        try? store.upsertContact(Contact(userId: peer))
+        try? store.ensureConversation(id: peer, title: peer)
+        refreshContacts()
+        await openChat(peer: peer)
+        await subscribePresenceRoster()
+    }
+
+    public func reloadThread() {
+        guard let peer = selectedPeer else {
+            threadMessages = []
+            return
+        }
+        threadMessages = (try? store.messages(conversationId: peer, limit: 500)) ?? []
     }
 
     private func configureSession() async {
@@ -203,6 +304,8 @@ public final class AppModel {
     private func handle(_ event: LaneEvent) async {
         connectionState = await session.state
         pendingMessagesHint = await session.pendingMessagesHint
+        let me = credentials?.userId ?? ""
+
         switch event {
         case .replacedByNewSession:
             showReplacedAlert = true
@@ -212,29 +315,72 @@ public final class AppModel {
         case .protocolError(let code, let detail):
             let mapped = ProtocolErrorCode(raw: code)
             errorBanner = detail.isEmpty ? mapped.userMessage : detail
-            if mapped == .unsupportedVersion {
-                showUpgradeAlert = true
-            }
-            if mapped == .replacedByNewSession {
-                showReplacedAlert = true
-            }
-        case .chatMessage(let messageId, let fromUser, let seq):
+            if mapped == .unsupportedVersion { showUpgradeAlert = true }
+            if mapped == .replacedByNewSession { showReplacedAlert = true }
+        case .chatMessage(let messageId, let fromUser, let toUser, let body, let seq, let mediaId, let sentAt):
+            let peer = fromUser == me ? toUser : fromUser
+            let direction: MessageDirection = fromUser == me ? .outbound : .inbound
+            let created = sentAt > 0
+                ? Date(timeIntervalSince1970: TimeInterval(sentAt))
+                : Date()
             let stored = StoredMessage(
                 messageId: messageId,
-                conversationId: fromUser,
-                direction: .inbound,
-                body: "",
+                conversationId: peer.isEmpty ? fromUser : peer,
+                direction: direction,
+                body: body,
+                mediaId: mediaId,
                 seq: seq,
-                status: .delivered
+                status: direction == .inbound ? .delivered : .sent,
+                createdAt: created
             )
             _ = try? store.upsertMessage(stored)
+            if selectedPeer == stored.conversationId, direction == .inbound {
+                try? await session.ackDelivered(messageId: messageId)
+                try? await session.ackRead(messageId: messageId)
+                try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
+                try? store.markConversationRead(conversationId: stored.conversationId)
+            }
             refreshInbox()
+            if selectedPeer == stored.conversationId { reloadThread() }
         case .serverAck(let messageId, let seq):
             try? store.updateStatus(messageId: messageId, status: .sent, seq: seq)
-        case .deliveredAck(let messageId):
+            if selectedPeer != nil { reloadThread() }
+        case .deliveredAck(let messageId, _):
             try? store.updateStatus(messageId: messageId, status: .delivered, seq: nil)
-        case .readAck(let messageId):
+            if selectedPeer != nil { reloadThread() }
+        case .readAck(let messageId, _):
             try? store.updateStatus(messageId: messageId, status: .read, seq: nil)
+            if selectedPeer != nil { reloadThread() }
+        case .presence(let userId, let kind, let lastSeen):
+            // Never invent last-seen: only store when server provided a value.
+            let existing = try? store.contact(userId: userId)
+            let presence = PresenceKind(rawValue: kind) ?? .unavailable
+            let seen: Date? = {
+                if let lastSeen, lastSeen > 0 {
+                    return Date(timeIntervalSince1970: TimeInterval(lastSeen))
+                }
+                return existing?.lastSeen
+            }()
+            let contact = Contact(
+                userId: userId,
+                displayName: existing?.displayName ?? userId,
+                presence: presence,
+                lastSeen: presence == .lastSeen || presence == .unavailable ? seen : existing?.lastSeen
+            )
+            // Privacy: if server omitted last_seen on LAST_SEEN, keep prior only; do not invent.
+            if presence == .lastSeen, lastSeen == nil || lastSeen == 0 {
+                let c = Contact(
+                    userId: userId,
+                    displayName: contact.displayName,
+                    presence: .lastSeen,
+                    lastSeen: existing?.lastSeen
+                )
+                try? store.upsertContact(c)
+            } else {
+                try? store.upsertContact(contact)
+            }
+            refreshContacts()
+            refreshInbox()
         case .syncComplete(let latestSeq, _):
             if latestSeq > 0 {
                 let current = (try? store.resumeAfterSeq()) ?? 0
@@ -245,5 +391,24 @@ public final class AppModel {
         default:
             break
         }
+    }
+
+    private func subscribePresenceRoster() async {
+        let ids = ((try? store.contacts()) ?? []).map(\.userId)
+        guard !ids.isEmpty else { return }
+        try? await session.subscribePresence(contactIds: ids)
+    }
+
+    private func seedDebugContactsIfNeeded() async {
+        #if DEBUG
+        let existing = (try? store.contacts()) ?? []
+        guard existing.isEmpty, let me = credentials?.userId else { return }
+        // Bootstrap peers for local gateway demos (messenger_demo uses alice/bob).
+        let seeds = ["alice", "bob", "carol"].filter { $0 != me }
+        for user in seeds {
+            try? store.upsertContact(Contact(userId: user, presence: .unavailable))
+        }
+        refreshContacts()
+        #endif
     }
 }

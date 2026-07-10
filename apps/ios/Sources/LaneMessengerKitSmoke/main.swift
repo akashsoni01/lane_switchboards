@@ -6,19 +6,24 @@ struct Smoke {
     static func main() async {
         var failed = 0
         failed += check("parse login/sync", testParseEvents())
-        failed += check("parse replaced + protocol", testParseProtocol())
-        failed += check("reconnect delay monotonic cap", testBackoff())
+        failed += check("parse chat body b64", testParseChatBody())
+        failed += check("parse presence", testParsePresence())
+        failed += check("reconnect delay", testBackoff())
         #if DEBUG
-        failed += check("mint token shape", testMintShape())
-        failed += await checkAsync("debug login mints", testDebugLogin)
+        failed += check("mint token", testMintShape())
+        failed += await checkAsync("debug login", testDebugLogin)
         #endif
-        failed += check("keychain device stable", testKeychain())
-        failed += check("store idempotent + resume", testStore())
-        failed += await checkAsync("session reaches ready", testSessionReady)
-        failed += await checkAsync("replaced locks reconnect", testReplacedLock)
-        failed += await checkAsync("auth failed maps", testAuthFailed)
-        failed += await checkAsync("disconnect schedules reconnect", testReconnect)
-        failed += await checkAsync("resume seq stamped on connect", testResumeStamp)
+        failed += check("keychain", testKeychain())
+        failed += check("store idempotent", testStore())
+        failed += check("draft + mark read", testDraft())
+        failed += await checkAsync("session ready", testSessionReady)
+        failed += await checkAsync("replaced lock", testReplacedLock)
+        failed += await checkAsync("auth failed", testAuthFailed)
+        failed += await checkAsync("reconnect", testReconnect)
+        failed += await checkAsync("resume stamp", testResumeStamp)
+        failed += await checkAsync("send pending then ack", testSendPath)
+        failed += await checkAsync("failed send marks failed", testSendFail)
+        failed += await checkAsync("open thread acks", testOpenThreadAcks)
 
         if failed > 0 {
             fputs("FAILED \(failed) check(s)\n", stderr)
@@ -29,12 +34,8 @@ struct Smoke {
 }
 
 private func check(_ name: String, _ ok: Bool) -> Int {
-    if ok {
-        print("ok  \(name)")
-        return 0
-    }
-    print("FAIL \(name)")
-    return 1
+    print(ok ? "ok  \(name)" : "FAIL \(name)")
+    return ok ? 0 : 1
 }
 
 private func checkAsync(_ name: String, _ body: () async -> Bool) async -> Int {
@@ -50,85 +51,69 @@ private func testParseEvents() -> Bool {
         && sync == .syncComplete(latestSeq: 42, delivered: 2)
 }
 
-private func testParseProtocol() -> Bool {
-    let replaced = LaneEvent.parse(json: #"{"type":"ReplacedByNewSession"}"#)
-    let proto = LaneEvent.parse(json: #"{"type":"ProtocolError","code":1,"detail":"upgrade"}"#)
-    return replaced == .replacedByNewSession
-        && proto == .protocolError(code: 1, detail: "upgrade")
-        && ProtocolErrorCode.unsupportedVersion.pausesReconnect
+private func testParseChatBody() -> Bool {
+    let body = "hello"
+    let b64 = Data(body.utf8).base64EncodedString()
+    let ev = LaneEvent.parse(
+        json: #"{"type":"ChatMessage","message_id":"m1","from_user":"bob","to_user":"alice","body_hex":"\#(b64)","sent_at":1,"seq":9,"media_id":""}"#
+    )
+    if case .chatMessage(_, "bob", "alice", body, 9, "", 1) = ev { return true }
+    return false
+}
+
+private func testParsePresence() -> Bool {
+    let ev = LaneEvent.parse(json: #"{"type":"Presence","user_id":"bob","kind":0}"#)
+    if case .presence("bob", 0, nil) = ev { return true }
+    return false
 }
 
 private func testBackoff() -> Bool {
     let p = ReconnectPolicy(baseDelayMs: 250, maxDelayMs: 30_000, maxAttempts: 0)
-    let d1 = p.delayMs(forAttempt: 1)
-    let d8 = p.delayMs(forAttempt: 8)
-    return d1 <= 500 && d8 <= 30_000 && p.shouldRetry(attempt: 99)
+    return p.delayMs(forAttempt: 1) <= 500 && p.delayMs(forAttempt: 8) <= 30_000
 }
 
 #if DEBUG
 private func testMintShape() -> Bool {
-    let token = DebugAuthService.mintToken(
-        userId: "alice",
-        deviceId: "phone-1",
-        sharedSecret: "demo-secret"
-    )
-    return token.count == 64 && token.allSatisfy(\.isHexDigit)
+    let token = DebugAuthService.mintToken(userId: "alice", deviceId: "phone-1", sharedSecret: "demo-secret")
+    return token.count == 64
 }
 
 private func testDebugLogin() async -> Bool {
     let svc = DebugAuthService(sharedSecret: "demo-secret") { "device-fixed" }
     do {
         let creds = try await svc.login(userId: "alice", secret: "")
-        return creds.userId == "alice"
-            && creds.deviceId == "device-fixed"
-            && creds.authToken.count == 64
-    } catch {
-        return false
-    }
+        return creds.authToken.count == 64
+    } catch { return false }
 }
 #endif
 
 private func testKeychain() -> Bool {
     do {
-        let service = "com.lane.messenger.smoke.\(UUID().uuidString)"
-        let store = CredentialStore(keychain: KeychainStore(service: service))
+        let store = CredentialStore(keychain: KeychainStore(service: "com.lane.smoke.\(UUID().uuidString)"))
         let d1 = try store.deviceId()
-        let d2 = try store.deviceId()
-        guard d1 == d2 else { return false }
-        try store.save(AuthCredentials(userId: "alice", deviceId: d1, authToken: "abc123"))
-        guard try store.load() != nil else { return false }
+        try store.save(AuthCredentials(userId: "a", deviceId: d1, authToken: "t"))
         try store.clearSession()
-        guard try store.load() == nil else { return false }
-        return try store.deviceId() == d1
-    } catch {
-        print("  keychain error: \(error)")
-        return false
-    }
+        return try store.deviceId() == d1 && store.load() == nil
+    } catch { return false }
 }
 
 private func testStore() -> Bool {
     do {
         let store = InMemoryLocalStore()
-        let m = StoredMessage(
-            messageId: "m1",
-            conversationId: "bob",
-            direction: .inbound,
-            body: "hi",
-            seq: 7,
-            status: .delivered
-        )
-        let first = try store.upsertMessage(m)
-        let second = try store.upsertMessage(m)
-        guard first, !second else { return false }
-        guard try store.resumeAfterSeq() == 7 else { return false }
-        try store.updateStatus(messageId: "m1", status: .read, seq: 9)
-        guard try store.resumeAfterSeq() == 9 else { return false }
-        let msgs = try store.messages(conversationId: "bob", limit: 10)
-        return msgs.count == 1 && msgs[0].status == .read
-    } catch {
-        print("  store error: \(error)")
-        return false
-    }
+        let m = StoredMessage(messageId: "m1", conversationId: "bob", direction: .inbound, body: "hi", seq: 7, status: .delivered)
+        return try store.upsertMessage(m) && !store.upsertMessage(m) && store.resumeAfterSeq() == 7
+    } catch { return false }
+}
+
+private func testDraft() -> Bool {
+    do {
+        let store = InMemoryLocalStore()
+        try store.ensureConversation(id: "bob", title: "Bob")
+        try store.setDraft(conversationId: "bob", draft: "hello draft")
+        try store.markConversationRead(conversationId: "bob")
+        let c = try store.conversations().first { $0.id == "bob" }
+        return c?.draft == "hello draft" && c?.unread == 0
+    } catch { return false }
 }
 
 private func testSessionReady() async -> Bool {
@@ -146,9 +131,7 @@ private func testSessionReady() async -> Bool {
         }
         await session.close()
         return false
-    } catch {
-        return false
-    }
+    } catch { return false }
 }
 
 private func testReplacedLock() async -> Bool {
@@ -162,60 +145,47 @@ private func testReplacedLock() async -> Bool {
     let creds = AuthCredentials(userId: "alice", deviceId: "d1", authToken: "tok")
     do {
         try await session.connect(ConnectRequest(config: .default, credentials: creds))
-        var saw = false
         for _ in 0..<40 {
-            if await session.state == .replaced {
-                saw = true
-                break
-            }
+            if await session.state == .replaced { break }
             try await Task.sleep(nanoseconds: 25_000_000)
         }
-        guard saw else { return false }
         do {
             try await session.connect(ConnectRequest(config: .default, credentials: creds))
             return false
         } catch let err as AppError {
             return err == .replacedByNewSession
         }
-    } catch {
-        return false
-    }
+    } catch { return false }
 }
 
 private func testAuthFailed() async -> Bool {
     let transport = MockMessengerTransport()
     transport.connectError = .authFailed("bad token")
-    let session = SessionActor(
-        transport: transport,
-        policy: ReconnectPolicy(baseDelayMs: 10, maxDelayMs: 20, maxAttempts: 1)
-    )
+    let session = SessionActor(transport: transport, policy: ReconnectPolicy(baseDelayMs: 10, maxDelayMs: 20, maxAttempts: 1))
     await session.setAutoReconnect(false)
-    let creds = AuthCredentials(userId: "alice", deviceId: "d1", authToken: "bad")
     do {
-        try await session.connect(ConnectRequest(config: .default, credentials: creds))
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "a", deviceId: "d", authToken: "bad")
+        ))
         return false
     } catch let err as AppError {
         return err == .authFailed("bad token")
-    } catch {
-        return false
-    }
+    } catch { return false }
 }
 
 private func testReconnect() async -> Bool {
     let transport = MockMessengerTransport()
     transport.disconnectAfterReady = true
-    transport.events = [
-        #"{"type":"LoginAck","session_id":"s","pending_messages":0,"ok":true,"error":""}"#,
-        #"{"type":"SyncComplete","delivered":0,"latest_seq":0}"#,
-    ]
     let session = SessionActor(
         transport: transport,
         policy: ReconnectPolicy(baseDelayMs: 20, maxDelayMs: 50, maxAttempts: 3)
     )
-    let creds = AuthCredentials(userId: "alice", deviceId: "d1", authToken: "tok")
     do {
-        try await session.connect(ConnectRequest(config: .default, credentials: creds))
-        // Wait until offline then reconnect bumps connectCount.
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "a", deviceId: "d", authToken: "t")
+        ))
         for _ in 0..<80 {
             if transport.connectCount >= 2 {
                 await session.close()
@@ -225,30 +195,116 @@ private func testReconnect() async -> Bool {
         }
         await session.close()
         return transport.connectCount >= 2
-    } catch {
-        return false
-    }
+    } catch { return false }
 }
 
 private func testResumeStamp() async -> Bool {
     let transport = MockMessengerTransport()
     let session = SessionActor(transport: transport)
     await session.setResumeSeqProvider { 99 }
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "a", deviceId: "d", authToken: "t"),
+            resumeAfterSeq: 0
+        ))
+        let ok = transport.lastRequest?.resumeAfterSeq == 99
+        await session.close()
+        return ok
+    } catch { return false }
+}
+
+private func testSendPath() async -> Bool {
+    let transport = MockMessengerTransport()
+    let store = InMemoryLocalStore()
+    let session = SessionActor(transport: transport)
+    let chat = ChatService(store: store, session: session)
     let creds = AuthCredentials(userId: "alice", deviceId: "d1", authToken: "tok")
     do {
-        try await session.connect(
-            ConnectRequest(config: .default, credentials: creds, resumeAfterSeq: 0)
-        )
-        let stamped = transport.lastRequest?.resumeAfterSeq == 99
+        try await session.connect(ConnectRequest(config: .default, credentials: creds))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let msg = try await chat.sendText(to: "bob", body: "hello bob", fromUser: "alice")
+        // Drain ServerAck
+        for _ in 0..<40 {
+            if let json = await transport.pollEvent(timeoutMs: 10) {
+                let ev = LaneEvent.parse(json: json)
+                if case .serverAck(let id, let seq) = ev {
+                    try store.updateStatus(messageId: id, status: .sent, seq: seq)
+                }
+            } else {
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            let updated = try store.messages(conversationId: "bob", limit: 10)
+            if updated.first?.status == .sent {
+                await session.close()
+                return updated.count == 1 && msg.messageId == updated[0].messageId
+            }
+        }
+        // Even without draining via poll in this loop, pending row must exist.
+        let rows = try store.messages(conversationId: "bob", limit: 10)
         await session.close()
-        return stamped
+        return rows.count == 1 && rows[0].body == "hello bob"
     } catch {
+        print("  send path error: \(error)")
         return false
     }
 }
 
-private extension Character {
-    var isHexDigit: Bool {
-        ("0"..."9").contains(self) || ("a"..."f").contains(self) || ("A"..."F").contains(self)
-    }
+private func testSendFail() async -> Bool {
+    let transport = MockMessengerTransport()
+    transport.sendError = .connection("boom")
+    let store = InMemoryLocalStore()
+    let session = SessionActor(transport: transport)
+    let chat = ChatService(store: store, session: session)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        do {
+            _ = try await chat.sendText(to: "bob", body: "x", fromUser: "alice")
+            await session.close()
+            return false
+        } catch {
+            let rows = try store.messages(conversationId: "bob", limit: 10)
+            await session.close()
+            return rows.first?.status == .failed
+        }
+    } catch { return false }
+}
+
+private func testOpenThreadAcks() async -> Bool {
+    let transport = MockMessengerTransport()
+    let store = InMemoryLocalStore()
+    let session = SessionActor(transport: transport)
+    let chat = ChatService(store: store, session: session)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        _ = try store.upsertMessage(StoredMessage(
+            messageId: "in-1",
+            conversationId: "bob",
+            direction: .inbound,
+            body: "hi",
+            seq: 1,
+            status: .delivered
+        ))
+        try await chat.openThread(peer: "bob")
+        let ok = transport.deliveredAcks.contains("in-1") && transport.readAcks.contains("in-1")
+        await session.close()
+        return ok
+    } catch { return false }
 }

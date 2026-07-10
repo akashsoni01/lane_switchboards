@@ -5,9 +5,6 @@ import LaneMessengerFFI
 #endif
 
 /// Production transport wrapping `LaneMessengerFFI.LaneSession` (C ABI).
-///
-/// When the FFI module is not linked (unit tests / macOS package builds),
-/// construction throws `AppError.notConfigured` — inject a mock instead.
 public final class LaneFFITransport: MessengerTransport, @unchecked Sendable {
     #if canImport(LaneMessengerFFI)
     private var session: LaneSession?
@@ -55,6 +52,42 @@ public final class LaneFFITransport: MessengerTransport, @unchecked Sendable {
         #if canImport(LaneMessengerFFI)
         try session?.close()
         session = nil
+        #endif
+    }
+
+    public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        return try session.sendChat(to: to, messageId: messageId, body: body)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func ackDelivered(messageId: String) async throws {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        try session.ackDelivered(messageId: messageId)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func ackRead(messageId: String) async throws {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        try session.ackRead(messageId: messageId)
+        #else
+        throw AppError.notConfigured
+        #endif
+    }
+
+    public func subscribePresence(contactIds: [String]) async throws {
+        #if canImport(LaneMessengerFFI)
+        guard let session else { throw AppError.connection("not connected") }
+        try session.subscribePresence(contactIds: contactIds)
+        #else
+        throw AppError.notConfigured
         #endif
     }
 }

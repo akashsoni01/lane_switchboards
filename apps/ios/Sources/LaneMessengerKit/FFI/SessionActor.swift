@@ -94,6 +94,25 @@ public actor SessionActor {
         lastPingRttMs = UInt64(ms.rounded())
     }
 
+    public func sendChat(to: String, messageId: String, body: Data) async throws -> UInt64 {
+        guard state == .ready || state == .syncing || state == .awaitingLogin else {
+            throw AppError.connection("not ready")
+        }
+        return try await transport.sendChat(to: to, messageId: messageId, body: body)
+    }
+
+    public func ackDelivered(messageId: String) async throws {
+        try await transport.ackDelivered(messageId: messageId)
+    }
+
+    public func ackRead(messageId: String) async throws {
+        try await transport.ackRead(messageId: messageId)
+    }
+
+    public func subscribePresence(contactIds: [String]) async throws {
+        try await transport.subscribePresence(contactIds: contactIds)
+    }
+
     public func close() async {
         autoReconnect = false
         reconnectTask?.cancel()

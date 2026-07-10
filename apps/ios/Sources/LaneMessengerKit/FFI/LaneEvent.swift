@@ -14,13 +14,21 @@ public enum ConnectionState: String, Sendable, Equatable {
 public enum LaneEvent: Sendable, Equatable {
     case loginAck(sessionId: String, ok: Bool, pendingMessages: UInt32, error: String)
     case syncComplete(latestSeq: UInt64, delivered: UInt32)
-    case chatMessage(messageId: String, fromUser: String, seq: UInt64)
+    case chatMessage(
+        messageId: String,
+        fromUser: String,
+        toUser: String,
+        body: String,
+        seq: UInt64,
+        mediaId: String,
+        sentAt: UInt64
+    )
     case serverAck(messageId: String, seq: UInt64)
-    case deliveredAck(messageId: String)
-    case readAck(messageId: String)
+    case deliveredAck(messageId: String, fromUser: String)
+    case readAck(messageId: String, fromUser: String)
     case groupMessage(messageId: String, groupId: String)
     case groupAckSummary(messageId: String, memberCount: UInt32)
-    case presence(userId: String, kind: Int)
+    case presence(userId: String, kind: Int, lastSeen: UInt64?)
     case protocolError(code: Int, detail: String)
     case replacedByNewSession
     case disconnected(reason: String)
@@ -47,10 +55,15 @@ public enum LaneEvent: Sendable, Equatable {
                 delivered: uint32(obj["delivered"])
             )
         case "ChatMessage":
+            let encoded = obj["body_hex"] as? String ?? obj["body_b64"] as? String ?? ""
             return .chatMessage(
                 messageId: obj["message_id"] as? String ?? "",
                 fromUser: obj["from_user"] as? String ?? "",
-                seq: uint64(obj["seq"])
+                toUser: obj["to_user"] as? String ?? "",
+                body: decodeBody(encoded),
+                seq: uint64(obj["seq"]),
+                mediaId: obj["media_id"] as? String ?? "",
+                sentAt: uint64(obj["sent_at"])
             )
         case "ServerAck":
             return .serverAck(
@@ -58,9 +71,15 @@ public enum LaneEvent: Sendable, Equatable {
                 seq: uint64(obj["seq"])
             )
         case "DeliveredAck":
-            return .deliveredAck(messageId: obj["message_id"] as? String ?? "")
+            return .deliveredAck(
+                messageId: obj["message_id"] as? String ?? "",
+                fromUser: obj["from_user"] as? String ?? ""
+            )
         case "ReadAck":
-            return .readAck(messageId: obj["message_id"] as? String ?? "")
+            return .readAck(
+                messageId: obj["message_id"] as? String ?? "",
+                fromUser: obj["from_user"] as? String ?? ""
+            )
         case "GroupMessage":
             return .groupMessage(
                 messageId: obj["message_id"] as? String ?? "",
@@ -72,9 +91,14 @@ public enum LaneEvent: Sendable, Equatable {
                 memberCount: uint32(obj["member_count"])
             )
         case "Presence":
+            let last: UInt64? = {
+                if obj["last_seen"] == nil { return nil }
+                return uint64(obj["last_seen"])
+            }()
             return .presence(
                 userId: obj["user_id"] as? String ?? "",
-                kind: obj["kind"] as? Int ?? 0
+                kind: obj["kind"] as? Int ?? (obj["kind"] as? NSNumber)?.intValue ?? 0,
+                lastSeen: last
             )
         case "ProtocolError":
             return .protocolError(
@@ -108,6 +132,23 @@ public struct ConnectRequest: Sendable, Equatable {
         self.resumeAfterSeq = resumeAfterSeq
         self.clientVersion = clientVersion
     }
+}
+
+/// C API field is named `body_hex` but encodes **base64** (`c_api::b64`).
+private func decodeBody(_ encoded: String) -> String {
+    if encoded.isEmpty { return "" }
+    if let data = Data(base64Encoded: encoded), let s = String(data: data, encoding: .utf8) {
+        return s
+    }
+    // Fallback: hex
+    var bytes = [UInt8]()
+    var idx = encoded.startIndex
+    while idx < encoded.endIndex {
+        let next = encoded.index(idx, offsetBy: 2, limitedBy: encoded.endIndex) ?? encoded.endIndex
+        if let b = UInt8(encoded[idx..<next], radix: 16) { bytes.append(b) }
+        idx = next
+    }
+    return String(bytes: bytes, encoding: .utf8) ?? ""
 }
 
 private func uint64(_ value: Any?) -> UInt64 {

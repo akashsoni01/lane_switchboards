@@ -163,7 +163,13 @@ public final class SQLiteLocalStore: LocalStore, @unchecked Sendable {
             try check(
                 sqlite3_prepare_v2(
                     db,
-                    "SELECT id, title, sort_ts, unread, draft, last_preview FROM conversations ORDER BY sort_ts DESC",
+                    """
+                    SELECT c.id, c.title, c.sort_ts, c.unread, c.draft, c.last_preview,
+                           k.presence, k.last_seen
+                    FROM conversations c
+                    LEFT JOIN contacts k ON k.user_id = c.id
+                    ORDER BY c.sort_ts DESC
+                    """,
                     -1,
                     &stmt,
                     nil
@@ -172,6 +178,12 @@ public final class SQLiteLocalStore: LocalStore, @unchecked Sendable {
             )
             var rows: [Conversation] = []
             while sqlite3_step(stmt) == SQLITE_ROW {
+                let presenceRaw = sqlite3_column_type(stmt, 6) == SQLITE_NULL
+                    ? nil
+                    : PresenceKind(rawValue: Int(sqlite3_column_int(stmt, 6)))
+                let lastSeen: Date? = sqlite3_column_type(stmt, 7) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 7)))
                 rows.append(
                     Conversation(
                         id: string(stmt, 0),
@@ -179,7 +191,9 @@ public final class SQLiteLocalStore: LocalStore, @unchecked Sendable {
                         sortTs: Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2)),
                         unread: Int(sqlite3_column_int(stmt, 3)),
                         draft: string(stmt, 4),
-                        lastPreview: string(stmt, 5)
+                        lastPreview: string(stmt, 5),
+                        presence: presenceRaw,
+                        lastSeen: lastSeen
                     )
                 )
             }
@@ -223,6 +237,92 @@ public final class SQLiteLocalStore: LocalStore, @unchecked Sendable {
             }
             return rows
         }
+    }
+
+    public func setDraft(conversationId: String, draft: String) throws {
+        try withDB { db in
+            try exec(
+                db,
+                """
+                INSERT INTO conversations(id, title, sort_ts, unread, draft, last_preview)
+                VALUES('\(escape(conversationId))', '\(escape(conversationId))', \(Date().timeIntervalSince1970), 0, '\(escape(draft))', '')
+                ON CONFLICT(id) DO UPDATE SET draft=excluded.draft
+                """
+            )
+        }
+    }
+
+    public func markConversationRead(conversationId: String) throws {
+        try withDB { db in
+            try exec(db, "UPDATE conversations SET unread=0 WHERE id='\(escape(conversationId))'")
+        }
+    }
+
+    public func ensureConversation(id: String, title: String?) throws {
+        try withDB { db in
+            let t = title ?? id
+            try exec(
+                db,
+                """
+                INSERT INTO conversations(id, title, sort_ts, unread, draft, last_preview)
+                VALUES('\(escape(id))', '\(escape(t))', \(Date().timeIntervalSince1970), 0, '', '')
+                ON CONFLICT(id) DO UPDATE SET title=CASE WHEN length(excluded.title)>0 THEN excluded.title ELSE conversations.title END
+                """
+            )
+        }
+    }
+
+    public func upsertContact(_ contact: Contact) throws {
+        try withDB { db in
+            let last = contact.lastSeen.map { String(Int64($0.timeIntervalSince1970)) } ?? "NULL"
+            try exec(
+                db,
+                """
+                INSERT INTO contacts(user_id, display_name, presence, last_seen)
+                VALUES('\(escape(contact.userId))', '\(escape(contact.displayName))', \(contact.presence.rawValue), \(last))
+                ON CONFLICT(user_id) DO UPDATE SET
+                  display_name=excluded.display_name,
+                  presence=excluded.presence,
+                  last_seen=excluded.last_seen
+                """
+            )
+        }
+    }
+
+    public func contacts() throws -> [Contact] {
+        try withDB { db in
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            try check(
+                sqlite3_prepare_v2(
+                    db,
+                    "SELECT user_id, display_name, presence, last_seen FROM contacts ORDER BY display_name ASC",
+                    -1,
+                    &stmt,
+                    nil
+                ),
+                db
+            )
+            var rows: [Contact] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let lastSeen: Date? = sqlite3_column_type(stmt, 3) == SQLITE_NULL
+                    ? nil
+                    : Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(stmt, 3)))
+                rows.append(
+                    Contact(
+                        userId: string(stmt, 0),
+                        displayName: string(stmt, 1),
+                        presence: PresenceKind(rawValue: Int(sqlite3_column_int(stmt, 2))) ?? .unavailable,
+                        lastSeen: lastSeen
+                    )
+                )
+            }
+            return rows
+        }
+    }
+
+    public func contact(userId: String) throws -> Contact? {
+        try contacts().first { $0.userId == userId }
     }
 
     public func wipeUserData() throws {
@@ -349,6 +449,7 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
     private var resume: UInt64 = 0
     private var messages: [String: StoredMessage] = [:]
     private var convos: [String: Conversation] = [:]
+    private var people: [String: Contact] = [:]
     private let lock = NSLock()
 
     public init() {}
@@ -369,6 +470,9 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
         if var existing = messages[message.messageId] {
             existing.seq = max(existing.seq, message.seq)
             if !message.body.isEmpty { existing.body = message.body }
+            if message.status.rank >= existing.status.rank {
+                existing.status = message.status
+            }
             messages[message.messageId] = existing
         } else {
             messages[message.messageId] = message
@@ -378,6 +482,11 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
         c.sortTs = max(c.sortTs, message.createdAt)
         c.lastPreview = message.body.isEmpty ? c.lastPreview : String(message.body.prefix(120))
         if !existed, message.direction == .inbound { c.unread += 1 }
+        if let contact = people[message.conversationId] {
+            c.presence = contact.presence
+            c.lastSeen = contact.lastSeen
+            c.title = contact.displayName
+        }
         convos[message.conversationId] = c
         return !existed
     }
@@ -385,7 +494,7 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
     public func updateStatus(messageId: String, status: MessageStatus, seq: UInt64?) throws {
         lock.lock(); defer { lock.unlock() }
         guard var m = messages[messageId] else { return }
-        m.status = status
+        if status.rank >= m.status.rank { m.status = status }
         if let seq {
             m.seq = max(m.seq, seq)
             if seq > resume { resume = seq }
@@ -395,7 +504,16 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
 
     public func conversations() throws -> [Conversation] {
         lock.lock(); defer { lock.unlock() }
-        return convos.values.sorted { $0.sortTs > $1.sortTs }
+        return convos.values.map { c in
+            var out = c
+            if let contact = people[c.id] {
+                out.presence = contact.presence
+                out.lastSeen = contact.lastSeen
+                out.title = contact.displayName
+            }
+            return out
+        }
+        .sorted { $0.sortTs > $1.sortTs }
     }
 
     public func messages(conversationId: String, limit: Int) throws -> [StoredMessage] {
@@ -407,10 +525,67 @@ public final class InMemoryLocalStore: LocalStore, @unchecked Sendable {
             .map { $0 }
     }
 
+    public func setDraft(conversationId: String, draft: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        var c = convos[conversationId] ?? Conversation(id: conversationId)
+        c.draft = draft
+        convos[conversationId] = c
+    }
+
+    public func markConversationRead(conversationId: String) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard var c = convos[conversationId] else { return }
+        c.unread = 0
+        convos[conversationId] = c
+    }
+
+    public func ensureConversation(id: String, title: String?) throws {
+        lock.lock(); defer { lock.unlock() }
+        if convos[id] == nil {
+            convos[id] = Conversation(id: id, title: title ?? id)
+        } else if let title, !title.isEmpty {
+            convos[id]?.title = title
+        }
+    }
+
+    public func upsertContact(_ contact: Contact) throws {
+        lock.lock(); defer { lock.unlock() }
+        people[contact.userId] = contact
+        if var c = convos[contact.userId] {
+            c.presence = contact.presence
+            c.lastSeen = contact.lastSeen
+            c.title = contact.displayName
+            convos[contact.userId] = c
+        }
+    }
+
+    public func contacts() throws -> [Contact] {
+        lock.lock(); defer { lock.unlock() }
+        return people.values.sorted { $0.displayName < $1.displayName }
+    }
+
+    public func contact(userId: String) throws -> Contact? {
+        lock.lock(); defer { lock.unlock() }
+        return people[userId]
+    }
+
     public func wipeUserData() throws {
         lock.lock(); defer { lock.unlock() }
         messages.removeAll()
         convos.removeAll()
+        people.removeAll()
         resume = 0
+    }
+}
+
+private extension MessageStatus {
+    var rank: Int {
+        switch self {
+        case .pending: return 0
+        case .failed: return 0
+        case .sent: return 1
+        case .delivered: return 2
+        case .read: return 3
+        }
     }
 }
