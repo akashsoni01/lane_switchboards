@@ -869,9 +869,10 @@ fn event_to_json(ev: &LaneEvent) -> String {
             a.received_bytes
         ),
         LaneEvent::KeyBundle(k) => format!(
-            r#"{{"type":"KeyBundle","user_id":"{}","device_id":"{}","found":{}}}"#,
+            r#"{{"type":"KeyBundle","user_id":"{}","device_id":"{}","identity_key":"{}","found":{}}}"#,
             json_escape(&k.user_id),
             json_escape(&k.device_id),
+            json_escape(&k.identity_key),
             k.found
         ),
         LaneEvent::ProtocolError(e) => format!(
@@ -968,6 +969,159 @@ pub extern "C" fn lane_e2ee_import_pickle(
     match E2eeHandle::import_pickle(data, pass) {
         Ok(inner) => Box::into_raw(Box::new(LaneE2eeDevice { inner })),
         Err(_) => ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_e2ee_create_group_session(
+    device: *mut LaneE2eeDevice,
+    group_id: *const c_char,
+    out_session_id: *mut *mut c_char,
+) -> c_int {
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let sid = d.inner.create_group_session(gid);
+    if !out_session_id.is_null() {
+        set_err(out_session_id, &sid);
+    }
+    FfiErrorCode::Ok.as_i32()
+}
+
+#[no_mangle]
+pub extern "C" fn lane_e2ee_distribute_group_key(
+    session: *mut LaneSession,
+    device: *mut LaneE2eeDevice,
+    group_id: *const c_char,
+    members_csv: *const c_char,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let csv = match cstr(members_csv) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let members: Vec<String> = csv
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    match d.inner.distribute_group_key(&s.inner, gid, &members) {
+        Ok(()) => FfiErrorCode::Ok.as_i32(),
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_send_encrypted_group(
+    session: *mut LaneSession,
+    device: *mut LaneE2eeDevice,
+    group_id: *const c_char,
+    message_id: *const c_char,
+    plaintext: *const u8,
+    plaintext_len: usize,
+) -> c_int {
+    let Some(s) = (unsafe { session.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let mid = match cstr(message_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let plain = match bytes_from(plaintext, plaintext_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match d.inner.send_encrypted_group(&s.inner, gid, mid, plain) {
+        Ok(()) => FfiErrorCode::Ok.as_i32(),
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_decrypt_group(
+    device: *mut LaneE2eeDevice,
+    group_id: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    out_plain: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let gid = match cstr(group_id) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let body = match bytes_from(body, body_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match d.inner.decrypt_group(gid, body) {
+        Ok(mut plain) => {
+            if !out_plain.is_null() && !out_len.is_null() {
+                let len = plain.len();
+                let ptr = plain.as_mut_ptr();
+                std::mem::forget(plain);
+                unsafe {
+                    *out_plain = ptr;
+                    *out_len = len;
+                }
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lane_e2ee_try_import_group_key(
+    device: *mut LaneE2eeDevice,
+    from_user: *const c_char,
+    body: *const u8,
+    body_len: usize,
+    out_imported: *mut c_int,
+) -> c_int {
+    let Some(d) = (unsafe { device.as_ref() }) else {
+        return FfiErrorCode::InvalidArgument.as_i32();
+    };
+    let from = match cstr(from_user) {
+        Ok(t) => t,
+        Err(c) => return c.as_i32(),
+    };
+    let body = match bytes_from(body, body_len) {
+        Ok(b) => b,
+        Err(c) => return c.as_i32(),
+    };
+    match d.inner.try_import_group_key(from, body) {
+        Ok(imported) => {
+            if !out_imported.is_null() {
+                unsafe { *out_imported = if imported { 1 } else { 0 } };
+            }
+            FfiErrorCode::Ok.as_i32()
+        }
+        Err(e) => e.code().as_i32(),
     }
 }
 

@@ -181,6 +181,12 @@ struct HomeShellView: View {
         .sheet(isPresented: $model.showAttachMenu) {
             AttachMenuView(model: model)
         }
+        .sheet(isPresented: $model.showSafetyNumber) {
+            SafetyNumberSheet(model: model)
+        }
+        .sheet(isPresented: $model.showE2eeSettings) {
+            E2eeSettingsSheet(model: model)
+        }
         #if os(iOS)
         .fullScreenCover(isPresented: Binding(
             get: { model.previewMediaId != nil },
@@ -296,6 +302,9 @@ public struct InboxView: View {
                     #endif
                     Button("Sign out", role: .destructive) {
                         Task { await model.signOut() }
+                    }
+                    Button("E2EE settings") {
+                        model.showE2eeSettings = true
                     }
                 } label: {
                     Image(systemName: "gearshape")
@@ -479,6 +488,20 @@ public struct ChatThreadView: View {
                         Image(systemName: "info.circle")
                     }
                     .accessibilityLabel("Group info")
+                }
+            } else {
+                ToolbarItem(placement: .primaryAction) {
+                    Menu {
+                        Button("Safety number") {
+                            Task { await model.openSafetyNumber(forPeer: peer) }
+                        }
+                        Button("E2EE settings") {
+                            model.showE2eeSettings = true
+                        }
+                    } label: {
+                        Image(systemName: "lock.shield")
+                    }
+                    .accessibilityLabel("Encryption")
                 }
             }
         }
@@ -819,6 +842,101 @@ struct GroupInfoSheet: View {
                 }
             }
             .onAppear { model.refreshSelectedGroup() }
+        }
+    }
+}
+
+struct SafetyNumberSheet: View {
+    @Bindable var model: AppModel
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("Compare this number with your contact out of band. If it changes, someone may be intercepting the conversation.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text(formattedNumber)
+                    .font(.system(.title3, design: .monospaced).weight(.semibold))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity)
+                    .padding()
+                    .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 12))
+                Text("Screenshots of this screen can leak the fingerprint to other apps.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Safety number")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { model.showSafetyNumber = false }
+                }
+            }
+        }
+    }
+
+    private var formattedNumber: String {
+        let raw = model.safetyNumberText
+        guard raw.count >= 12 else { return raw }
+        var parts: [String] = []
+        var idx = raw.startIndex
+        while idx < raw.endIndex {
+            let end = raw.index(idx, offsetBy: 5, limitedBy: raw.endIndex) ?? raw.endIndex
+            parts.append(String(raw[idx..<end]))
+            idx = end
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+struct E2eeSettingsSheet: View {
+    @Bindable var model: AppModel
+    @State private var exported: Data?
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Status") {
+                    LabeledContent("E2EE") {
+                        Text(model.e2eeReady ? "Ready" : (FeatureFlags.e2eeEnabled ? "Starting…" : "Off"))
+                    }
+                    if !model.e2eeLocalIdentity.isEmpty {
+                        Text(model.e2eeLocalIdentity)
+                            .font(.caption.monospaced())
+                            .textSelection(.enabled)
+                    }
+                    #if DEBUG
+                    Text("DEBUG_PLAINTEXT_FALLBACK=\(FeatureFlags.debugPlaintextFallback)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    #endif
+                }
+                Section("Export account pickle") {
+                    SecureField("Passphrase", text: $model.e2eeExportPassphrase)
+                    Button("Export") {
+                        Task {
+                            exported = await model.exportE2eePickle()
+                        }
+                    }
+                    if let exported {
+                        Text("Exported \(exported.count) bytes — save via Files / AirDrop in the host app.")
+                            .font(.caption)
+                    }
+                }
+                Section("Import account pickle") {
+                    SecureField("Passphrase", text: $model.e2eeImportPassphrase)
+                    Text("Use fileImporter in the host app, then call importE2eePickle(_:).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("E2EE")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { model.showE2eeSettings = false }
+                }
+            }
         }
     }
 }

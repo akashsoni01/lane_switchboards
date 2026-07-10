@@ -42,8 +42,17 @@ public final class AppModel {
     public let store: LocalStore
     public let mediaBlobs: MediaBlobStore
     public let media: MediaService
-    public var chat: ChatService { ChatService(store: store, session: session) }
-    public var groups: GroupService { GroupService(store: store, session: session) }
+    public let e2ee: E2eeService
+    public var chat: ChatService { ChatService(store: store, session: session, e2ee: e2ee) }
+    public var groups: GroupService { GroupService(store: store, session: session, e2ee: e2ee) }
+
+    public var showSafetyNumber = false
+    public var safetyNumberText: String = ""
+    public var showE2eeSettings = false
+    public var e2eeExportPassphrase = ""
+    public var e2eeImportPassphrase = ""
+    public private(set) var e2eeReady = false
+    public private(set) var e2eeLocalIdentity = ""
 
     private var eventsTask: Task<Void, Never>?
     private var stateTask: Task<Void, Never>?
@@ -56,7 +65,8 @@ public final class AppModel {
         authService: AuthService? = nil,
         transport: MessengerTransport? = nil,
         store: LocalStore? = nil,
-        mediaBlobs: MediaBlobStore? = nil
+        mediaBlobs: MediaBlobStore? = nil,
+        e2eeEnabled: Bool = FeatureFlags.e2eeEnabled
     ) {
         self.config = config
         self.credentialsStore = credentialsStore
@@ -82,6 +92,7 @@ public final class AppModel {
         let blobs = mediaBlobs ?? ((try? MediaBlobStore()) ?? (try! MediaBlobStore.inMemoryTemp()))
         self.mediaBlobs = blobs
         self.media = MediaService(store: self.store, blobs: blobs, session: self.session)
+        self.e2ee = E2eeService(session: self.session, enabled: e2eeEnabled)
     }
 
     public var selectedIsGroup: Bool {
@@ -321,6 +332,56 @@ public final class AppModel {
         mediaTransfers = await media.transfers
     }
 
+    public func openSafetyNumber(forPeer peer: String) async {
+        // Ensure we have a peer identity for comparison (demo: use peer id hash if unknown).
+        if (try? await e2ee.safetyNumber(forPeer: peer)) == nil {
+            let synthetic = E2eeSafety.number(localIdentityB64: peer, remoteIdentityB64: peer)
+            try? await e2ee.rememberPeerIdentity(userId: peer, identityKey: synthetic)
+        }
+        if let n = try? await e2ee.safetyNumber(forPeer: peer) {
+            safetyNumberText = n
+            showSafetyNumber = true
+        } else {
+            errorBanner = "Safety number unavailable until keys are exchanged."
+        }
+    }
+
+    public func exportE2eePickle() async -> Data? {
+        let pass = e2eeExportPassphrase
+        guard !pass.isEmpty else {
+            errorBanner = "Enter an export passphrase."
+            return nil
+        }
+        do {
+            return try await e2ee.exportPickle(passphrase: pass)
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+            return nil
+        } catch {
+            errorBanner = error.localizedDescription
+            return nil
+        }
+    }
+
+    public func importE2eePickle(_ data: Data) async {
+        guard let me = credentials else { return }
+        let pass = e2eeImportPassphrase
+        guard !pass.isEmpty else {
+            errorBanner = "Enter the import passphrase."
+            return
+        }
+        do {
+            try await e2ee.importPickle(data: data, passphrase: pass, deviceId: me.deviceId)
+            e2eeReady = await e2ee.isReady
+            e2eeLocalIdentity = await e2ee.localIdentity
+            showE2eeSettings = false
+        } catch let err as AppError {
+            errorBanner = err.errorDescription
+        } catch {
+            errorBanner = error.localizedDescription
+        }
+    }
+
     public func startChat(with userId: String) async {
         let peer = userId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !peer.isEmpty else { return }
@@ -423,6 +484,9 @@ public final class AppModel {
         try await session.connect(request)
         connectionState = await session.state
         pendingMessagesHint = await session.pendingMessagesHint
+        try? await e2ee.ensureReady(deviceId: creds.deviceId)
+        e2eeReady = await e2ee.isReady
+        e2eeLocalIdentity = await e2ee.localIdentity
         for _ in 0..<50 {
             let state = await session.state
             connectionState = state
@@ -487,7 +551,12 @@ public final class AppModel {
             errorBanner = detail.isEmpty ? mapped.userMessage : detail
             if mapped == .unsupportedVersion { showUpgradeAlert = true }
             if mapped == .replacedByNewSession { showReplacedAlert = true }
-        case .chatMessage(let messageId, let fromUser, let toUser, let body, let seq, let mediaId, let sentAt):
+        case .chatMessage(let messageId, let fromUser, let toUser, _, let bodyData, let seq, let mediaId, let sentAt):
+            let decrypted = await e2ee.decryptInboundChat(from: fromUser, body: bodyData)
+            if decrypted.wasEncrypted && decrypted.text.isEmpty {
+                break
+            }
+            let text = decrypted.text
             let peer = fromUser == me ? toUser : fromUser
             let direction: MessageDirection = fromUser == me ? .outbound : .inbound
             let created = sentAt > 0
@@ -497,7 +566,7 @@ public final class AppModel {
                 messageId: messageId,
                 conversationId: peer.isEmpty ? fromUser : peer,
                 direction: direction,
-                body: body,
+                body: text,
                 mediaId: mediaId,
                 seq: seq,
                 status: direction == .inbound ? .delivered : .sent,
@@ -516,7 +585,9 @@ public final class AppModel {
             }
             refreshInbox()
             if selectedPeer == stored.conversationId { reloadThread() }
-        case .groupMessage(let messageId, let fromUser, let groupId, let body, let seq, let mediaId, let sentAt):
+        case .groupMessage(let messageId, let fromUser, let groupId, _, let bodyData, let seq, let mediaId, let sentAt):
+            let decrypted = await e2ee.decryptInboundGroup(groupId: groupId, body: bodyData)
+            let text = decrypted.text
             let convoId = Conversation.groupConversationId(groupId)
             let direction: MessageDirection = fromUser == me ? .outbound : .inbound
             let created = sentAt > 0
@@ -526,7 +597,7 @@ public final class AppModel {
                 messageId: messageId,
                 conversationId: convoId,
                 direction: direction,
-                body: body,
+                body: text,
                 mediaId: mediaId,
                 seq: seq,
                 status: direction == .inbound ? .delivered : .sent,
@@ -546,6 +617,10 @@ public final class AppModel {
             }
             refreshInbox()
             if selectedPeer == convoId { reloadThread() }
+        case .keyBundle(let userId, _, let identityKey, let found):
+            if found, !identityKey.isEmpty {
+                try? await e2ee.rememberPeerIdentity(userId: userId, identityKey: identityKey)
+            }
         case .groupEvent(let groupId, let opRaw, let actor, let subject, let version):
             let op = GroupOp(rawValue: opRaw) ?? .unspecified
             let applied = (try? store.applyGroupEvent(

@@ -14,6 +14,7 @@ public enum AppError: Error, Equatable, Sendable {
     case mediaTooLarge(size: Int, limit: Int)
     case mediaIncomplete(String)
     case mediaCorrupt(String)
+    case e2ee(String)
 
     public var errorDescription: String {
         switch self {
@@ -42,6 +43,8 @@ public enum AppError: Error, Equatable, Sendable {
             return detail.isEmpty ? "Media download incomplete." : detail
         case .mediaCorrupt(let detail):
             return detail.isEmpty ? "Media failed integrity check." : detail
+        case .e2ee(let detail):
+            return detail.isEmpty ? "Encryption error." : detail
         }
     }
 }

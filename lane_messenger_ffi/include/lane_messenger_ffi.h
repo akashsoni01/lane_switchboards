@@ -141,6 +141,33 @@ LaneE2eeDevice *lane_e2ee_import_pickle(
     size_t len,
     const char *passphrase);
 
+int32_t lane_e2ee_create_group_session(LaneE2eeDevice *device, const char *group_id, char **out_session_id);
+int32_t lane_e2ee_distribute_group_key(
+    LaneSession *session,
+    LaneE2eeDevice *device,
+    const char *group_id,
+    const char *members_csv);
+int32_t lane_send_encrypted_group(
+    LaneSession *session,
+    LaneE2eeDevice *device,
+    const char *group_id,
+    const char *message_id,
+    const uint8_t *plaintext,
+    size_t plaintext_len);
+int32_t lane_decrypt_group(
+    LaneE2eeDevice *device,
+    const char *group_id,
+    const uint8_t *body,
+    size_t body_len,
+    uint8_t **out_plain,
+    size_t *out_len);
+int32_t lane_e2ee_try_import_group_key(
+    LaneE2eeDevice *device,
+    const char *from_user,
+    const uint8_t *body,
+    size_t body_len,
+    int32_t *out_imported);
+
 #ifdef __cplusplus
 }
 #endif

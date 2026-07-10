@@ -6,6 +6,11 @@ import Foundation
 public final class LaneSession {
     private var ptr: OpaquePointer?
 
+    /// Raw session pointer for companion C APIs (E2EE).
+    public var rawPointer: UnsafeMutableRawPointer? {
+        ptr.map { UnsafeMutableRawPointer($0) }
+    }
+
     public init(
         host: String,
         port: UInt16,

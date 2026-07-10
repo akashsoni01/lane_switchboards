@@ -1,16 +1,18 @@
 import Foundation
 
-/// Domain use-cases for 1:1 chat. Always writes local DB before FFI send.
+/// Domain use-cases for 1:1 chat. Always writes local DB before send.
 public struct ChatService: Sendable {
     public let store: LocalStore
     public let session: SessionActor
+    public let e2ee: E2eeService?
 
-    public init(store: LocalStore, session: SessionActor) {
+    public init(store: LocalStore, session: SessionActor, e2ee: E2eeService? = nil) {
         self.store = store
         self.session = session
+        self.e2ee = e2ee
     }
 
-    /// Insert pending outbound row, then send. Marks `failed` on transport error.
+    /// Insert pending outbound row, then send (E2EE when enabled).
     @discardableResult
     public func sendText(to peer: String, body: String, fromUser: String) async throws -> StoredMessage {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -22,7 +24,8 @@ public struct ChatService: Sendable {
             direction: .outbound,
             body: trimmed,
             status: .pending,
-            createdAt: Date()
+            createdAt: Date(),
+            fromUser: fromUser
         )
         try store.ensureConversation(id: peer, title: peer)
         _ = try store.upsertMessage(pending)
@@ -30,8 +33,12 @@ public struct ChatService: Sendable {
 
         do {
             let data = Data(trimmed.utf8)
-            let seq = try await session.sendChat(to: peer, messageId: messageId, body: data)
-            // ServerAck will move pending → sent; stamp seq early for resume.
+            let seq: UInt64
+            if let e2ee, await e2ee.shouldEncryptSends() {
+                seq = try await e2ee.sendChat(to: peer, messageId: messageId, plaintext: data)
+            } else {
+                seq = try await session.sendChat(to: peer, messageId: messageId, body: data)
+            }
             try store.updateStatus(messageId: messageId, status: .pending, seq: seq)
             LaneLog.chat.info("sent message_id length=\(messageId.count, privacy: .public) to peer")
             return pending
@@ -46,11 +53,13 @@ public struct ChatService: Sendable {
         guard message.status == .failed, message.direction == .outbound else { return }
         try store.updateStatus(messageId: message.messageId, status: .pending, seq: nil)
         do {
-            let seq = try await session.sendChat(
-                to: peer,
-                messageId: message.messageId,
-                body: Data(message.body.utf8)
-            )
+            let data = Data(message.body.utf8)
+            let seq: UInt64
+            if let e2ee, await e2ee.shouldEncryptSends() {
+                seq = try await e2ee.sendChat(to: peer, messageId: message.messageId, plaintext: data)
+            } else {
+                seq = try await session.sendChat(to: peer, messageId: message.messageId, body: data)
+            }
             try store.updateStatus(messageId: message.messageId, status: .pending, seq: seq)
         } catch {
             try store.updateStatus(messageId: message.messageId, status: .failed, seq: nil)
@@ -58,7 +67,6 @@ public struct ChatService: Sendable {
         }
     }
 
-    /// On opening a thread: ack delivered+read for inbound messages not yet read.
     public func openThread(peer: String) async throws {
         try store.markConversationRead(conversationId: peer)
         let msgs = try store.messages(conversationId: peer, limit: 500)

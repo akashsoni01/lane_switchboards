@@ -19,6 +19,7 @@ public enum LaneEvent: Sendable, Equatable {
         fromUser: String,
         toUser: String,
         body: String,
+        bodyData: Data,
         seq: UInt64,
         mediaId: String,
         sentAt: UInt64
@@ -31,6 +32,7 @@ public enum LaneEvent: Sendable, Equatable {
         fromUser: String,
         groupId: String,
         body: String,
+        bodyData: Data,
         seq: UInt64,
         mediaId: String,
         sentAt: UInt64
@@ -49,6 +51,7 @@ public enum LaneEvent: Sendable, Equatable {
         deliveredCount: UInt32,
         readCount: UInt32
     )
+    case keyBundle(userId: String, deviceId: String, identityKey: String, found: Bool)
     case presence(userId: String, kind: Int, lastSeen: UInt64?)
     case protocolError(code: Int, detail: String)
     case replacedByNewSession
@@ -77,11 +80,13 @@ public enum LaneEvent: Sendable, Equatable {
             )
         case "ChatMessage":
             let encoded = obj["body_hex"] as? String ?? obj["body_b64"] as? String ?? ""
+            let data = decodeBodyData(encoded)
             return .chatMessage(
                 messageId: obj["message_id"] as? String ?? "",
                 fromUser: obj["from_user"] as? String ?? "",
                 toUser: obj["to_user"] as? String ?? "",
-                body: decodeBody(encoded),
+                body: String(data: data, encoding: .utf8) ?? "",
+                bodyData: data,
                 seq: uint64(obj["seq"]),
                 mediaId: obj["media_id"] as? String ?? "",
                 sentAt: uint64(obj["sent_at"])
@@ -103,11 +108,13 @@ public enum LaneEvent: Sendable, Equatable {
             )
         case "GroupMessage":
             let encoded = obj["body_hex"] as? String ?? obj["body_b64"] as? String ?? ""
+            let data = decodeBodyData(encoded)
             return .groupMessage(
                 messageId: obj["message_id"] as? String ?? "",
                 fromUser: obj["from_user"] as? String ?? "",
                 groupId: obj["group_id"] as? String ?? "",
-                body: decodeBody(encoded),
+                body: String(data: data, encoding: .utf8) ?? "",
+                bodyData: data,
                 seq: uint64(obj["seq"]),
                 mediaId: obj["media_id"] as? String ?? "",
                 sentAt: uint64(obj["sent_at"])
@@ -127,6 +134,13 @@ public enum LaneEvent: Sendable, Equatable {
                 memberCount: uint32(obj["member_count"]),
                 deliveredCount: uint32(obj["delivered_count"]),
                 readCount: uint32(obj["read_count"])
+            )
+        case "KeyBundle":
+            return .keyBundle(
+                userId: obj["user_id"] as? String ?? "",
+                deviceId: obj["device_id"] as? String ?? "",
+                identityKey: obj["identity_key"] as? String ?? "",
+                found: obj["found"] as? Bool ?? false
             )
         case "Presence":
             let last: UInt64? = {
@@ -173,11 +187,9 @@ public struct ConnectRequest: Sendable, Equatable {
 }
 
 /// C API field is named `body_hex` but encodes **base64** (`c_api::b64`).
-private func decodeBody(_ encoded: String) -> String {
-    if encoded.isEmpty { return "" }
-    if let data = Data(base64Encoded: encoded), let s = String(data: data, encoding: .utf8) {
-        return s
-    }
+private func decodeBodyData(_ encoded: String) -> Data {
+    if encoded.isEmpty { return Data() }
+    if let data = Data(base64Encoded: encoded) { return data }
     var bytes = [UInt8]()
     var idx = encoded.startIndex
     while idx < encoded.endIndex {
@@ -185,7 +197,11 @@ private func decodeBody(_ encoded: String) -> String {
         if let b = UInt8(encoded[idx..<next], radix: 16) { bytes.append(b) }
         idx = next
     }
-    return String(bytes: bytes, encoding: .utf8) ?? ""
+    return Data(bytes)
+}
+
+private func decodeBody(_ encoded: String) -> String {
+    String(data: decodeBodyData(encoded), encoding: .utf8) ?? ""
 }
 
 private func uint64(_ value: Any?) -> UInt64 {

@@ -4,10 +4,12 @@ import Foundation
 public struct GroupService: Sendable {
     public let store: LocalStore
     public let session: SessionActor
+    public let e2ee: E2eeService?
 
-    public init(store: LocalStore, session: SessionActor) {
+    public init(store: LocalStore, session: SessionActor, e2ee: E2eeService? = nil) {
         self.store = store
         self.session = session
+        self.e2ee = e2ee
     }
 
     /// Create group on the wire, then seed local membership (creator = admin).
@@ -30,6 +32,7 @@ public struct GroupService: Sendable {
             text: Self.systemText(op: .create, actor: creator, subject: creator),
             version: version
         )
+        try await e2ee?.setupGroupEncryption(groupId: gid, members: [creator])
         LaneLog.groups.info("created group")
         return info
     }
@@ -55,6 +58,10 @@ public struct GroupService: Sendable {
                 text: Self.systemText(op: .addMember, actor: actor, subject: user),
                 version: version
             )
+            if let info = try store.group(id: groupId) {
+                let members = info.members.map(\.userId).filter { $0 != actor }
+                try await e2ee?.setupGroupEncryption(groupId: groupId, members: members)
+            }
         }
     }
 
@@ -118,7 +125,12 @@ public struct GroupService: Sendable {
         try store.setDraft(conversationId: convoId, draft: "")
 
         do {
-            try await session.sendGroup(groupId: groupId, messageId: messageId, body: Data(trimmed.utf8))
+            let data = Data(trimmed.utf8)
+            if let e2ee, await e2ee.shouldEncryptSends() {
+                try await e2ee.sendGroup(groupId: groupId, messageId: messageId, plaintext: data)
+            } else {
+                try await session.sendGroup(groupId: groupId, messageId: messageId, body: data)
+            }
             LaneLog.groups.info("sent group message")
             return pending
         } catch {
@@ -131,11 +143,16 @@ public struct GroupService: Sendable {
         guard message.status == .failed, message.direction == .outbound else { return }
         try store.updateStatus(messageId: message.messageId, status: .pending, seq: nil)
         do {
-            try await session.sendGroup(
-                groupId: groupId,
-                messageId: message.messageId,
-                body: Data(message.body.utf8)
-            )
+            let data = Data(message.body.utf8)
+            if let e2ee, await e2ee.shouldEncryptSends() {
+                try await e2ee.sendGroup(groupId: groupId, messageId: message.messageId, plaintext: data)
+            } else {
+                try await session.sendGroup(
+                    groupId: groupId,
+                    messageId: message.messageId,
+                    body: data
+                )
+            }
         } catch {
             try store.updateStatus(messageId: message.messageId, status: .failed, seq: nil)
             throw (error as? AppError) ?? AppError.connection(error.localizedDescription)

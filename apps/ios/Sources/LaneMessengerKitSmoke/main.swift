@@ -31,6 +31,10 @@ struct Smoke {
         failed += check("media sha roundtrip", testMediaShaStore())
         failed += await checkAsync("media size cap", testMediaTooLarge)
         failed += await checkAsync("media upload send fetch", testMediaUploadSendFetch)
+        failed += check("safety number stable", testSafetyNumber())
+        failed += await checkAsync("e2ee encrypt decrypt", testE2eeChatRoundTrip)
+        failed += await checkAsync("e2ee pickle roundtrip", testE2eePickle)
+        failed += await checkAsync("e2ee megolm group", testE2eeMegolm)
 
         if failed > 0 {
             fputs("FAILED \(failed) check(s)\n", stderr)
@@ -64,7 +68,9 @@ private func testParseChatBody() -> Bool {
     let ev = LaneEvent.parse(
         json: #"{"type":"ChatMessage","message_id":"m1","from_user":"bob","to_user":"alice","body_hex":"\#(b64)","sent_at":1,"seq":9,"media_id":""}"#
     )
-    if case .chatMessage(_, "bob", "alice", body, 9, "", 1) = ev { return true }
+    if case .chatMessage(_, "bob", "alice", body, let data, 9, "", 1) = ev {
+        return String(data: data, encoding: .utf8) == body
+    }
     return false
 }
 
@@ -326,7 +332,8 @@ private func testParseGroupEvents() -> Bool {
     let ack = LaneEvent.parse(
         json: #"{"type":"GroupAckSummary","message_id":"m1","group_id":"g1","member_count":3,"delivered_count":2,"read_count":1}"#
     )
-    guard case .groupMessage("m1", "alice", "g1", "hi", 3, "", 1) = msg else { return false }
+    guard case .groupMessage("m1", "alice", "g1", "hi", let data, 3, "", 1) = msg else { return false }
+    guard String(data: data, encoding: .utf8) == "hi" else { return false }
     guard case .groupEvent("g1", 2, "alice", "bob", 2) = ev else { return false }
     guard case .groupAckSummary("m1", "g1", 3, 2, 1) = ack else { return false }
     return true
@@ -522,6 +529,112 @@ private func testMediaUploadSendFetch() async -> Bool {
         return ok
     } catch {
         print("  media path error: \(error)")
+        return false
+    }
+}
+
+private func testSafetyNumber() -> Bool {
+    let a = E2eeSafety.number(localIdentityB64: "aaa", remoteIdentityB64: "bbb")
+    let b = E2eeSafety.number(localIdentityB64: "bbb", remoteIdentityB64: "aaa")
+    return a == b && a.count == 64
+}
+
+private func testE2eeChatRoundTrip() async -> Bool {
+    let transport = MockMessengerTransport()
+    let session = SessionActor(transport: transport)
+    let store = InMemoryLocalStore()
+    let pickle = try? E2eePickleStore(
+        keychain: KeychainStore(service: "com.lane.smoke.e2ee.\(UUID().uuidString)"),
+        fileURL: FileManager.default.temporaryDirectory.appendingPathComponent("e2ee-\(UUID().uuidString)")
+    )
+    let e2ee = E2eeService(session: session, pickleStore: pickle, enabled: true)
+    let chat = ChatService(store: store, session: session, e2ee: e2ee)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try await e2ee.ensureReady(deviceId: "d")
+        guard await e2ee.shouldEncryptSends() else { return false }
+        let msg = try await chat.sendText(to: "bob", body: "secret hello", fromUser: "alice")
+        guard transport.sent.count == 1 else { return false }
+        let wire = transport.sent[0].body
+        let bobBackend = MockE2eeBackend(session: session, identity: "bob-id")
+        let plain = try bobBackend.decryptChat(from: "alice", body: wire)
+        await session.close()
+        return String(data: plain, encoding: .utf8) == "secret hello"
+            && msg.body == "secret hello"
+    } catch {
+        print("  e2ee chat error: \(error)")
+        return false
+    }
+}
+
+private func testE2eePickle() async -> Bool {
+    let transport = MockMessengerTransport()
+    let session = SessionActor(transport: transport)
+    let kc = KeychainStore(service: "com.lane.smoke.pickle.\(UUID().uuidString)")
+    let file = FileManager.default.temporaryDirectory.appendingPathComponent("pickle-\(UUID().uuidString)")
+    do {
+        let store = try E2eePickleStore(keychain: kc, fileURL: file)
+        let e2ee = E2eeService(session: session, pickleStore: store, enabled: true)
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try await e2ee.ensureReady(deviceId: "d")
+        let id1 = await e2ee.localIdentity
+        let exported = try await e2ee.exportPickle(passphrase: "test-pass")
+        let e2ee2 = E2eeService(session: session, pickleStore: store, enabled: true)
+        try await e2ee2.importPickle(data: exported, passphrase: "test-pass", deviceId: "d")
+        let id2 = await e2ee2.localIdentity
+        await session.close()
+        return id1 == id2 && !id1.isEmpty
+    } catch {
+        print("  pickle error: \(error)")
+        return false
+    }
+}
+
+private func testE2eeMegolm() async -> Bool {
+    let transport = MockMessengerTransport()
+    let session = SessionActor(transport: transport)
+    let e2ee = E2eeService(session: session, enabled: true)
+    do {
+        try await session.connect(ConnectRequest(
+            config: .default,
+            credentials: AuthCredentials(userId: "alice", deviceId: "d", authToken: "t")
+        ))
+        for _ in 0..<40 {
+            if await session.state == .ready { break }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try await e2ee.ensureReady(deviceId: "d")
+        _ = try await session.createGroup(groupId: "g-e2ee")
+        try await e2ee.setupGroupEncryption(groupId: "g-e2ee", members: ["bob"])
+        try await e2ee.sendGroup(groupId: "g-e2ee", messageId: "gm1", plaintext: Data("group secret".utf8))
+        guard let wire = transport.groupSent.first(where: { $0.messageId == "gm1" })?.body else {
+            await session.close()
+            return false
+        }
+        // Bob imports key share from alice's distribute (sent as chat).
+        let bob = MockE2eeBackend(session: session, identity: "bob")
+        if let share = transport.sent.first(where: { $0.messageId.hasPrefix("gsk-") })?.body {
+            _ = try bob.tryImportGroupKey(from: "alice", body: share)
+        }
+        let plain = try bob.decryptGroup(groupId: "g-e2ee", body: wire)
+        await session.close()
+        return String(data: plain, encoding: .utf8) == "group secret"
+    } catch {
+        print("  megolm error: \(error)")
         return false
     }
 }
