@@ -1,0 +1,45 @@
+name: LaneMessenger
+options:
+  bundleIdPrefix: com.lane
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MESSENGER_HOST: "127.0.0.1"
+    MESSENGER_PORT: "9000"
+    MESSENGER_USE_TLS: "NO"
+configs:
+  Debug:
+    MESSENGER_USE_TLS: "NO"
+  Release:
+    MESSENGER_USE_TLS: "YES"
+packages:
+  LaneMessengerKit:
+    path: .
+targets:
+  LaneMessenger:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+      - path: Sources/LaneMessengerKit
+        excludes:
+          - "**/*"
+        # Kit comes from the local package product
+    dependencies:
+      - package: LaneMessengerKit
+        product: LaneMessengerKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lane.messenger
+        INFOPLIST_FILE: App/Info.plist
+        TARGETED_DEVICE_FAMILY: "1"
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.9.2"
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: App/Info.plist
+      properties:
+        UILaunchScreen: {}
