@@ -3,6 +3,16 @@
 This is the **end-to-end** map of the production stack: iOS UI → Swift kit →
 FFI bindings → Rust client → FunXMPP over TCP/TLS → messenger gateway.
 
+**Diagrams in this doc**
+
+| Section | Contents |
+|---------|----------|
+| [§1.1](#11-entities-servers-protocols-mermaid) | Entities, servers, protocols (flowchart) |
+| [§1A](#1a-session-connect--login-detailed) | Connect / Login / SyncComplete |
+| [§1B](#1b-message-send-flow-maximum-detail) | Full send + ack ladder + offline/cluster |
+| [§1C](#1c-message-receive-flow-maximum-detail) | Live receive, offline replay, APNs open |
+| [§1D](#1d-ack-ladder--wire-packets-cheat-sheet) | Packet ID cheat sheet |
+
 If you are new here, read this page first, then dive into the linked docs.
 
 | Audience | Start here |
@@ -78,14 +88,14 @@ flowchart TB
   end
 
   %% Control-plane HTTPS
-  AM -->|"HTTPS JSON<br/>login / refresh"| ID
-  AM -->|"HTTPS JSON<br/>platform=ios · push_type=alert"| APNS_REG
-  APNS_REG -.->|"APNs HTTP/2<br/>provider API"| APNS
-  APNS -->|"alert payload<br/>lane.conversation_id"| UN
+  AM -->|"HTTPS JSON login refresh"| ID
+  AM -->|"HTTPS JSON push_type alert"| APNS_REG
+  APNS_REG -.->|"APNs HTTP2 provider API"| APNS
+  APNS -->|"alert payload lane.conversation_id"| UN
   CS -.->|"HTTPS GET optional"| CDN
 
   %% Realtime FunXMPP
-  FFI_LIB -->|"persistent TCP + TLS<br/>FunXMPP frames<br/>ver|type|len|protobuf"| ACC
+  FFI_LIB -->|"persistent TCP plus TLS FunXMPP frames"| ACC
   ACC --> AUTH
   AUTH --> SESS
   SESS --> ROUTER
@@ -171,56 +181,56 @@ Before any chat, the client must open a FunXMPP session. Login is always the
 sequenceDiagram
   autonumber
   actor User
-  participant UI as SwiftUI / AppModel
-  participant Auth as AuthService<br/>DEBUG HMAC or HTTPS identity
+  participant UI as SwiftUI AppModel
+  participant Auth as AuthService
   participant KC as Keychain
   participant SA as SessionActor
-  participant FFI as lane_messenger_ffi<br/>SessionHandle
-  participant GW as Gateway<br/>Accept + Session task
+  participant FFI as lane_messenger_ffi
+  participant GW as Gateway
   participant AuthZ as Authenticator
   participant Inbox as Recipient inbox
 
-  User->>UI: Sign in (user_id, secret)
-  UI->>Auth: login(user_id, secret)
+  User->>UI: Sign in user_id secret
+  UI->>Auth: login user_id secret
   alt DEBUG
-    Auth-->>UI: token = hex(HMAC-SHA256(demo-secret, user:device))
+    Auth-->>UI: mint HMAC demo token
   else Production
     Auth->>Auth: HTTPS POST identity service
-    Auth-->>UI: auth_token + claims
+    Auth-->>UI: auth_token plus claims
   end
-  UI->>KC: save(user_id, device_id, auth_token)
-  UI->>SA: connect(host, port, use_tls, creds, resume_after_seq)
-  SA->>FFI: SessionHandle.connect(ConnectOptions)
-  FFI->>GW: TCP connect (+ TLS handshake if use_tls)
-  Note over FFI,GW: Frame: ver=1 · pkt=Login 0x01 · protobuf Login
+  UI->>KC: save user_id device_id auth_token
+  UI->>SA: connect host port use_tls creds resume_after_seq
+  SA->>FFI: SessionHandle.connect ConnectOptions
+  FFI->>GW: TCP connect optional TLS handshake
+  Note over FFI,GW: Frame ver=1 pkt=Login 0x01 protobuf Login
 
-  FFI->>GW: Login{user_id, device_id, auth_token, resume_after_seq}
-  GW->>AuthZ: verify(token)
-  alt AUTH_FAILED / NOT_AUTHENTICATED
+  FFI->>GW: Login user_id device_id auth_token resume_after_seq
+  GW->>AuthZ: verify token
+  alt AUTH_FAILED or NOT_AUTHENTICATED
     AuthZ-->>GW: reject
-    GW-->>FFI: ProtocolError → close
-    FFI-->>SA: LaneEvent error / disconnect
+    GW-->>FFI: ProtocolError then close
+    FFI-->>SA: LaneEvent error disconnect
   else OK
     AuthZ-->>GW: ok
     opt Same device already online
       GW-->>GW: kick old session REPLACED_BY_NEW_SESSION 0x0F
     end
-    GW-->>FFI: LoginAck{session_id, pending_messages, ok}
-    loop For each inbox row with seq > resume_after_seq
-      Inbox-->>GW: ChatMessage / GroupMessage / …
-      GW-->>FFI: push frame (monotonic seq)
-      FFI-->>SA: LaneEvent → AppModel upsert SQLite
+    GW-->>FFI: LoginAck session_id pending_messages ok
+    loop Inbox rows with seq greater than resume_after_seq
+      Inbox-->>GW: ChatMessage or GroupMessage
+      GW-->>FFI: push frame monotonic seq
+      FFI-->>SA: LaneEvent then AppModel upsert SQLite
     end
-    GW-->>FFI: SyncComplete{delivered, latest_seq}
+    GW-->>FFI: SyncComplete delivered latest_seq
     FFI-->>SA: SyncComplete
-    SA-->>UI: connectionState = ready
+    SA-->>UI: connectionState ready
   end
 
-  loop Every ~30s while connected
+  loop Every about 30s while connected
     FFI->>GW: Ping 0x03
     GW-->>FFI: Pong 0x04
   end
-  Note over FFI,GW: Idle > 90s without traffic → server closes
+  Note over FFI,GW: Idle over 90s without traffic server closes
 ```
 
 **Packet IDs in this phase:** `Login 0x01`, `LoginAck 0x02`, `Ping 0x03`,
@@ -240,66 +250,66 @@ sequenceDiagram
   participant UI as SwiftUI thread
   participant AM as AppModel
   participant SQL as SQLite
-  participant E2EE as E2eeService<br/>Rust Olm via FFI
+  participant E2EE as E2eeService
   participant Chat as ChatService
   participant SA as SessionActor
   participant FFI as lane_messenger_ffi
-  participant GW as Gateway session<br/>Alice
+  participant GW as Gateway Alice
   participant R as Message router
-  participant Inbox as Bob inbox + WAL
+  participant Inbox as Bob inbox WAL
   participant Pres as Presence registry
-  participant BobS as Gateway session<br/>Bob (if online)
-  participant BobFFI as Bob FFI / client
-  participant BobUI as Bob AppModel / UI
+  participant BobS as Gateway Bob
+  participant BobFFI as Bob FFI client
+  participant BobUI as Bob AppModel UI
 
-  Alice->>UI: Tap Send (compose text)
-  UI->>AM: sendChat(peer=bob, body)
-  AM->>SQL: upsertMessage(status=pending, direction=outbound,<br/>message_id=uuid, conversation_id=bob)
-  AM->>UI: show pending tick (clock / empty)
+  Alice->>UI: Tap Send compose text
+  UI->>AM: sendChat peer=bob body
+  AM->>SQL: upsertMessage pending outbound message_id
+  AM->>UI: show pending tick
 
   alt E2EE enabled
-    AM->>E2EE: encryptOutboundChat(to=bob, plaintext)
-    E2EE->>E2EE: Olm session encrypt (vodozemac in Rust)
-    E2EE-->>AM: ciphertext bytes (opaque body)
-  else Plaintext / DEBUG fallback
-    AM->>AM: body = UTF-8 bytes
+    AM->>E2EE: encryptOutboundChat to=bob plaintext
+    E2EE->>E2EE: Olm session encrypt in Rust
+    E2EE-->>AM: ciphertext opaque body
+  else Plaintext or DEBUG fallback
+    AM->>AM: body equals UTF-8 bytes
   end
 
-  AM->>Chat: send(peer, message_id, body[, media_id])
-  Chat->>SA: transport.sendChat / sendEncryptedChat
-  SA->>FFI: send_chat(to, message_id, body) or send_encrypted_chat
-  Note over FFI,GW: FunXMPP ChatMessage 0x20<br/>fields: message_id, from, to, body, sent_at, media_id<br/>seq usually 0 on client send
+  AM->>Chat: send peer message_id body
+  Chat->>SA: transport sendChat or sendEncryptedChat
+  SA->>FFI: send_chat or send_encrypted_chat
+  Note over FFI,GW: FunXMPP ChatMessage 0x20 opaque body
 
-  FFI->>GW: ChatMessage{from=alice, to=bob, message_id, body, …}
-  GW->>R: route(alice → bob)
+  FFI->>GW: ChatMessage from=alice to=bob message_id body
+  GW->>R: route alice to bob
 
-  R->>Inbox: durable insert (dedup by message_id)
-  Note over Inbox: Assign monotonic seq for Bob's inbox<br/>ServerAck ONLY after durable store
-  Inbox-->>R: seq=N assigned
+  R->>Inbox: durable insert dedup by message_id
+  Note over Inbox: Assign monotonic seq then ServerAck
+  Inbox-->>R: seq N assigned
 
   R-->>GW: enqueue ServerAck for Alice
-  GW-->>FFI: ServerAck{message_id, seq?} 0x21
-  FFI-->>SA: LaneEvent.ServerAck
+  GW-->>FFI: ServerAck message_id seq N pkt 0x21
+  FFI-->>SA: LaneEvent ServerAck
   SA-->>AM: handle ack
-  AM->>SQL: updateStatus(sent) — single tick ✓
+  AM->>SQL: updateStatus sent single tick
   AM->>UI: refresh ticks
 
-  R->>Pres: is bob online on this node / cluster?
-  alt Bob online (same node)
-    R->>BobS: push ChatMessage{…, seq=N}
+  R->>Pres: is bob online on this node or cluster
+  alt Bob online same node
+    R->>BobS: push ChatMessage seq N
     BobS-->>BobFFI: ChatMessage 0x20
-    BobFFI-->>BobUI: LaneEvent.ChatMessage
+    BobFFI-->>BobUI: LaneEvent ChatMessage
     BobUI->>BobUI: E2EE decrypt if needed
-    BobUI->>SQL: upsert inbound (unread++)
+    BobUI->>SQL: upsert inbound unread plus one
     opt App in background
-      BobUI->>BobUI: local UNNotification + badge
+      BobUI->>BobUI: local UNNotification and badge
     end
     BobUI->>BobFFI: DeliveredAck 0x22
-    BobFFI->>BobS: DeliveredAck{message_id}
+    BobFFI->>BobS: DeliveredAck message_id
     BobS->>R: fan-in to Alice
     R->>GW: DeliveredAck toward Alice
     GW-->>FFI: DeliveredAck 0x22
-    FFI-->>AM: updateStatus(delivered) — double tick ✓✓
+    FFI-->>AM: updateStatus delivered double tick
 
     opt Bob opens thread
       BobUI->>BobFFI: ReadAck 0x23
@@ -307,15 +317,17 @@ sequenceDiagram
       BobS->>R: route to Alice
       R->>GW: ReadAck
       GW-->>FFI: ReadAck 0x23
-      FFI-->>AM: updateStatus(read) — blue ticks
+      FFI-->>AM: updateStatus read blue ticks
       AM->>SQL: mark read
     end
-  else Bob offline
-    Note over Inbox: Message stays in inbox until Bob Login<br/>with resume_after_seq &lt; N
-    Note over Alice: Alice already has ServerAck ✓;<br/>Delivered/Read wait until Bob connects
-  else Bob on another cluster node
-    R->>R: PeerSync / forward to Bob home shard 0x52
-    Note over R: Home persists + seq; deliver to Bob's<br/>current node via PeerPresence location map
+  else Bob not on this node
+    alt Bob offline
+      Note over Inbox: Stays in inbox until Bob Login resume_after_seq
+      Note over Alice: Alice already has ServerAck Delivered Read wait
+    else Bob on another cluster node
+      R->>R: PeerSync forward to Bob home shard 0x52
+      Note over R: Home persists seq then deliver via PeerPresence
+    end
   end
 ```
 
@@ -346,7 +358,7 @@ on login). Also covers background notification + deep link.
 sequenceDiagram
   autonumber
   participant Inbox as Bob durable inbox
-  participant GW as Gateway session Bob
+  participant GW as Gateway Bob
   participant FFI as Bob lane_messenger_ffi
   participant SA as SessionActor
   participant AM as AppModel
@@ -356,61 +368,55 @@ sequenceDiagram
   participant UI as SwiftUI
   actor Bob
 
-  rect rgb(40, 40, 50)
-    Note over Inbox,UI: Case A — Bob already online (live push)
-    Inbox->>GW: router delivers ChatMessage{seq=N}
-    GW->>FFI: frame ChatMessage 0x20
-    FFI->>SA: poll / event stream LaneEvent.ChatMessage
-    SA->>AM: handle(event)
-    AM->>E2EE: decryptInboundChat(from, bodyData)
-    alt decrypt OK
-      E2EE-->>AM: plaintext + wasEncrypted
-    else fail and no plaintext fallback
-      E2EE-->>AM: placeholder / empty (may skip notify)
-    end
-    AM->>SQL: upsertMessage(inbound, delivered)<br/>conversation.unread += 1
-    AM->>SQL: refresh inbox preview / sort_ts
+  Note over Inbox,UI: Case A Bob already online live push
+  Inbox->>GW: router delivers ChatMessage seq N
+  GW->>FFI: frame ChatMessage 0x20
+  FFI->>SA: event stream LaneEvent ChatMessage
+  SA->>AM: handle event
+  AM->>E2EE: decryptInboundChat from bodyData
+  alt decrypt OK
+    E2EE-->>AM: plaintext wasEncrypted
+  else decrypt fail no fallback
+    E2EE-->>AM: placeholder may skip notify
+  end
+  AM->>SQL: upsertMessage inbound delivered unread plus one
+  AM->>SQL: refresh inbox preview sort_ts
 
-    alt selectedPeer == conversation AND foreground
-      AM->>FFI: ackDelivered(message_id)
-      AM->>FFI: ackRead(message_id)
-      AM->>SQL: status=read · unread=0
-      AM->>UI: reloadThread()
-    else app in background OR other thread
-      AM->>UN: presentLocal(PushPayload)<br/>preview policy may hide body if E2EE
-      AM->>UN: setBadge(sum unread)
-      AM->>FFI: ackDelivered only when policy says<br/>(often on open thread)
-    end
+  alt selectedPeer is conversation and foreground
+    AM->>FFI: ackDelivered message_id
+    AM->>FFI: ackRead message_id
+    AM->>SQL: status read unread zero
+    AM->>UI: reloadThread
+  else background or other thread
+    AM->>UN: presentLocal PushPayload preview policy
+    AM->>UN: setBadge sum unread
+    AM->>FFI: ackDelivered when policy allows
   end
 
-  rect rgb(40, 50, 40)
-    Note over Inbox,UI: Case B — Bob was offline (login replay)
-    Bob->>AM: cold start / foreground
-    AM->>SA: connect(resume_after_seq = max stored seq)
-    SA->>FFI: Login{resume_after_seq=S}
-    FFI->>GW: Login 0x01
-    GW->>Inbox: select rows where seq > S ORDER BY seq
-    loop Each pending message
-      Inbox-->>GW: row seq=S+1 … N
-      GW->>FFI: ChatMessage / GroupMessage {seq}
-      FFI->>AM: upsert + decrypt as above
-    end
-    GW->>FFI: SyncComplete{delivered, latest_seq}
-    FFI->>AM: persist latest_seq as resume cursor
-    AM->>UI: connectionState=ready · refreshInbox
+  Note over Inbox,UI: Case B Bob was offline login replay
+  Bob->>AM: cold start or foreground
+  AM->>SA: connect resume_after_seq max stored seq
+  SA->>FFI: Login resume_after_seq S
+  FFI->>GW: Login 0x01
+  GW->>Inbox: select rows seq greater than S order by seq
+  loop Each pending message
+    Inbox-->>GW: row next seq
+    GW->>FFI: ChatMessage or GroupMessage with seq
+    FFI->>AM: upsert and decrypt as above
   end
+  GW->>FFI: SyncComplete delivered latest_seq
+  FFI->>AM: persist latest_seq as resume cursor
+  AM->>UI: connectionState ready refreshInbox
 
-  rect rgb(50, 40, 40)
-    Note over UN,UI: Case C — APNs / deep link open (socket may be down)
-    UN->>AM: handleNotificationOpen(userInfo)<br/>or handleDeepLink(lane://chat/bob)
-    AM->>AM: pendingOpenConversationId = bob<br/>(if route != home)
-    AM->>SA: foreground → reconnect + resume
-    AM->>UI: openChat(peer=bob) after home
-    AM->>SQL: markConversationRead
-    AM->>UN: clearNotifications(conversation)
-    AM->>UN: refreshBadge
-    AM->>FFI: DeliveredAck + ReadAck for visible msgs
-  end
+  Note over UN,UI: Case C APNs or deep link open
+  UN->>AM: handleNotificationOpen or handleDeepLink
+  AM->>AM: pendingOpenConversationId bob if not home
+  AM->>SA: foreground reconnect and resume
+  AM->>UI: openChat peer bob after home
+  AM->>SQL: markConversationRead
+  AM->>UN: clearNotifications conversation
+  AM->>UN: refreshBadge
+  AM->>FFI: DeliveredAck and ReadAck for visible msgs
 ```
 
 **Receive-path state on device**
@@ -418,16 +424,16 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
   [*] --> Disconnected
-  Disconnected --> Connecting: bootstrap / signIn / foreground
-  Connecting --> AwaitingLogin: TCP(+TLS) up
+  Disconnected --> Connecting: bootstrap signIn foreground
+  Connecting --> AwaitingLogin: TCP TLS up
   AwaitingLogin --> Syncing: LoginAck ok
   AwaitingLogin --> Locked: REPLACED_BY_NEW_SESSION
   Syncing --> Ready: SyncComplete
-  Ready --> Ready: ChatMessage / acks / presence / Ping
-  Ready --> Reconnecting: socket drop / background kill
+  Ready --> Ready: ChatMessage acks presence Ping
+  Ready --> Reconnecting: socket drop background kill
   Reconnecting --> Connecting: auto-reconnect policy
-  Locked --> [*]: user acknowledges · re-login required
-  Ready --> Disconnected: signOut / close
+  Locked --> [*]: user acknowledges re-login required
+  Ready --> Disconnected: signOut close
 ```
 
 **Inbound UI / notify decision**
@@ -447,12 +453,12 @@ stateDiagram-v2
 ```mermaid
 flowchart LR
   subgraph ClientSend["Sender client"]
-    P["pending"] --> S["sent ✓ ServerAck"]
-    S --> D["delivered ✓✓ DeliveredAck"]
-    D --> R["read blue ReadAck"]
+    P["pending"] --> S["sent ServerAck"]
+    S --> D["delivered DeliveredAck"]
+    D --> R["read ReadAck"]
   end
 
-  subgraph Wire["FunXMPP on TCP/TLS"]
+  subgraph Wire["FunXMPP on TCP TLS"]
     CM["0x20 ChatMessage"]
     SA["0x21 ServerAck"]
     DA["0x22 DeliveredAck"]
@@ -605,6 +611,9 @@ TCP(+TLS) accept
 ```
 
 ### 3.5 Typical send path
+
+Short form (full sequence diagrams: [§1B](#1b-message-send-flow-maximum-detail),
+[§1C](#1c-message-receive-flow-maximum-detail)):
 
 ```text
 User taps Send
