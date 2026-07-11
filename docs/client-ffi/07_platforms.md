@@ -27,7 +27,9 @@ UDL: `lane_messenger_ffi/src/lane_messenger.udl`.
 ## Android notes
 
 - Min API 24; ship `arm64-v8a`, `armeabi-v7a`, `x86_64`.
-- **JNI path:** `com.lane.messenger.LaneSession` + `--features jni`.
+- **Production Java JNI path (recommended):** `com.lane.messenger.LaneSession` /
+  `LaneE2eeDevice` — full C ABI parity. See [`10_java.md`](10_java.md).
+  Build with `FEATURES="c-api,tls,ws,jni" ./scripts/build_android_ndk.sh`.
 - **UniFFI path:** `uniffi.lane_messenger` (JNA) + `--features uniffi`.
 - ProGuard rules in `bindings/android/lane-messenger-ffi/proguard-rules.pro`.
 - Sample: `examples/android_ffi_demo/`.

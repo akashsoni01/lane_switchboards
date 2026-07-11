@@ -18,9 +18,10 @@ Features: `c-api` (default), `tls` (default), `ws` (default), optional `uniffi`,
 | Feature | Purpose |
 |---------|---------|
 | `uniffi` | UDL scaffolding + `uniffi-bindgen` (Swift/Kotlin) |
-| `jni` | `Java_com_lane_messenger_LaneSession_native*` glue |
+| `jni` | `Java_com_lane_messenger_*` glue — full session + E2EE JNI |
 
 Platform packages / scripts: see [`docs/client-ffi/BUILD.md`](../docs/client-ffi/BUILD.md).
+Java production API: [`docs/client-ffi/10_java.md`](../docs/client-ffi/10_java.md).
 
 Env: `LANE_MESSENGER_WORKER_THREADS` — Tokio worker count (default 2–8).
 

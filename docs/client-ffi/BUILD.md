@@ -45,9 +45,12 @@ CI job: `ffi-ios-xcframework` (macOS).
 
 ```bash
 export ANDROID_NDK_HOME=…
+# jni is included by default — required for com.lane.messenger Java API
 ./scripts/build_android_ndk.sh
 # → bindings/android/lane-messenger-ffi/src/main/jniLibs/<abi>/liblane_messenger_ffi.so
 ```
+
+Java API docs: [`10_java.md`](10_java.md).
 
 Package the module `bindings/android/lane-messenger-ffi/` as an AAR (Gradle).
 CI job: `ffi-android-ndk`.

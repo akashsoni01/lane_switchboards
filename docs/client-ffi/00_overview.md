@@ -44,4 +44,5 @@ while let Some(ev) = s.poll_event(100) {
 s.ping()?;
 ```
 
-See [BUILD.md](BUILD.md) for XCFramework / AAR notes.
+See [BUILD.md](BUILD.md) for XCFramework / AAR notes.  
+Java / Android JNI (production): [10_java.md](10_java.md).

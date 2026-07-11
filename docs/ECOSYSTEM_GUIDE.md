@@ -1096,8 +1096,10 @@ Auth token + device id + E2EE pickle → Keychain. Gateway HMAC secret →
 **server only**, never in App Store builds.
 
 **Q: What about Android / Flutter?**  
-Same FFI crate; see `docs/client-ffi/07_platforms.md` and
-`examples/android_ffi_demo/`, `examples/flutter_ffi_demo/`.
+Same FFI crate. **Java production API:** [`client-ffi/10_java.md`](client-ffi/10_java.md)
+(`com.lane.messenger.LaneSession` / `LaneE2eeDevice`). Also
+`docs/client-ffi/07_platforms.md` and `examples/android_ffi_demo/`,
+`examples/flutter_ffi_demo/`.
 
 ---
 
