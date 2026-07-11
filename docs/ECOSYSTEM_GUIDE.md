@@ -8,10 +8,12 @@ FFI bindings → Rust client → FunXMPP over TCP/TLS → messenger gateway.
 | Section | Contents |
 |---------|----------|
 | [§1.1](#11-entities-servers-protocols-mermaid) | Entities, servers, protocols (flowchart) |
+| [§1E](#1e-users-clients-and-servers-communication) | Users ↔ clients ↔ gateways (overview) |
 | [§1A](#1a-session-connect--login-detailed) | Connect / Login / SyncComplete |
 | [§1B](#1b-message-send-flow-maximum-detail) | Full send + ack ladder + offline/cluster |
 | [§1C](#1c-message-receive-flow-maximum-detail) | Live receive, offline replay, APNs open |
 | [§1D](#1d-ack-ladder--wire-packets-cheat-sheet) | Packet ID cheat sheet |
+| [§8 FAQ](#8-faq) | E2EE location, send path, FFI size, native vs Rust |
 
 If you are new here, read this page first, then dive into the linked docs.
 
@@ -170,6 +172,127 @@ flowchart TB
 | HTTPS for login / APNs register / CDN | WebSocket as primary iOS transport |
 | SQLite + Keychain on device | Hand-rolled Swift frame codec |
 | Standard **alert** APNs | VoIP / Push-to-Talk for chat |
+
+---
+
+## 1E. Users, clients, and servers (communication)
+
+How **people**, **apps**, and **Lane servers** talk. Alice and Bob are users;
+each runs a client that embeds the Rust messenger engine; the gateway is the
+Lane messenger server (optionally several clustered nodes).
+
+```mermaid
+flowchart LR
+  subgraph Users
+    AliceUser[Alice person]
+    BobUser[Bob person]
+  end
+
+  subgraph AlicePhone[Alice device]
+    AliceUI[LaneMessenger UI]
+    AliceKit[LaneMessengerKit]
+    AliceFFI[lane_messenger_ffi]
+    AliceMC[MessengerClient inside FFI]
+    AliceE2EE[E2eeDevice keys encrypt decrypt]
+    AliceUI --> AliceKit
+    AliceKit --> AliceFFI
+    AliceFFI --> AliceMC
+    AliceFFI --> AliceE2EE
+  end
+
+  subgraph BobPhone[Bob device]
+    BobUI[LaneMessenger UI]
+    BobKit[LaneMessengerKit]
+    BobFFI[lane_messenger_ffi]
+    BobMC[MessengerClient inside FFI]
+    BobE2EE[E2eeDevice keys encrypt decrypt]
+    BobUI --> BobKit
+    BobKit --> BobFFI
+    BobFFI --> BobMC
+    BobFFI --> BobE2EE
+  end
+
+  subgraph ControlPlane[HTTPS control plane]
+    Identity[Identity service]
+    PushReg[Push token register]
+    APNs[Apple APNs]
+  end
+
+  subgraph LaneCluster[Lane messenger servers]
+    GW0[Gateway node-0]
+    GW1[Gateway node-1]
+    Inbox[(Inbox WAL)]
+    KeyDir[(Public key directory)]
+    GW0 --- GW1
+    GW0 --> Inbox
+    GW1 --> Inbox
+    GW0 --> KeyDir
+    GW1 --> KeyDir
+  end
+
+  AliceUser --> AliceUI
+  BobUser --> BobUI
+
+  AliceKit -.->|HTTPS login| Identity
+  BobKit -.->|HTTPS login| Identity
+  AliceKit -.->|HTTPS| PushReg
+  BobKit -.->|HTTPS| PushReg
+  PushReg -.-> APNs
+  APNs -.->|alert push| AliceUI
+  APNs -.->|alert push| BobUI
+
+  AliceMC <-->|TCP TLS FunXMPP| GW0
+  BobMC <-->|TCP TLS FunXMPP| GW1
+```
+
+**Text send (Alice → Bob) — who calls whom**
+
+```mermaid
+sequenceDiagram
+  actor Alice
+  participant UI as Alice Swift UI
+  participant Kit as ChatService SessionActor
+  participant FFI as lane_messenger_ffi
+  participant MC as MessengerClient Rust
+  participant GW as Lane messenger server
+  participant BobC as Bob MessengerClient
+  participant BobUI as Bob Swift UI
+  actor Bob
+
+  Alice->>UI: tap Send
+  UI->>Kit: sendChat
+  Kit->>Kit: SQLite pending row
+  opt E2EE on
+    Kit->>FFI: encrypt on device
+  end
+  Kit->>FFI: send_chat or send_encrypted_chat
+  FFI->>MC: same Rust client as demos
+  MC->>GW: FunXMPP ChatMessage
+  GW->>GW: durable inbox assign seq
+  GW-->>MC: ServerAck
+  MC-->>UI: single tick
+  alt Bob online
+    GW->>BobC: ChatMessage
+    BobC->>BobUI: decrypt on device show bubble
+    BobUI->>BobC: DeliveredAck ReadAck
+    BobC->>GW: acks
+    GW-->>MC: DeliveredAck ReadAck
+  else Bob offline
+    Note over GW: stay in inbox until Bob Login resume
+  end
+  BobUI->>Bob: sees message
+```
+
+| Role | Component | Job |
+|------|-----------|-----|
+| User | Alice / Bob | Taps UI only |
+| Client app | SwiftUI + Kit | UX, SQLite, Keychain, push presentation |
+| Client engine | `lane_messenger_ffi` → **`MessengerClient`** | Codec, session, send/recv, E2EE |
+| Server | Lane **messenger gateway** | Auth, route, inbox, presence, public keys |
+| Not on server | Private keys / plaintext encrypt | Always on device when E2EE is on |
+
+Without XCFramework, Kit uses `MockMessengerTransport` and **never** reaches a
+real gateway (UI/smoke only).
 
 ---
 
@@ -871,9 +994,95 @@ lane_switchboards/
 
 ## 8. FAQ
 
+**Q: Where do key creation and encryption happen — mobile app or Lane backend?**
+
+**On the mobile client (Rust via FFI), not on the Lane gateway.**
+
+| Step | Where |
+|------|--------|
+| Create IK / SPK / OTKs / Olm / Megolm sessions | **Device** — `E2eeDevice` in `lane_messenger_ffi` |
+| Persist private material | **Device** Keychain pickle |
+| Publish / fetch **public** key bundles | Device ↔ gateway **key directory** |
+| Encrypt before send / decrypt after receive | **Device** |
+| Store and route ciphertext, assign `seq`, acks | **Lane messenger server** |
+
+The gateway is a relay + public key directory. With E2EE on it must not see
+private keys or message plaintext. See [`messenger/10_e2ee.md`](messenger/10_e2ee.md)
+and [§1E](#1e-users-clients-and-servers-communication).
+
+**Q: After sending a text message, does the call go to MessengerClient and then the Lane messenger server?**
+
+**Yes.** On iOS the Swift UI never imports `MessengerClient` directly; the chain is:
+
+```text
+User tap Send
+  → AppModel / ChatService
+  → SessionActor → LaneFFITransport → LaneSession binding
+  → lane_messenger_ffi SessionHandle
+       └─ wraps MessengerClient (same Rust client as demos/tests)
+  → TCP (+ TLS) FunXMPP ChatMessage
+  → Lane messenger gateway
+       └─ durable inbox → ServerAck → deliver to peer or wait offline
+```
+
+Rust demos/tests call `MessengerClient::send_chat` → same gateway path.
+Mock transport skips the server entirely. Full picture: [§1E](#1e-users-clients-and-servers-communication),
+[§1B](#1b-message-send-flow-maximum-detail).
+
 **Q: Why isn’t chat just REST or gRPC?**  
 Realtime delivery, presence, and ack ladders need a long-lived binary session.
 HTTP is reserved for identity, config, APNs registration, and CDN.
+
+**Q: How big is the FFI / XCFramework, and what latency does the binding add?**
+
+Measured on this repo (host `cargo build -p lane_messenger_ffi --release`,
+2026-07-11, macOS arm64):
+
+| Artifact | Approx size | Ships in app? |
+|----------|-------------|---------------|
+| `liblane_messenger_ffi.dylib` (release) | **~3.7 MiB** | Host/dev only |
+| `liblane_messenger_ffi.a` (static archive) | **~50–70 MiB** | No — object archive, not final link size |
+| iOS XCFramework on disk (device + sim slices) | **~6–15 MiB** typical | Thinned per arch at install |
+| Contribution inside a thinned App Store IPA (one arch, stripped/LTO) | **~2–5 MiB** ballpark | Yes (order of magnitude; rebuild to measure) |
+| Android `.so` per ABI (arm64) | **~2–6 MiB** ballpark | Yes, per ABI you ship |
+
+Dominant bulk: Tokio + TLS (rustls) + prost + **vodozemac** (Olm/Megolm), not
+the thin Swift/Kotlin wrappers (`bindings/swift` is only ~100 KiB of sources).
+
+**Binding latency (order of magnitude, not a substitute for a microbench):**
+
+| Hop | Typical cost | Dominates UX? |
+|-----|--------------|---------------|
+| C ABI call (scalar / small buffer) | **~10 ns – few µs** | No |
+| UniFFI / JNI + UTF-8 / byte copy | **~1–50 µs** | No |
+| Swift → poll one event / fire send | **µs–low hundreds µs** | No |
+| Localhost FunXMPP `send` → `ServerAck` | **~0.2–2 ms** (release, same machine) | Sometimes |
+| Cross-node offline ack (bench) | **p50 ~2–4 ms, p99 ~8–15 ms** | Yes vs FFI |
+| Real WAN RTT + TLS | **tens–hundreds of ms** | Yes |
+
+Rule of thumb: **FFI overhead is ≪ 1% of end-to-end chat latency.** Network,
+disk (SQLite), and crypto dominate; the binding does not.
+
+**Q: Is there a benefit to writing everything in native languages (Swift / Kotlin)?**
+
+| Benefit of all-native | Reality for Lane |
+|-----------------------|------------------|
+| Avoid FFI marshalling | Saves µs; irrelevant next to RTT |
+| Slightly smaller binary (no Rust std/Tokio in app) | Possible **~1–4 MiB** savings if you drop shared crypto/runtime — easy to lose again with Swift crypto + protobuf stacks |
+| Idiomatic Swift concurrency / Instruments | Real DX win for **UI** only |
+| Match WhatsApp’s per-platform clients | True for WA; Lane deliberately follows **Signal/`libsignal`**: one audited wire+E2EE core |
+
+| Cost of all-native | Why it hurts |
+|--------------------|--------------|
+| Reimplement FunXMPP codec + session SM per OS | Drift, security bugs, double test matrix |
+| Reimplement Olm/Megolm (or wrap differently per OS) | Highest-risk surface; vodozemac already audited path |
+| Android ≠ iOS behavior forever | Exactly the class of bugs messengers are famous for |
+| No Flutter/desktop reuse | FFI core amortizes once |
+
+**Recommendation:** keep **UI, Keychain, SQLite, push** native (already done in
+`LaneMessengerKit`); keep **wire + E2EE + reconnect** in Rust via FFI. Going
+fully native is a product/org choice (WA-style), not a latency win. See
+[`gap.md`](../gap.md) §2.3.
 
 **Q: Can I implement FunXMPP in Swift with Network.framework?**  
 Not for production. The codec, E2EE, and framing stay in Rust via FFI so all
@@ -900,3 +1109,4 @@ Same FFI crate; see `docs/client-ffi/07_platforms.md` and
 4. [`client-ios/02_session.md`](client-ios/02_session.md) — SessionActor
 5. [`messenger/10_e2ee.md`](messenger/10_e2ee.md) + [`client-ios/08_e2ee.md`](client-ios/08_e2ee.md)
 6. [`todo_ios.md`](../todo_ios.md) — remaining I10 polish
+7. [`gap.md`](../gap.md) / [`funxmpp_todo.md`](../funxmpp_todo.md) — WA fidelity backlogs
