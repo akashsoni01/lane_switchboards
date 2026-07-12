@@ -1,11 +1,15 @@
 import Foundation
+import LaneMessengerC
 
 /// Host-owned Olm/Megolm device. Private keys never leave Rust.
-public final class LaneE2eeDevice {
+///
+/// Uses the same C ABI as Android/Java (`lane_e2ee_*`). Do not mix with
+/// UniFFI-generated `LaneE2eeDevice` in the same target.
+public final class LaneE2eeDevice: @unchecked Sendable {
     private var ptr: OpaquePointer?
 
     public init() {
-        ptr = OpaquePointer(lane_e2ee_generate())
+        ptr = lane_e2ee_generate()
     }
 
     public init(pickle: Data, passphrase: String) throws {
@@ -19,18 +23,18 @@ public final class LaneE2eeDevice {
             }
         }
         guard let device else { throw LaneFFIError.code(-1) }
-        ptr = OpaquePointer(device)
+        ptr = device
     }
 
     deinit {
         if let ptr {
-            lane_e2ee_free(UnsafeMutablePointer(ptr))
+            lane_e2ee_free(ptr)
         }
     }
 
     public func identityKey() throws -> String {
         var out: UnsafeMutablePointer<CChar>?
-        try check(lane_e2ee_identity_key(UnsafeMutablePointer(ptr), &out))
+        try check(lane_e2ee_identity_key(ptr, &out))
         defer { if let out { lane_string_free(out) } }
         return out.map { String(cString: $0) } ?? ""
     }
@@ -49,7 +53,7 @@ public final class LaneE2eeDevice {
 
     public func publish(session: LaneSession, deviceId: String, otkCount: UInt32 = 20) throws {
         let code = deviceId.withCString { d in
-            lane_e2ee_publish(session.rawPointer, UnsafeMutablePointer(ptr), d, otkCount)
+            lane_e2ee_publish(session.opaquePointer, ptr, d, otkCount)
         }
         try check(code)
     }
@@ -65,8 +69,8 @@ public final class LaneE2eeDevice {
             to.withCString { t in
                 messageId.withCString { m in
                     lane_send_encrypted_chat(
-                        session.rawPointer,
-                        UnsafeMutablePointer(ptr),
+                        session.opaquePointer,
+                        ptr,
                         t, m,
                         raw.bindMemory(to: UInt8.self).baseAddress,
                         plaintext.count,
@@ -85,7 +89,7 @@ public final class LaneE2eeDevice {
         let code = body.withUnsafeBytes { raw in
             from.withCString { f in
                 lane_decrypt_chat(
-                    UnsafeMutablePointer(ptr), f,
+                    ptr, f,
                     raw.bindMemory(to: UInt8.self).baseAddress,
                     body.count,
                     &outPtr, &outLen
@@ -104,7 +108,7 @@ public final class LaneE2eeDevice {
         var outPtr: UnsafeMutablePointer<UInt8>?
         var outLen: Int = 0
         let code = passphrase.withCString { p in
-            lane_e2ee_export_pickle(UnsafeMutablePointer(ptr), p, &outPtr, &outLen)
+            lane_e2ee_export_pickle(ptr, p, &outPtr, &outLen)
         }
         defer {
             if let outPtr { lane_bytes_free(outPtr, outLen) }
@@ -117,7 +121,7 @@ public final class LaneE2eeDevice {
     public func createGroupSession(groupId: String) throws -> String {
         var out: UnsafeMutablePointer<CChar>?
         let code = groupId.withCString { g in
-            lane_e2ee_create_group_session(UnsafeMutablePointer(ptr), g, &out)
+            lane_e2ee_create_group_session(ptr, g, &out)
         }
         defer { if let out { lane_string_free(out) } }
         try check(code)
@@ -129,7 +133,7 @@ public final class LaneE2eeDevice {
         let code = groupId.withCString { g in
             csv.withCString { m in
                 lane_e2ee_distribute_group_key(
-                    session.rawPointer, UnsafeMutablePointer(ptr), g, m
+                    session.opaquePointer, ptr, g, m
                 )
             }
         }
@@ -146,8 +150,8 @@ public final class LaneE2eeDevice {
             groupId.withCString { g in
                 messageId.withCString { m in
                     lane_send_encrypted_group(
-                        session.rawPointer,
-                        UnsafeMutablePointer(ptr),
+                        session.opaquePointer,
+                        ptr,
                         g, m,
                         raw.bindMemory(to: UInt8.self).baseAddress,
                         plaintext.count
@@ -164,7 +168,7 @@ public final class LaneE2eeDevice {
         let code = body.withUnsafeBytes { raw in
             groupId.withCString { g in
                 lane_decrypt_group(
-                    UnsafeMutablePointer(ptr), g,
+                    ptr, g,
                     raw.bindMemory(to: UInt8.self).baseAddress,
                     body.count,
                     &outPtr, &outLen
@@ -184,7 +188,7 @@ public final class LaneE2eeDevice {
         let code = body.withUnsafeBytes { raw in
             from.withCString { f in
                 lane_e2ee_try_import_group_key(
-                    UnsafeMutablePointer(ptr), f,
+                    ptr, f,
                     raw.bindMemory(to: UInt8.self).baseAddress,
                     body.count,
                     &imported
@@ -199,110 +203,3 @@ public final class LaneE2eeDevice {
         if code != 0 { throw LaneFFIError.code(code) }
     }
 }
-
-@_silgen_name("lane_e2ee_generate")
-func lane_e2ee_generate() -> OpaquePointer?
-
-@_silgen_name("lane_e2ee_free")
-func lane_e2ee_free(_ d: UnsafeMutableRawPointer?)
-
-@_silgen_name("lane_e2ee_identity_key")
-func lane_e2ee_identity_key(
-    _ d: UnsafeMutableRawPointer?,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
-) -> Int32
-
-@_silgen_name("lane_e2ee_safety_number")
-func lane_e2ee_safety_number(
-    _ local: UnsafePointer<CChar>,
-    _ remote: UnsafePointer<CChar>,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
-) -> Int32
-
-@_silgen_name("lane_e2ee_publish")
-func lane_e2ee_publish(
-    _ s: UnsafeMutableRawPointer?,
-    _ d: UnsafeMutableRawPointer?,
-    _ deviceId: UnsafePointer<CChar>,
-    _ otk: UInt32
-) -> Int32
-
-@_silgen_name("lane_send_encrypted_chat")
-func lane_send_encrypted_chat(
-    _ s: UnsafeMutableRawPointer?,
-    _ d: UnsafeMutableRawPointer?,
-    _ to: UnsafePointer<CChar>,
-    _ mid: UnsafePointer<CChar>,
-    _ plain: UnsafePointer<UInt8>?,
-    _ len: Int,
-    _ seq: UnsafeMutablePointer<UInt64>
-) -> Int32
-
-@_silgen_name("lane_decrypt_chat")
-func lane_decrypt_chat(
-    _ d: UnsafeMutableRawPointer?,
-    _ from: UnsafePointer<CChar>,
-    _ body: UnsafePointer<UInt8>?,
-    _ len: Int,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
-    _ outLen: UnsafeMutablePointer<Int>
-) -> Int32
-
-@_silgen_name("lane_e2ee_export_pickle")
-func lane_e2ee_export_pickle(
-    _ d: UnsafeMutableRawPointer?,
-    _ pass: UnsafePointer<CChar>,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
-    _ outLen: UnsafeMutablePointer<Int>
-) -> Int32
-
-@_silgen_name("lane_e2ee_import_pickle")
-func lane_e2ee_import_pickle(
-    _ bytes: UnsafePointer<UInt8>?,
-    _ len: Int,
-    _ pass: UnsafePointer<CChar>
-) -> OpaquePointer?
-
-@_silgen_name("lane_e2ee_create_group_session")
-func lane_e2ee_create_group_session(
-    _ d: UnsafeMutableRawPointer?,
-    _ groupId: UnsafePointer<CChar>,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
-) -> Int32
-
-@_silgen_name("lane_e2ee_distribute_group_key")
-func lane_e2ee_distribute_group_key(
-    _ s: UnsafeMutableRawPointer?,
-    _ d: UnsafeMutableRawPointer?,
-    _ groupId: UnsafePointer<CChar>,
-    _ members: UnsafePointer<CChar>
-) -> Int32
-
-@_silgen_name("lane_send_encrypted_group")
-func lane_send_encrypted_group(
-    _ s: UnsafeMutableRawPointer?,
-    _ d: UnsafeMutableRawPointer?,
-    _ groupId: UnsafePointer<CChar>,
-    _ mid: UnsafePointer<CChar>,
-    _ plain: UnsafePointer<UInt8>?,
-    _ len: Int
-) -> Int32
-
-@_silgen_name("lane_decrypt_group")
-func lane_decrypt_group(
-    _ d: UnsafeMutableRawPointer?,
-    _ groupId: UnsafePointer<CChar>,
-    _ body: UnsafePointer<UInt8>?,
-    _ len: Int,
-    _ out: UnsafeMutablePointer<UnsafeMutablePointer<UInt8>?>,
-    _ outLen: UnsafeMutablePointer<Int>
-) -> Int32
-
-@_silgen_name("lane_e2ee_try_import_group_key")
-func lane_e2ee_try_import_group_key(
-    _ d: UnsafeMutableRawPointer?,
-    _ from: UnsafePointer<CChar>,
-    _ body: UnsafePointer<UInt8>?,
-    _ len: Int,
-    _ outImported: UnsafeMutablePointer<Int32>
-) -> Int32

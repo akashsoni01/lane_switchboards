@@ -22,6 +22,11 @@ Features: `c-api` (default), `tls` (default), `ws` (default), optional `uniffi`,
 
 Platform packages / scripts: see [`docs/client-ffi/BUILD.md`](../docs/client-ffi/BUILD.md).
 Java production API: [`docs/client-ffi/10_java.md`](../docs/client-ffi/10_java.md).
+Swift C ABI + cheatsheet: [`docs/client-ffi/11_swift.md`](../docs/client-ffi/11_swift.md) ·
+[`bindings/swift/LaneMessengerFFI/SWIFT_CHEATSHEET.md`](../bindings/swift/LaneMessengerFFI/SWIFT_CHEATSHEET.md).
+
+**Swift conflict note:** SPM product uses hand-written wrappers only; UniFFI
+`generated/` is excluded so it cannot clash with `LaneSession` / Rust C ABI.
 
 Env: `LANE_MESSENGER_WORKER_THREADS` — Tokio worker count (default 2–8).
 

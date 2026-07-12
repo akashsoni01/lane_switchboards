@@ -1,0 +1,50 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "LaneMessengerFFI-arm64-apple-macosx15.0-debug.module": ["<LaneMessengerFFI-arm64-apple-macosx15.0-debug.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<LaneMessengerFFI-arm64-apple-macosx15.0-debug.module>"]
+  "test": ["<LaneMessengerFFI-arm64-apple-macosx15.0-debug.module>"]
+default: "main"
+nodes:
+  "/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerC/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+  "/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/LaneE2ee.swift","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/LaneSession.swift"]
+    outputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/sources"]
+    description: "Write auxiliary file /Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/sources"
+
+  "/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Library/Developer/CommandLineTools/usr/bin/swiftc"]
+    outputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt"
+
+  "<LaneMessengerFFI-arm64-apple-macosx15.0-debug.module>":
+    tool: phony
+    inputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/LaneE2ee.swift.o","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/LaneSession.swift.o","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/Modules/LaneMessengerFFI.swiftmodule"]
+    outputs: ["<LaneMessengerFFI-arm64-apple-macosx15.0-debug.module>"]
+
+  "C.LaneMessengerFFI-arm64-apple-macosx15.0-debug.module":
+    tool: shell
+    inputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/LaneE2ee.swift","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/LaneSession.swift","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/swift-version--1AB21518FC5DEDBE.txt","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/sources"]
+    outputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/LaneE2ee.swift.o","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/LaneSession.swift.o","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/Modules/LaneMessengerFFI.swiftmodule"]
+    description: "Compiling Swift Module 'LaneMessengerFFI' (2 sources)"
+    args: ["/Library/Developer/CommandLineTools/usr/bin/swiftc","-module-name","LaneMessengerFFI","-emit-dependencies","-emit-module","-emit-module-path","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/Modules/LaneMessengerFFI.swiftmodule","-output-file-map","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/output-file-map.json","-parse-as-library","-incremental","-c","@/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/sources","-I","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/Modules","-target","arm64-apple-macosx13.0","-enable-batch-mode","-index-store-path","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/index/store","-Onone","-enable-testing","-j8","-DSWIFT_PACKAGE","-DDEBUG","-Xcc","-fmodule-map-file=/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerC/module.modulemap","-module-cache-path","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/ModuleCache","-parseable-output","-parse-as-library","-emit-objc-header","-emit-objc-header-path","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/.build/arm64-apple-macosx/debug/LaneMessengerFFI.build/LaneMessengerFFI-Swift.h","-swift-version","5","-F","/Library/Developer/CommandLineTools/Library/Developer/Frameworks","-sdk","/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk","-g","-Xcc","-isysroot","-Xcc","/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk","-Xcc","-fPIC","-Xcc","-g","-package-name","lanemessengerffi"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerC/","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Sources/LaneMessengerFFI/","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Package.swift","/Users/akashsoni/Documents/didl/lane_switchboards/bindings/swift/LaneMessengerFFI/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

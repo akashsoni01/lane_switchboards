@@ -20,8 +20,11 @@ UDL: `lane_messenger_ffi/src/lane_messenger.udl`.
 ## iOS notes
 
 - Min iOS 15+; ATS requires TLS in production.
-- Prefer UniFFI-generated Swift after linking the XCFramework; C ABI wrapper
-  remains for hosts that skip UniFFI.
+- **Production path (recommended):** hand-written C ABI Swift
+  (`bindings/swift/LaneMessengerFFI` — `LaneSession` / `LaneE2eeDevice`).
+  See [`11_swift.md`](11_swift.md) + [`SWIFT_CHEATSHEET.md`](../../bindings/swift/LaneMessengerFFI/SWIFT_CHEATSHEET.md).
+- **UniFFI path:** `generated/` after XCFramework link — **do not** compile with
+  the hand-written wrappers in the same target (duplicate `LaneSession`).
 - Sample: `examples/ios_ffi_demo/`.
 
 ## Android notes

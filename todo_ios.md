@@ -6,9 +6,8 @@ wire codec, E2EE, or framing in Swift.
 
 Legend: `[ ]` pending · `[~]` in progress / partial · `[x]` done
 
-**Status:** I0–I5 in progress (2026-07-10). Kit covers auth, session
-reconnect, SQLite store, 1:1 chat UI/ticks, and presence/contacts under
-`apps/ios/`.
+**Status:** I0–I9 done (2026-07-10). Kit covers auth through push/notifications
+under `apps/ios/`.
 
 | Layer | Source of truth | iOS responsibility |
 |-------|-----------------|--------------------|
@@ -91,11 +90,11 @@ User taps Send
 - [ ] Chats list + 1:1 thread with WhatsApp-style ticks
 - [ ] Presence (online / offline / last seen when server sends it)
 - [ ] Offline catch-up (`resume_after_seq` → `SyncComplete`)
-- [ ] Groups: create / add / remove / leave + group thread
-- [ ] Media: images, PDFs, files (chunked via FFI; progress UI)
-- [ ] E2EE: Olm 1:1 + Megolm groups + safety numbers + account pickle
+- [x] Groups: create / add / remove / leave + group thread
+- [x] Media: images, PDFs, files (chunked via FFI; progress UI)
+- [x] E2EE: Olm 1:1 + Megolm groups + safety numbers + account pickle
 - [ ] Local search, drafts, unread badges
-- [ ] Push-ready (APNs); foreground reconnect
+- [x] Push-ready (APNs); foreground reconnect
 - [ ] TLS in production; ATS-compliant; Keychain for secrets
 
 ### Out of scope (do not build on iOS)
@@ -343,19 +342,19 @@ provided.
 Wire: `GroupEvent`, `GroupMessage`, `GroupAckSummary`
 ([`docs/messenger/08_groups.md`](docs/messenger/08_groups.md)).
 
-- [ ] Create group / add / remove / leave via FFI.
-- [ ] Apply membership `version` in order; ignore stale.
-- [ ] Group thread UI (sender labels, system lines for membership).
-- [ ] Group info screen (members, admin actions).
-- [ ] Respect `max_group_members` in UI when known.
-- [ ] Document ack-aggregation vs WhatsApp until server summary is complete.
+- [x] Create group / add / remove / leave via FFI.
+- [x] Apply membership `version` in order; ignore stale.
+- [x] Group thread UI (sender labels, system lines for membership).
+- [x] Group info screen (members, admin actions).
+- [x] Respect `max_group_members` in UI when known.
+- [x] Document ack-aggregation vs WhatsApp until server summary is complete.
 
 **Tests**
-- [ ] Integration: create → add → fan-out message.
-- [ ] Non-member send / non-admin add surfaces error.
+- [x] Integration: create → add → fan-out message.
+- [x] Non-member send / non-admin add surfaces error.
 
 **Docs**
-- [ ] `docs/client-ios/06_groups.md`
+- [x] `docs/client-ios/06_groups.md`
 
 **Exit criteria**: group golden path works on single-node gateway.
 
@@ -370,18 +369,18 @@ WhatsApp-style split still applies conceptually: **control + chunks on the
 messaging socket** (this repo), not a separate gRPC stream. Optional future
 CDN/HTTP for large blobs can sit behind the same UI.
 
-- [ ] Picker: Photos, Files (PDF), Camera.
-- [ ] Cap **64 MiB**; chunk ≤ **64 KiB**; SHA-256 before upload (FFI/helpers).
-- [ ] Queue: one upload at a time per session (server rule).
-- [ ] Progress UI; failure + retry; resume download via `from_offset`.
-- [ ] Persist blobs under Application Support; reference from `messages`.
-- [ ] Image viewer + Quick Look for PDF.
+- [x] Picker: Photos, Files (PDF); camera on iOS via image picker.
+- [x] Cap **64 MiB**; chunk ≤ **64 KiB**; SHA-256 before upload (FFI/helpers).
+- [x] Queue: one upload at a time per session (server rule).
+- [x] Progress UI; failure + retry; resume download via `from_offset`.
+- [x] Persist blobs under Application Support; reference from `messages`.
+- [x] Image viewer + Quick Look for PDF.
 
 **Tests**
-- [ ] Upload/fetch round-trip; oversized rejected; corrupt SHA fails cleanly.
+- [x] Upload/fetch round-trip; oversized rejected; corrupt SHA fails cleanly.
 
 **Docs**
-- [ ] `docs/client-ios/07_media.md`
+- [x] `docs/client-ios/07_media.md`
 
 **Exit criteria**: image + PDF send/receive end-to-end; no partial file shown
 as complete.
@@ -393,22 +392,22 @@ as complete.
 Wire/crypto in Rust (`docs/messenger/10_e2ee.md`); iOS only stores pickle +
 UX.
 
-- [ ] Feature flag `E2EE_ENABLED` default **on** for staging/prod builds.
-- [ ] On first login: generate device via FFI; `publish` one-time keys.
-- [ ] 1:1: `send_encrypted_chat` / `decrypt_chat`; store ciphertext + meta
+- [x] Feature flag `E2EE_ENABLED` default **on** for staging/prod builds.
+- [x] On first login: generate device via FFI; `publish` one-time keys.
+- [x] 1:1: `send_encrypted_chat` / `decrypt_chat`; store ciphertext + meta
       only when possible.
-- [ ] Groups: Megolm session create / distribute / decrypt.
-- [ ] Safety number screen (compare / screenshot warning).
-- [ ] Account pickle export/import to Keychain-backed file
+- [x] Groups: Megolm session create / distribute / decrypt.
+- [x] Safety number screen (compare / screenshot warning).
+- [x] Account pickle export/import to Keychain-backed file
       (passphrase UX).
-- [ ] DEBUG-only plaintext fallback behind explicit flag (never in Release).
+- [x] DEBUG-only plaintext fallback behind explicit flag (never in Release).
 
 **Tests**
-- [ ] Two-device encrypt/decrypt against gateway (parity FFI E2EE smokes).
-- [ ] Pickle round-trip survives reinstall (Keychain + file).
+- [x] Two-device encrypt/decrypt against gateway (parity FFI E2EE smokes).
+- [x] Pickle round-trip survives reinstall (Keychain + file).
 
 **Docs**
-- [ ] `docs/client-ios/08_e2ee.md` — threat model notes for UI
+- [x] `docs/client-ios/08_e2ee.md` — threat model notes for UI
       ([`11_security_review.md`](docs/messenger/11_security_review.md)).
 
 **Exit criteria**: E2EE on by default in Release; safety number reachable
@@ -420,21 +419,21 @@ from chat info.
 
 FunXMPP socket will drop in background — design for it.
 
-- [ ] APNs entitlement + device token → HTTPS registration API (when server
+- [x] APNs entitlement + device token → HTTPS registration API (when server
       exists); stub protocol now.
-- [ ] Notification service: show sender/preview policy (hide body when E2EE).
-- [ ] Tap notification → deep link to conversation.
-- [ ] Foreground reconnect + `resume_after_seq` (I2).
-- [ ] Badge = sum of local unread.
-- [ ] Do **not** abuse VoIP push for chat (App Store risk); use standard
+- [x] Notification service: show sender/preview policy (hide body when E2EE).
+- [x] Tap notification → deep link to conversation.
+- [x] Foreground reconnect + `resume_after_seq` (I2).
+- [x] Badge = sum of local unread.
+- [x] Do **not** abuse VoIP push for chat (App Store risk); use standard
       alert pushes.
 
 **Tests**
-- [ ] Cold start from notification opens correct thread (UI test).
-- [ ] Badge updates on inbound apply.
+- [x] Cold start from notification opens correct thread (UI test).
+- [x] Badge updates on inbound apply.
 
 **Docs**
-- [ ] `docs/client-ios/09_push.md` — payload contract, E2EE preview rules.
+- [x] `docs/client-ios/09_push.md` — payload contract, E2EE preview rules.
 
 **Exit criteria**: background message shows notification; opening app
 syncs without gaps/duplicates.

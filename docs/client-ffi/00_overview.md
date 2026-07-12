@@ -45,4 +45,6 @@ s.ping()?;
 ```
 
 See [BUILD.md](BUILD.md) for XCFramework / AAR notes.  
-Java / Android JNI (production): [10_java.md](10_java.md).
+Java / Android JNI (production): [10_java.md](10_java.md).  
+Swift C ABI (production): [11_swift.md](11_swift.md) ·
+[cheatsheet](../../bindings/swift/LaneMessengerFFI/SWIFT_CHEATSHEET.md).
